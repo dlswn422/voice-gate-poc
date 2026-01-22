@@ -41,8 +41,11 @@ def load_qwen():
 # =========================
 # Intent 판별 (LLM 중심, 유사 발음 허용)
 # =========================
-def detect_intent_llm(text: str) -> IntentResult:
+def detect_intent_llm(text: str, debug: bool = True) -> IntentResult:
     model, tokenizer = load_qwen()
+
+    if debug:
+        print(f"📥 [LLM INPUT] {text}")
 
     messages = [
         {
@@ -59,16 +62,15 @@ def detect_intent_llm(text: str) -> IntentResult:
                 "  예: 차당기, 하단기, 사단기, 처단기, 챠단기 등\n"
                 "- 단어 자체보다 '출입/통과하려는 의도'가 핵심이다\n\n"
                 "판단 기준:\n"
-                "- 화자가 스스로 이동/출입/통과하려는 맥락이 명확하면 OPEN_GATE\n"
-                "- 물리적 출입 장치를 올리거나/열어달라는 의미면 OPEN_GATE\n"
-                "- 물리적 출입 장치를 내리거나/막아달라는 의미면 CLOSE_GATE\n"
-                "- 내부 공간(방, 방문, 화장실, 집, 사무실 등)은 차단기와 무관하므로 제외한다\n"
-                "- 잡담, 설명, 질문, 감정 표현, 욕구 표현은 NONE이다\n"
-                "- 조금이라도 확신이 부족하면 반드시 NONE을 선택한다\n\n"
+                "- 출입/이동/통과 맥락이 명확하면 OPEN_GATE\n"
+                "- 물리적 출입 장치를 올리거나 열어달라는 의미면 OPEN_GATE\n"
+                "- 물리적 출입 장치를 내리거나 막아달라는 의미면 CLOSE_GATE\n"
+                "- 내부 공간(방, 방문, 화장실, 집, 사무실 등)은 무조건 NONE\n"
+                "- 잡담, 설명, 질문, 감정 표현은 NONE\n"
+                "- 조금이라도 확신이 부족하면 반드시 NONE\n\n"
                 "출력 규칙:\n"
-                "- 반드시 JSON 형식만 출력한다\n"
+                "- 반드시 JSON만 출력한다\n"
                 "- 형식: {\"intent\":\"OPEN_GATE|CLOSE_GATE|NONE\",\"confidence\":0.0~1.0}\n"
-                "- confidence는 판단 확신 정도를 의미한다"
             ),
         },
         {
@@ -77,7 +79,6 @@ def detect_intent_llm(text: str) -> IntentResult:
         },
     ]
 
-    # Qwen Instruct 전용 Chat Template
     input_ids = tokenizer.apply_chat_template(
         messages,
         tokenize=True,
@@ -89,7 +90,7 @@ def detect_intent_llm(text: str) -> IntentResult:
         output_ids = model.generate(
             input_ids=input_ids,
             max_new_tokens=64,
-            do_sample=False,  # 결정론적 (안전)
+            do_sample=False,  # 결정론적
             eos_token_id=tokenizer.eos_token_id,
         )
 
@@ -97,11 +98,39 @@ def detect_intent_llm(text: str) -> IntentResult:
     generated_ids = output_ids[0][input_ids.shape[-1]:]
     decoded = tokenizer.decode(generated_ids, skip_special_tokens=True)
 
-    # JSON 안전 파싱
+    if debug:
+        print("🧾 [LLM RAW OUTPUT]")
+        print(decoded)
+
+    # =========================
+    # JSON 안전 파싱 + Intent 변환
+    # =========================
     try:
-        start = decoded.index("{")
-        end = decoded.index("}") + 1
+        start = decoded.find("{")
+        end = decoded.rfind("}") + 1
         data = json.loads(decoded[start:end])
-        return IntentResult(**data)
-    except Exception:
+
+        intent_str = data.get("intent", "NONE")
+        confidence = float(data.get("confidence", 0.0))
+
+        # 🔑 문자열 → Enum 변환 (핵심)
+        try:
+            intent = Intent(intent_str)
+        except ValueError:
+            intent = Intent.NONE
+
+        # confidence 보정
+        confidence = max(0.0, min(confidence, 1.0))
+
+        if debug:
+            print(
+                f"📊 [LLM PARSED] intent={intent.name}, "
+                f"confidence={confidence:.2f}"
+            )
+
+        return IntentResult(intent=intent, confidence=confidence)
+
+    except Exception as e:
+        if debug:
+            print("❌ [LLM PARSE ERROR]", e)
         return IntentResult(intent=Intent.NONE, confidence=0.0)

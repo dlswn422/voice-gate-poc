@@ -3,7 +3,6 @@ from engine.app_engine import AppEngine
 
 MIC_DEVICE_INDEX = 1  # 노트북 내장 마이크
 
-
 def main():
     engine = AppEngine()
 

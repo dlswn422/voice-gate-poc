@@ -6,29 +6,42 @@ CONFIDENCE_THRESHOLD = 0.75   # 🔑 유일한 정책 값
 
 class AppEngine:
     def handle_text(self, text: str):
-        print(f"📥 [ENGINE] STT TEXT: {text}")
+        print("\n" + "=" * 50)
+        print("📥 [ENGINE] 음성 명령 수신")
+        print(f"🗣  STT TEXT        : \"{text}\"")
 
+        # LLM 추론
         result = detect_intent_llm(text)
-        print(f"🧠 [LLM] INTENT: {result.intent} ({result.confidence:.2f})")
+        print(
+            f"🧠 [LLM] 의도 추론     : {result.intent.name}"
+            f" (confidence={result.confidence:.2f})"
+        )
 
-        # 1️⃣ NONE은 무시
+        # 1️⃣ 명령 여부 판단
         if result.intent == Intent.NONE:
-            print("🚫 [ENGINE] 명령 아님 → 무시")
+            print("🚫 [DECISION] 차단기 제어와 무관 → 실행 안 함")
+            print("=" * 50)
             return
 
-        # 2️⃣ confidence 기준만 적용
+        # 2️⃣ 신뢰도 기준 적용
         if result.confidence < CONFIDENCE_THRESHOLD:
             print(
-                f"🚫 [ENGINE] confidence 부족 "
-                f"({result.confidence:.2f} < {CONFIDENCE_THRESHOLD:.2f}) → 무시"
+                "🚫 [DECISION] 신뢰도 기준 미달\n"
+                f"    └ confidence {result.confidence:.2f} "
+                f"< threshold {CONFIDENCE_THRESHOLD:.2f}"
             )
+            print("=" * 50)
             return
 
-        # 3️⃣ 실행
+        # 3️⃣ 최종 실행 판단
+        print("✅ [DECISION] 제어 조건 충족 → 실행")
+
         if result.intent == Intent.OPEN_GATE:
             self.open_gate()
         elif result.intent == Intent.CLOSE_GATE:
             self.close_gate()
+
+        print("=" * 50)
 
     def open_gate(self):
         print("🟢 [CONTROL] 차단기 열기 실행")

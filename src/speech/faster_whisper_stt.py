@@ -1,15 +1,15 @@
 import sounddevice as sd
 import numpy as np
-import time
 from faster_whisper import WhisperModel
 from typing import Optional, Callable
 
 
 class FasterWhisperSTT:
     """
-    VAD 기반 발화 종료 STT (최종)
-    - 무음 기반 발화 확정
-    - 발화 끝났을 때만 LLM 호출
+    VAD 기반 발화 종료 STT (최종 안정본)
+    - 무음 구간에서는 로그 출력 없음
+    - 음성 시작 / 발화 종료 / STT 결과만 출력
+    - 발화 종료 시에만 STT 수행
     """
 
     def __init__(
@@ -43,6 +43,7 @@ class FasterWhisperSTT:
 
         buffer = []
         silent_count = 0
+        is_speaking = False
 
         try:
             with sd.InputStream(
@@ -53,31 +54,39 @@ class FasterWhisperSTT:
             ) as stream:
 
                 while True:
-                    data, _ = stream.read(int(self.chunk_seconds * self.sample_rate))
+                    data, _ = stream.read(
+                        int(self.chunk_seconds * self.sample_rate)
+                    )
                     audio = data.squeeze()
-
                     volume = np.max(np.abs(audio))
-                    print(f"🔊 volume={volume:.4f}")
 
-                    if volume < self.silence_threshold:
-                        silent_count += 1
-                        print(f"🤫 무음 감지 ({silent_count}/{self.silence_chunks})")
-                    else:
-                        silent_count = 0
+                    # 음성 감지
+                    if volume >= self.silence_threshold:
+                        if not is_speaking:
+                            print("🗣 음성 감지 시작")
+                            is_speaking = True
+
                         buffer.append(audio)
-                        print("🗣 음성 수집 중...")
+                        silent_count = 0
+                    else:
+                        if is_speaking:
+                            silent_count += 1
 
                     # 발화 종료 판단
-                    if silent_count >= self.silence_chunks and buffer:
+                    if is_speaking and silent_count >= self.silence_chunks:
                         print("🧾 발화 종료 감지 → STT 수행")
                         self._process_buffer(buffer)
                         buffer.clear()
                         silent_count = 0
+                        is_speaking = False
 
         except KeyboardInterrupt:
             print("\n🛑 STT 종료")
 
     def _process_buffer(self, buffer):
+        if not buffer:
+            return
+
         audio = np.concatenate(buffer)
 
         segments, _ = self.model.transcribe(

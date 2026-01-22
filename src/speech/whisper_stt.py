@@ -5,9 +5,6 @@ import whisper
 import scipy.signal
 from typing import Optional, Callable
 
-# =========================
-# Whisper 모델 싱글톤
-# =========================
 _WHISPER_MODEL = None
 
 
@@ -20,9 +17,6 @@ def get_whisper_model(model_size: str):
     return _WHISPER_MODEL
 
 
-# =========================
-# 텍스트 정규화
-# =========================
 def normalize_text(text: str) -> str:
     noises = ["ㅋㅋ", "ㅎㅎ", "음", "어", "아", "그", ",", ".", "!", "?"]
     for n in noises:
@@ -30,30 +24,11 @@ def normalize_text(text: str) -> str:
     return text.strip()
 
 
-# =========================
-# Intent 판별 (최종)
-# =========================
-def detect_intent(text: str) -> Optional[str]:
-    open_keywords = ["열", "여", "올", "개", "오픈"]
-    close_keywords = ["닫", "잠", "내", "클로즈"]
-
-    if any(k in text for k in open_keywords):
-        return "OPEN_GATE"
-
-    if any(k in text for k in close_keywords):
-        return "CLOSE_GATE"
-
-    return None
-
-
 class WhisperSTT:
     """
-    Whisper STT 최종본 (현업 기준)
-
-    ✔ Windows 마이크 입력 안정
-    ✔ 48kHz → 16kHz 리샘플링
-    ✔ 의미 없는 발화 제거
-    ✔ Intent 중심 처리
+    STT 전용 클래스
+    - 텍스트까지만 생성
+    - 의미 판단 ❌
     """
 
     def __init__(
@@ -64,11 +39,9 @@ class WhisperSTT:
     ):
         self.device = device
         self.listen_seconds = listen_seconds
-
         self.input_rate = 48000
         self.target_rate = 16000
-
-        self.on_intent: Optional[Callable[[str, str], None]] = None
+        self.on_text: Optional[Callable[[str], None]] = None
         self.model = get_whisper_model(model_size)
 
     def listen_once(self):
@@ -91,18 +64,15 @@ class WhisperSTT:
 
         audio = np.concatenate(frames, axis=0).squeeze()
 
-        # 🔕 무음 컷
         if np.max(np.abs(audio)) < 0.02:
             return
 
-        # 🔁 48k → 16k
         audio = scipy.signal.resample_poly(
             audio,
             self.target_rate,
             self.input_rate,
         )
 
-        # 🔊 정규화
         audio = audio.astype(np.float32)
         audio /= max(np.abs(audio).max(), 1e-6)
 
@@ -117,24 +87,15 @@ class WhisperSTT:
             condition_on_previous_text=False,
         )
 
-        raw_text = normalize_text(result.get("text", ""))
+        text = normalize_text(result.get("text", ""))
 
-        # ❌ 너무 짧은 발화 제거
-        if len(raw_text) <= 2:
+        if len(text) <= 2:
             return
 
-        # ❌ 동작 단어 없는 발화 제거
-        if not any(k in raw_text for k in ["열", "닫", "올", "내"]):
-            return
+        print(f"🧪 STT TEXT: {text}")
 
-        print(f"🧪 RAW STT TEXT: {raw_text}")
-
-        intent = detect_intent(raw_text)
-
-        if intent:
-            print(f"🚦 INTENT DETECTED: {intent}")
-            if self.on_intent:
-                self.on_intent(intent, raw_text)
+        if self.on_text:
+            self.on_text(text)
 
     def start_listening(self):
         print("🎙 Whisper STT 시작 (Ctrl+C 종료)")

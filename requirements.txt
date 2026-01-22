@@ -1,2 +1,9 @@
-vosk
+torch
+transformers
+pydantic
+accelerate
 sounddevice
+numpy
+scipy
+faster-whisper
+openai-whisper

@@ -39,7 +39,7 @@ def load_qwen():
 
 
 # =========================
-# Intent 판별 (LLM 중심, 유사 발음 허용)
+# Intent 판별 (확장 버전)
 # =========================
 def detect_intent_llm(text: str, debug: bool = True) -> IntentResult:
     model, tokenizer = load_qwen()
@@ -52,25 +52,20 @@ def detect_intent_llm(text: str, debug: bool = True) -> IntentResult:
             "role": "system",
             "content": (
                 "너는 '주차장 출입 차단기 제어' 전용 AI다.\n\n"
-                "너의 임무는 사용자의 발화가 아래 중 무엇인지 판단하는 것이다:\n"
-                "- OPEN_GATE: 사용자가 직접 이동/출입/통과하기 위해 차단기를 열어달라는 요청\n"
-                "- CLOSE_GATE: 차단기를 닫거나 막아달라는 요청\n"
-                "- NONE: 차단기 제어와 무관하거나, 출입 맥락이 불명확한 발화\n\n"
-                "⚠️ 매우 중요 (오타 / 유사 발음 처리 규칙):\n"
-                "- 음성 인식 특성상 단어가 틀릴 수 있음을 반드시 고려한다\n"
-                "- '차단기'와 발음·철자가 유사한 단어는 문맥상 차단기를 의미할 수 있다\n"
-                "  예: 차당기, 하단기, 사단기, 처단기, 챠단기 등\n"
-                "- 단어 자체보다 '출입/통과하려는 의도'가 핵심이다\n\n"
-                "판단 기준:\n"
-                "- 출입/이동/통과 맥락이 명확하면 OPEN_GATE\n"
-                "- 물리적 출입 장치를 올리거나 열어달라는 의미면 OPEN_GATE\n"
-                "- 물리적 출입 장치를 내리거나 막아달라는 의미면 CLOSE_GATE\n"
-                "- 내부 공간(방, 방문, 화장실, 집, 사무실 등)은 무조건 NONE\n"
-                "- 잡담, 설명, 질문, 감정 표현은 NONE\n"
-                "- 조금이라도 확신이 부족하면 반드시 NONE\n\n"
+                "사용자의 발화를 아래 의도 중 하나로 분류하라:\n\n"
+                "- OPEN_GATE: 지금 당장 차단기를 열어달라는 명시적 요청\n"
+                "- CLOSE_GATE: 차단기를 닫거나 막아달라는 명시적 요청\n"
+                "- HELP_REQUEST: 문이 안 열림, 결제 실패, 등록 오류 등 문제 상황 설명\n"
+                "- INFO_REQUEST: 방문 등록 방법, 절차, 사용법을 묻는 질문\n"
+                "- NONE: 차단기 제어와 무관한 발화\n\n"
+                "⚠️ 매우 중요:\n"
+                "- OPEN_GATE는 '열어줘', '올려줘', '통과할게요' 등 직접 명령일 때만 선택한다\n"
+                "- '문이 안 열려요', '방문등록 했는데 안돼요'는 OPEN_GATE가 아니라 HELP_REQUEST다\n"
+                "- 질문형 문장은 INFO_REQUEST로 분류한다\n"
+                "- 애매하면 반드시 NONE 또는 HELP_REQUEST를 선택한다\n\n"
                 "출력 규칙:\n"
                 "- 반드시 JSON만 출력한다\n"
-                "- 형식: {\"intent\":\"OPEN_GATE|CLOSE_GATE|NONE\",\"confidence\":0.0~1.0}\n"
+                "- 형식: {\"intent\":\"OPEN_GATE|CLOSE_GATE|HELP_REQUEST|INFO_REQUEST|NONE\",\"confidence\":0.0~1.0}"
             ),
         },
         {
@@ -90,11 +85,10 @@ def detect_intent_llm(text: str, debug: bool = True) -> IntentResult:
         output_ids = model.generate(
             input_ids=input_ids,
             max_new_tokens=64,
-            do_sample=False,  # 결정론적
+            do_sample=False,
             eos_token_id=tokenizer.eos_token_id,
         )
 
-    # 생성된 부분만 디코딩
     generated_ids = output_ids[0][input_ids.shape[-1]:]
     decoded = tokenizer.decode(generated_ids, skip_special_tokens=True)
 
@@ -103,7 +97,7 @@ def detect_intent_llm(text: str, debug: bool = True) -> IntentResult:
         print(decoded)
 
     # =========================
-    # JSON 안전 파싱 + Intent 변환
+    # JSON 파싱 + Enum 변환
     # =========================
     try:
         start = decoded.find("{")
@@ -113,13 +107,11 @@ def detect_intent_llm(text: str, debug: bool = True) -> IntentResult:
         intent_str = data.get("intent", "NONE")
         confidence = float(data.get("confidence", 0.0))
 
-        # 🔑 문자열 → Enum 변환 (핵심)
         try:
             intent = Intent(intent_str)
         except ValueError:
             intent = Intent.NONE
 
-        # confidence 보정
         confidence = max(0.0, min(confidence, 1.0))
 
         if debug:

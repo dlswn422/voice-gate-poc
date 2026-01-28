@@ -1,9 +1,45 @@
+# =========================
+# Core ML / LLM
+# =========================
+
 torch
+# PyTorch: LLM(Qwen) 추론 및 모델 실행용 핵심 프레임워크
+
 transformers
-pydantic
+# Hugging Face Transformers: Qwen, Whisper 등 LLM/STT 모델 로딩 및 추론
+
 accelerate
+# Transformers 추론/로딩 최적화 (디바이스 매핑, 메모리 관리)
+
+pydantic
+# 의도 분류 결과(IntentResult)와 같은 데이터 스키마 검증/정의
+
+
+# =========================
+# Audio / Speech-to-Text
+# =========================
+
 sounddevice
+# 마이크 입력 수집 (실시간 음성 입력)
+
 numpy
+# 오디오 데이터 및 수치 연산 기본 라이브러리
+
 scipy
+# 오디오 신호 처리 (resampling 등)
+
 faster-whisper
-openai-whisper
+# Whisper 기반 고속 STT 엔진 (실시간 음성 인식)
+
+
+# =========================
+# Database / Environment
+# =========================
+
+psycopg2-binary
+# PostgreSQL 드라이버
+# Supabase(PostgreSQL)와 Python 코드(intent_logger) 연결에 사용
+
+python-dotenv
+# .env 파일 로드
+# DATABASE_URL 등 환경변수를 로컬 개발 환경에서 안전하게 관리

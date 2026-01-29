@@ -31,6 +31,7 @@ scipy
 faster-whisper
 # Whisper 기반 고속 STT 엔진 (실시간 음성 인식)
 
+openai-whisper
 
 # =========================
 # Database / Environment
@@ -40,7 +41,6 @@ psycopg2-binary
 # PostgreSQL 드라이버
 # Supabase(PostgreSQL)와 Python 코드(intent_logger) 연결에 사용
 
-openai-whisper
 python-dotenv
 # .env 파일 로드
 # DATABASE_URL 등 환경변수를 로컬 개발 환경에서 안전하게 관리

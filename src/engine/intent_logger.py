@@ -78,3 +78,57 @@ def log_intent(
     except Exception as e:
         # ❗ 절대 raise 하지 않음 (엔진 안정성 최우선)
         print("❌ [INTENT_LOGGER] Failed to log intent:", e)
+        
+        
+# ==================================================
+# 2️⃣ 2차 상담 대화 로그 저장
+# ==================================================
+
+def log_dialog(
+    intent_log_id: int,
+    session_id: str,
+    role: str,
+    content: str,
+    model: str,
+    turn_index: int,
+):
+    """
+    2차 상담(라마) 대화를 dialog_logs 테이블에 저장한다.
+
+    role:
+        - 'user'
+        - 'assistant'
+    """
+
+    if role not in ("user", "assistant"):
+        raise ValueError("role must be 'user' or 'assistant'")
+
+    sql = """
+        INSERT INTO dialog_logs (
+            intent_log_id,
+            session_id,
+            role,
+            content,
+            model,
+            turn_index
+        )
+        VALUES (%s, %s, %s, %s, %s, %s);
+    """
+
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                sql,
+                (
+                    intent_log_id,
+                    session_id,
+                    role,
+                    content,
+                    model,
+                    turn_index,
+                ),
+            )
+            conn.commit()
+    finally:
+        conn.close()

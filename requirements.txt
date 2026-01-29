@@ -31,6 +31,7 @@ scipy
 faster-whisper
 # Whisper 기반 고속 STT 엔진 (실시간 음성 인식)
 
+openai-whisper
 
 # =========================
 # Database / Environment

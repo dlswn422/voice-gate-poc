@@ -1,9 +1,10 @@
-from nlu.llm_client import detect_intent_llm
-from nlu.intent_schema import Intent
-from engine.intent_logger import log_intent
+from src.nlu.llm_client import detect_intent_llm
+from src.nlu.intent_schema import Intent
+from src.engine.intent_logger import log_intent
 
 import uuid
 import time
+import traceback
 
 # --------------------------------------------------
 # 정책 설정
@@ -36,7 +37,7 @@ class AppEngine:
             return
 
         request_id = str(uuid.uuid4())
-        received_at = time.time()  # 추후 확장용 (현재는 로그만)
+        received_at = time.time()  # 추후 확장용
 
         print("=" * 50)
         print("[ENGINE] Speech received")
@@ -48,9 +49,10 @@ class AppEngine:
         # ==================================================
         try:
             result = detect_intent_llm(text)
-        except Exception as e:
-            print("[ENGINE] LLM inference failed:", e)
-            print("=" * 50)
+        except Exception:
+            print("[ENGINE] LLM inference failed (traceback):")
+            traceback.print_exc()
+            print("=" * 60)
             return
 
         print(
@@ -61,8 +63,6 @@ class AppEngine:
         # ==================================================
         # 2️⃣ 학습 데이터 DB 적재
         # ==================================================
-        # 이 데이터는 '원천 학습 데이터'로 사용되며
-        # 추후 사람 검수를 통해 최종 라벨로 확정된다
         log_intent(
             utterance=text,
             predicted_intent=result.intent.value,

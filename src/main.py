@@ -6,8 +6,8 @@ from dotenv import load_dotenv
 # ==================================================
 load_dotenv()
 
-from speech.faster_whisper_stt import FasterWhisperSTT
-from engine.app_engine import AppEngine
+from src.speech.faster_whisper_stt import FasterWhisperSTT
+from src.engine.app_engine import AppEngine
 
 # --------------------------------------------------
 # 마이크 디바이스 인덱스

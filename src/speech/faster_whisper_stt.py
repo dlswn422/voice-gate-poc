@@ -6,12 +6,10 @@ from typing import Optional, Callable
 
 class FasterWhisperSTT:
     """
-    VAD 기반 실시간 STT 엔진
-
-    특징:
-    - 무음 구간에서는 아무 로그도 출력하지 않음
-    - 음성 시작 / 발화 종료 / STT 결과만 로그로 출력
-    - 발화 종료 시점에만 Whisper 추론 수행
+    VAD 기반 발화 종료 STT (최종 안정본)
+    - 무음 구간에서는 로그 출력 없음
+    - 음성 시작 / 발화 종료 / STT 결과만 출력
+    - 발화 종료 시에만 STT 수행
     """
 
     def __init__(
@@ -23,32 +21,25 @@ class FasterWhisperSTT:
         silence_threshold: float = 0.015,
         silence_chunks: int = 2,
     ):
-        # 오디오 설정
         self.sample_rate = sample_rate
         self.chunk_seconds = chunk_seconds
         self.silence_threshold = silence_threshold
         self.silence_chunks = silence_chunks
         self.device_index = device_index
 
-        # Whisper 모델 로딩
-        print("[STT] Loading Faster-Whisper model...")
+        print("⏳ Faster-Whisper 모델 로딩 중...")
         self.model = WhisperModel(
             model_size,
             device="cpu",
             compute_type="int8",
             download_root="models",
         )
-        print("[STT] Faster-Whisper model loaded")
+        print("✅ Faster-Whisper 모델 로딩 완료")
 
-        # STT 결과 콜백
         self.on_text: Optional[Callable[[str], None]] = None
 
     def start_listening(self):
-        """
-        마이크 입력을 받아 VAD 기반으로 발화를 감지하고
-        발화 종료 시 STT를 수행한다.
-        """
-        print("[STT] Listening started (Ctrl+C to stop)")
+        print("🎙 STT 시작 (VAD 기반, Ctrl+C 종료)")
 
         buffer = []
         silent_count = 0
@@ -60,22 +51,19 @@ class FasterWhisperSTT:
                 device=self.device_index,
                 channels=1,
                 dtype="float32",
-            ):
+            ) as stream:
+
                 while True:
-                    data, _ = sd.rec(
-                        int(self.chunk_seconds * self.sample_rate),
-                        samplerate=self.sample_rate,
-                        channels=1,
-                        dtype="float32",
-                        blocking=True,
+                    data, _ = stream.read(
+                        int(self.chunk_seconds * self.sample_rate)
                     )
                     audio = data.squeeze()
                     volume = np.max(np.abs(audio))
 
-                    # 음성 시작 감지
+                    # 음성 감지
                     if volume >= self.silence_threshold:
                         if not is_speaking:
-                            print("[STT] Speech detected")
+                            print("🗣 음성 감지 시작")
                             is_speaking = True
 
                         buffer.append(audio)
@@ -86,19 +74,16 @@ class FasterWhisperSTT:
 
                     # 발화 종료 판단
                     if is_speaking and silent_count >= self.silence_chunks:
-                        print("[STT] Speech ended, running transcription")
+                        print("🧾 발화 종료 감지 → STT 수행")
                         self._process_buffer(buffer)
                         buffer.clear()
                         silent_count = 0
                         is_speaking = False
 
         except KeyboardInterrupt:
-            print("[STT] Listening stopped")
+            print("\n🛑 STT 종료")
 
     def _process_buffer(self, buffer):
-        """
-        누적된 오디오 버퍼를 Whisper로 변환한다.
-        """
         if not buffer:
             return
 
@@ -114,11 +99,10 @@ class FasterWhisperSTT:
         text = "".join(seg.text for seg in segments).strip()
 
         if not text:
-            print("[STT] No transcription result")
+            print("⚠️ STT 결과 없음")
             return
 
-        print(f"[STT] Transcribed text: {text}")
+        print(f"🗣 [STT] {text}")
 
-        # STT 결과를 상위 로직(AppEngine)으로 전달
         if self.on_text:
             self.on_text(text)

@@ -51,6 +51,9 @@ class AppEngine:
         self.state = "FIRST_STAGE"
         self.session_id = None
 
+        # ✅ 추가: 2차(RAG/LLM) 문서 필터링용 최초 intent
+        self.first_intent = None
+
         # ✅ (추가) 2차 로그/세션 추적용
         self.intent_log_id = None
         self.dialog_turn_index = 0
@@ -166,7 +169,7 @@ class AppEngine:
             res = dialog_llm_chat(
                 text,
                 history=self.dialog_history,
-                context={"session_id": self.session_id, "intent_log_id": self.intent_log_id},
+                context={"session_id": self.session_id, "intent_log_id": self.intent_log_id, "first_intent": self.first_intent},
                 debug=True,
             )
 
@@ -228,6 +231,9 @@ class AppEngine:
         # ==================================================
         try:
             result = detect_intent_llm(text)
+
+            # ✅ 추가: 2차에서 쓰기 위해 최초 intent 저장
+            self.first_intent = result.intent.value
         except Exception as e:
             print("[ENGINE] LLM inference failed:", e)
             print("=" * 50)
@@ -292,3 +298,6 @@ class AppEngine:
         self.intent_log_id = None
         self.dialog_turn_index = 0
         self.dialog_history = []
+        
+        # ✅ 추가: 세션 종료 시 최초 intent도 초기화
+        self.first_intent = None

@@ -1,25 +1,30 @@
-# engine/intent_logger.py
+﻿# engine/intent_logger.py
 
 import os
 import psycopg2
 from contextlib import contextmanager
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+# ??(蹂寃? env??import ?쒖젏??怨좎젙?섏? 留먭퀬, 留??몄텧留덈떎 媛?몄삤??def _db_url() -> str | None:
+    return os.getenv("DATABASE_URL")
 
 
 # ==================================================
-# DB 연결 헬퍼
+# DB ?곌껐 ?ы띁
 # ==================================================
 
 @contextmanager
 def get_conn():
     """
-    PostgreSQL 커넥션 컨텍스트 매니저
+    PostgreSQL 而ㅻ꽖??而⑦뀓?ㅽ듃 留ㅻ땲?
 
-    - 커넥션/트랜잭션 안전 처리
-    - 예외 발생 시 rollback
+    - 而ㅻ꽖???몃옖??뀡 ?덉쟾 泥섎━
+    - ?덉쇅 諛쒖깮 ??rollback
     """
-    conn = psycopg2.connect(DATABASE_URL)
+    database_url = _db_url()
+    if not database_url:
+        raise RuntimeError("DATABASE_URL not set")
+
+    conn = psycopg2.connect(database_url)
     try:
         yield conn
         conn.commit()
@@ -31,7 +36,7 @@ def get_conn():
 
 
 # ==================================================
-# Intent 로그 적재 (학습 데이터용)
+# Intent 濡쒓렇 ?곸옱 (?숈뒿 ?곗씠?곗슜)
 # ==================================================
 
 def log_intent(
@@ -40,17 +45,20 @@ def log_intent(
     predicted_confidence: float,
     source: str | None = None,
     site_id: str | None = None,
-):
+) -> int | None:
     """
-    1차 의도 분류 결과를 학습 데이터로 DB에 적재한다.
+    1李??섎룄 遺꾨쪟 寃곌낵瑜??숈뒿 ?곗씠?곕줈 DB???곸옱?쒕떎.
 
-    정책:
-    - 실패해도 AppEngine 흐름을 절대 막지 않는다
-    - 모든 예외는 내부에서 처리하고 swallow 한다
+    ?뺤콉:
+    - ?ㅽ뙣?대룄 AppEngine ?먮쫫???덈? 留됱? ?딅뒗??    - 紐⑤뱺 ?덉쇅???대??먯꽌 泥섎━?섍퀬 swallow ?쒕떎
+
+    諛섑솚:
+    - ?깃났 ?? intent_logs??id(int)
+    - ?ㅽ뙣 ?? None
     """
-    if not DATABASE_URL:
-        print("⚠️ [INTENT_LOGGER] DATABASE_URL not set")
-        return
+    if not _db_url():
+        print("?좑툘 [INTENT_LOGGER] DATABASE_URL not set")
+        return None  # ??(蹂寃? 紐낇솗??None 諛섑솚
 
     try:
         with get_conn() as conn:
@@ -65,6 +73,7 @@ def log_intent(
                         site_id
                     )
                     VALUES (%s, %s, %s, %s, %s)
+                    RETURNING id
                     """,
                     (
                         utterance,
@@ -74,7 +83,69 @@ def log_intent(
                         site_id,
                     ),
                 )
+                intent_log_id = cur.fetchone()[0]  # ??(異붽?) PK 諛섑솚
+                return intent_log_id
 
     except Exception as e:
-        # ❗ 절대 raise 하지 않음 (엔진 안정성 최우선)
-        print("❌ [INTENT_LOGGER] Failed to log intent:", e)
+        # ???덈? raise ?섏? ?딆쓬 (?붿쭊 ?덉젙??理쒖슦??
+        print("??[INTENT_LOGGER] Failed to log intent:", e)
+        return None
+
+
+# ==================================================
+# 2截뤴깵 2李??곷떞 ???濡쒓렇 ???# ==================================================
+
+def log_dialog(
+    intent_log_id: int,
+    session_id: str,
+    role: str,
+    content: str,
+    model: str,
+    turn_index: int,
+) -> None:
+    """
+    2李??곷떞(?쇰쭏) ??붾? dialog_logs ?뚯씠釉붿뿉 ??ν븳??
+
+    role:
+        - 'user'
+        - 'assistant'
+
+    ?뺤콉:
+    - ?ㅽ뙣?대룄 AppEngine ?먮쫫??留됱? ?딅뒗??best-effort)
+    """
+    if not _db_url():
+        print("?좑툘 [INTENT_LOGGER] DATABASE_URL not set")
+        return
+
+    if role not in ("user", "assistant"):
+        raise ValueError("role must be 'user' or 'assistant'")
+
+    sql = """
+        INSERT INTO dialog_logs (
+            intent_log_id,
+            session_id,
+            role,
+            content,
+            model,
+            turn_index
+        )
+        VALUES (%s, %s, %s, %s, %s, %s);
+    """
+
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    sql,
+                    (
+                        intent_log_id,
+                        session_id,
+                        role,
+                        content,
+                        model,
+                        turn_index,
+                    ),
+                )
+
+    except Exception as e:
+        print("??[INTENT_LOGGER] Failed to log dialog:", e)

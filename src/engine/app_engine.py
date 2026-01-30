@@ -1,178 +1,199 @@
-from nlu.llm_client import detect_intent_llm
+﻿from nlu.llm_client import detect_intent_llm
 from nlu.intent_schema import Intent
-from nlu.dialog_llm_client import (
-    dialog_llm_chat,
-    make_dialog_system_messages,
-    DialogLLMResponse,
-)
+from engine.intent_logger import log_intent, log_dialog  # ??(異붽?) 2李????濡쒓렇 ???from nlu.dialog_llm_client import dialog_llm_chat        # ??(異붽?) 2李?Llama ?몄텧
 
-CONFIDENCE_THRESHOLD = 0.75   # 🔑 유일한 정책 값
+import uuid
+import time
 
 
-def _is_yes(text: str) -> bool:
-    t = text.strip().lower()
-    return any(k in t for k in ["예", "네", "응", "맞", "그래", "y", "yes"])
+# --------------------------------------------------
+# ?뺤콉 ?ㅼ젙
+# --------------------------------------------------
 
-
-def _is_no(text: str) -> bool:
-    t = text.strip().lower()
-    return any(k in t for k in ["아니", "아뇨", "no", "n", "ㄴㄴ", "싫"])
+CONFIDENCE_THRESHOLD = 0.75
+SITE_ID = "parkassist_local"
 
 
 class AppEngine:
+    """
+    二쇱감???ㅼ삤?ㅽ겕 CX??App Engine
+
+    ?곹깭:
+    - FIRST_STAGE  : 1李??섎룄 遺꾨쪟 ?④퀎
+    - SECOND_STAGE : 2李??곷떞(?쇰쭏) ?④퀎
+    """
+
     def __init__(self):
-        # IDLE: 1차 의도 분류
-        # DIALOG: 2차 대화형 LLM (Llama)로 추가 질문/해결
-        # CONFIRM: 실제 제어 실행 전 사용자 확인 단계
-        self.state = "IDLE"
-        self.dialog_messages = []
-        self.pending_intent: Intent | None = None
+        # ?뵎 ?곹깭 愿由?(?먮낯 ?좎?)
+        self.state = "FIRST_STAGE"
+        self.session_id = None
+
+        # ??(異붽?) 2李????濡쒓렇 ?곌껐???꾪븳 媛믩뱾
+        self.intent_log_id = None          # 1李?intent_logs PK (dialog_logs FK)
+        self.dialog_turn_index = 0         # dialog_logs turn_index (1遺??利앷?)
+
+    # ==================================================
+    # ?뵩 confidence 怨꾩궛 濡쒖쭅 (?먮낯 ?좎?)
+    # ==================================================
+
+    def calculate_confidence(self, text: str, intent: Intent) -> float:
+        score = 0.0
+        text = text.strip()
+
+        KEYWORDS = {
+            Intent.EXIT_FLOW_ISSUE: ["異쒖감", "?섍?", "李⑤떒湲?, "???대젮"],
+            Intent.ENTRY_FLOW_ISSUE: ["?낆감", "?ㅼ뼱媛", "李⑤떒湲?, "???대젮"],
+            Intent.PAYMENT_ISSUE: ["寃곗젣", "?붽툑", "移대뱶", "?뺤궛"],
+            Intent.TIME_ISSUE: ["?쒓컙", "臾대즺", "珥덇낵"],
+            Intent.PRICE_INQUIRY: ["?쇰쭏", "?붽툑", "媛寃?],
+            Intent.HOW_TO_EXIT: ["?대뼸寃?, "異쒖감", "?섍?"],
+            Intent.HOW_TO_REGISTER: ["?깅줉", "?대뵒", "諛⑸쾿"],
+        }
+
+        hits = sum(1 for k in KEYWORDS.get(intent, []) if k in text)
+
+        if hits >= 2:
+            score += 0.45
+        elif hits == 1:
+            score += 0.30
+        else:
+            score += 0.10
+
+        if len(text) < 3:
+            score += 0.05
+        elif any(f in text for f in ["??, "??, "..."]):
+            score += 0.10
+        else:
+            score += 0.25
+
+        INTENT_RISK_WEIGHT = {
+            Intent.HOW_TO_EXIT: 1.0,
+            Intent.PRICE_INQUIRY: 1.0,
+            Intent.TIME_ISSUE: 0.9,
+            Intent.EXIT_FLOW_ISSUE: 0.7,
+            Intent.ENTRY_FLOW_ISSUE: 0.7,
+            Intent.PAYMENT_ISSUE: 0.7,
+            Intent.REGISTRATION_ISSUE: 0.6,
+            Intent.COMPLAINT: 0.5,
+        }
+
+        score *= INTENT_RISK_WEIGHT.get(intent, 0.6)
+        return round(min(score, 1.0), 2)
+
+    # ==================================================
+    # ?럺截?STT ?띿뒪??泥섎━ ?뷀듃由ы룷?명듃
+    # ==================================================
 
     def handle_text(self, text: str):
-        print("\n" + "=" * 50)
-        print("📥 [ENGINE] 음성 명령 수신")
-        print(f"🗣  STT TEXT        : \"{text}\"")
-
-        # =========================
-        # CONFIRM 단계
-        # =========================
-        if self.state == "CONFIRM":
-            if _is_yes(text) and self.pending_intent is not None:
-                print("✅ [CONFIRM] 사용자 확인: 예 → 실행")
-                self._execute_intent(self.pending_intent)
-                self._reset_dialog()
-            elif _is_no(text):
-                print("🚫 [CONFIRM] 사용자 확인: 아니오 → 취소")
-                self._reset_dialog()
-            else:
-                print("❓ [CONFIRM] 예/아니오로만 답해주세요.")
-            print("=" * 50)
+        if not text or not text.strip():
             return
-
-        # =========================
-        # DIALOG 단계 (2차 LLM)
-        # =========================
-        if self.state == "DIALOG":
-            self._dialog_step(user_text=text)
-            print("=" * 50)
-            return
-
-        # LLM 추론
-        result = detect_intent_llm(text)
-        print(
-            f"🧠 [LLM] 의도 추론     : {result.intent.name}"
-            f" (confidence={result.confidence:.2f})"
-        )
-
-        # 1️⃣ 명령 여부 판단
-        if result.intent == Intent.NONE:
-            print("🚫 [DECISION] 차단기 제어와 무관 → 실행 안 함")
-            print("=" * 50)
-            return
-
-        # 2️⃣ 신뢰도 기준 적용
-        if result.confidence < CONFIDENCE_THRESHOLD:
-            print(
-                "🚫 [DECISION] 신뢰도 기준 미달\n"
-                f"    └ confidence {result.confidence:.2f} "
-                f"< threshold {CONFIDENCE_THRESHOLD:.2f}"
-            )
-            # ➜ 2차 대화형 모델로 에스컬레이션
-            self._start_dialog(
-                original_text=text,
-                intent_hint=result.intent.name,
-                confidence=result.confidence,
-                reason="LOW_CONFIDENCE",
-            )
-            print("=" * 50)
-            return
-
-        # 2.5️⃣ HELP/INFO는 "명령"이 아니라 상담 영역 → 2차로 전달
-        if result.intent in (Intent.HELP_REQUEST, Intent.INFO_REQUEST):
-            print("ℹ️ [DECISION] 도움/안내 요청 → 2차 대화형 모델로 전환")
-            self._start_dialog(
-                original_text=text,
-                intent_hint=result.intent.name,
-                confidence=result.confidence,
-                reason="HELP_OR_INFO",
-            )
-            print("=" * 50)
-            return
-
-        # 3️⃣ 최종 실행 판단
-        print("✅ [DECISION] 제어 조건 충족 → 실행")
-
-        self._execute_intent(result.intent)
 
         print("=" * 50)
+        print(f"[ENGINE] State={self.state}")
+        print(f"[ENGINE] Text={text}")
 
-    def _execute_intent(self, intent: Intent):
-        if intent == Intent.OPEN_GATE:
-            self.open_gate()
-        elif intent == Intent.CLOSE_GATE:
-            self.close_gate()
+        # ==================================================
+        # ?윟 2李??곷떞 ?④퀎 (?곹깭 ?좎?, ??붾뒗 怨꾩냽 ?쇰쭏濡?
+        # ==================================================
+        if self.state == "SECOND_STAGE":
+            try:
+                # ??(異붽?) ?ъ슜??諛쒗솕 濡쒓렇
+                self.dialog_turn_index += 1
+                log_dialog(
+                    intent_log_id=self.intent_log_id,
+                    session_id=self.session_id,
+                    role="user",
+                    content=text,
+                    model="stt",
+                    turn_index=self.dialog_turn_index,
+                )
 
-    def _reset_dialog(self):
-        self.state = "IDLE"
-        self.dialog_messages = []
-        self.pending_intent = None
+                # ??(異붽?) ?쇰쭏 ?몄텧
+                res = dialog_llm_chat(text, history=None, context={"session_id": self.session_id}, debug=True)
+                llama_response = res.reply if hasattr(res, "reply") else str(res)
 
-    def _start_dialog(
-        self,
-        original_text: str,
-        intent_hint: str,
-        confidence: float,
-        reason: str,
-    ):
-        """2차 LLM 대화 시작."""
-        self.state = "DIALOG"
-        self.dialog_messages = make_dialog_system_messages()
+                # ??(異붽?) ?쇰쭏 ?묐떟 濡쒓렇
+                self.dialog_turn_index += 1
+                log_dialog(
+                    intent_log_id=self.intent_log_id,
+                    session_id=self.session_id,
+                    role="assistant",
+                    content=llama_response,
+                    model="llama-3.1-8b",
+                    turn_index=self.dialog_turn_index,
+                )
 
-        # 1차 결과를 힌트로 전달(모델이 상황을 빨리 잡게)
-        self.dialog_messages.append(
-            {
-                "role": "user",
-                "content": (
-                    f"[1차 의도 힌트] intent={intent_hint}, confidence={confidence:.2f}, reason={reason}\n"
-                    f"[사용자 원문] {original_text}"
-                ),
-            }
-        )
+                print(f"[DIALOG] {llama_response}")
 
-        # 시작하자마자 2차 응답 1회 생성
-        self._dialog_step(user_text=None)
+            except Exception as e:
+                # ??(異붽?) STT 肄쒕갚??二쎌? ?딅룄濡?2李??덉쇅???붿쭊?먯꽌 泥섎━
+                print(f"[ENGINE] 2nd-stage failed: {repr(e)}")
 
-    def _dialog_step(self, user_text: str | None):
-        """2차 대화형 LLM 1 step."""
-        if user_text:
-            self.dialog_messages.append({"role": "user", "content": user_text})
+            print("=" * 50)
+            return
 
+        # ==================================================
+        # ?뵷 1李??섎룄 遺꾨쪟 ?④퀎 (?먮낯 ?좎?)
+        # ==================================================
         try:
-            resp: DialogLLMResponse = dialog_llm_chat(self.dialog_messages)
+            result = detect_intent_llm(text)
         except Exception as e:
-            print("❌ [DIALOG] Llama 호출 실패:", e)
-            print("➡️ Ollama가 실행 중인지 확인: `ollama serve` / `ollama run llama3.1:8b`")
-            self._reset_dialog()
+            print("[ENGINE] LLM inference failed:", e)
+            print("=" * 50)
             return
 
-        # 사용자에게 보여줄 문장
-        print("🤖 [Llama]", resp.assistant)
-        self.dialog_messages.append({"role": "assistant", "content": resp.assistant})
+        result.confidence = self.calculate_confidence(text=text, intent=result.intent)
 
-        # 모델이 제어를 제안하면 확인 단계로
-        if resp.suggested_intent in ("OPEN_GATE", "CLOSE_GATE") and resp.confirm:
-            self.pending_intent = Intent.OPEN_GATE if resp.suggested_intent == "OPEN_GATE" else Intent.CLOSE_GATE
-            self.state = "CONFIRM"
-            prompt = resp.confirm_prompt or "실행할까요? 예/아니오로 답해주세요."
-            print("🧩 [CONFIRM PROMPT]", prompt)
+        print(f"[ENGINE] Intent={result.intent.name}, confidence={result.confidence:.2f}")
+
+        # ??(蹂寃? 1李?intent 濡쒓렇 ?곸옱 + PK 諛섑솚媛????(2李?dialog_logs FK濡??ъ슜)
+        self.intent_log_id = log_intent(
+            utterance=text,
+            predicted_intent=result.intent.value,
+            predicted_confidence=result.confidence,
+            source="kiosk",
+            site_id=SITE_ID,
+        )
+        print(f"[ENGINE] intent_log_id={self.intent_log_id}")  # ??(異붽?) NULL ?щ? ?뺤씤??
+        # ??(異붽?) intent_log_id媛 ?놁쑝硫?dialog_logs NOT NULL 源⑥?誘濡?2李⑤줈 紐?媛?        if self.intent_log_id is None:
+            print("[ENGINE] intent_log_id is None ??skip llama fallback")
+            print("=" * 50)
             return
 
-        # 종료 조건
-        if resp.state == "END":
-            self._reset_dialog()
+        if result.intent == Intent.NONE:
+            print("[ENGINE] Decision: irrelevant utterance")
+            print("=" * 50)
+            return
 
-    def open_gate(self):
-        print("🟢 [CONTROL] 차단기 열기 실행")
+        # ==================================================
+        # confidence 湲곗? 遺꾧린: ?ш린留??쇰쭏 遺숈엫 (?붽뎄?ы빆 ?듭떖)
+        # ==================================================
+        if result.confidence < CONFIDENCE_THRESHOLD:
+            print("[ENGINE] Decision: low confidence ??llama fallback")
 
-    def close_gate(self):
-        print("🔴 [CONTROL] 차단기 닫기 실행")
+            # ??(異붽?) ?몄뀡 id ?앹꽦(?ъ슜?먮퀎 ???異붿쟻)
+            self.state = "SECOND_STAGE"
+            self.session_id = str(uuid.uuid4())   # ???붽뎄?ы빆: uuid 湲곕컲 session_id
+            self.dialog_turn_index = 0            # ??(異붽?) ??珥덇린??
+            print(f"[ENGINE] Session started: {self.session_id}")
+            print("[ENGINE] Llama will handle this utterance (logging dialog)")
+
+            # ??(異붽?) ?쒖껀 諛쒗솕?앸룄 諛붾줈 2李⑤줈 泥섎━(濡쒓렇 + ?쇰쭏?묐떟)
+            self.handle_text(text)
+
+            print("=" * 50)
+            return
+
+        print("[ENGINE] Decision: passed 1st-stage classification")
+        print("[ENGINE] Action: defer execution to next stage")
+        print("=" * 50)
+
+    # ==================================================
+    # ?뵚 ?곷떞 醫낅즺 ???몄텧
+    # ==================================================
+
+    def end_second_stage(self):
+        print(f"[ENGINE] Session ended: {self.session_id}")
+        self.state = "FIRST_STAGE"
+        self.session_id = None
+        self.intent_log_id = None          # ??(異붽?) ?몄뀡 醫낅즺 ??珥덇린??        self.dialog_turn_index = 0         # ??(異붽?) 珥덇린??

@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import os
@@ -34,10 +35,12 @@ from engine.app_engine import AppEngine                  # noqa: E402
 MIC_DEVICE_INDEX = 1
 
 
+
 def main():
     """
     ParkAssist 메인 진입점
     """
+
     print("[MAIN] Starting ParkAssist voice pipeline")
 
     # 1) App Engine 생성
@@ -50,6 +53,7 @@ def main():
         device_index=MIC_DEVICE_INDEX,
     )
     print("[MAIN] STT engine initialized")
+
 
     # 3) STT 결과 콜백 연결
     stt.on_text = engine.handle_text

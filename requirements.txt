@@ -3,15 +3,16 @@
 # =========================
 
 torch
-# PyTorch: LLM(Qwen) 異붾줎 諛?紐⑤뜽 ?ㅽ뻾???듭떖 ?꾨젅?꾩썙??
+# PyTorch: LLM(Qwen) 추론 및 모델 실행용 핵심 프레임워크
+
 transformers
-# Hugging Face Transformers: Qwen, Whisper ??LLM/STT 紐⑤뜽 濡쒕뵫 諛?異붾줎
+# Hugging Face Transformers: Qwen, Whisper 등 LLM/STT 모델 로딩 및 추론
 
 accelerate
-# Transformers 異붾줎/濡쒕뵫 理쒖쟻??(?붾컮?댁뒪 留ㅽ븨, 硫붾え由?愿由?
+# Transformers 추론/로딩 최적화 (디바이스 매핑, 메모리 관리)
 
 pydantic
-# ?섎룄 遺꾨쪟 寃곌낵(IntentResult)? 媛숈? ?곗씠???ㅽ궎留?寃利??뺤쓽
+# 의도 분류 결과(IntentResult)와 같은 데이터 스키마 검증/정의
 
 
 # =========================
@@ -19,28 +20,28 @@ pydantic
 # =========================
 
 sounddevice
-# 留덉씠???낅젰 ?섏쭛 (?ㅼ떆媛??뚯꽦 ?낅젰)
+# 마이크 입력 수집 (실시간 음성 입력)
 
 numpy
-# ?ㅻ뵒???곗씠??諛??섏튂 ?곗궛 湲곕낯 ?쇱씠釉뚮윭由?
+# 오디오 데이터 및 수치 연산 기본 라이브러리
+
 scipy
-# ?ㅻ뵒???좏샇 泥섎━ (resampling ??
+# 오디오 신호 처리 (resampling 등)
 
 faster-whisper
-# Whisper 湲곕컲 怨좎냽 STT ?붿쭊 (?ㅼ떆媛??뚯꽦 ?몄떇)
+# Whisper 기반 고속 STT 엔진 (실시간 음성 인식)
 
 openai-whisper
 
 requests
-
 # =========================
 # Database / Environment
 # =========================
 
 psycopg2-binary
-# PostgreSQL ?쒕씪?대쾭
-# Supabase(PostgreSQL)? Python 肄붾뱶(intent_logger) ?곌껐???ъ슜
+# PostgreSQL 드라이버
+# Supabase(PostgreSQL)와 Python 코드(intent_logger) 연결에 사용
 
 python-dotenv
-# .env ?뚯씪 濡쒕뱶
-# DATABASE_URL ???섍꼍蹂?섎? 濡쒖뺄 媛쒕컻 ?섍꼍?먯꽌 ?덉쟾?섍쾶 愿由?
+# .env 파일 로드
+# DATABASE_URL 등 환경변수를 로컬 개발 환경에서 안전하게 관리

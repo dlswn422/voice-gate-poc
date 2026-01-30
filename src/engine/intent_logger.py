@@ -1,3 +1,29 @@
+import os
+import psycopg2
+from contextlib import contextmanager
+
+def _db_url() -> str | None:
+    # dotenv가 main에서 load된 이후 값이 들어오므로, 호출 시점에 읽는 게 안전
+    return os.getenv("DATABASE_URL")
+
+@contextmanager
+def get_conn():
+    """
+    PostgreSQL 커넥션 컨텍스트 매니저
+    - 성공: commit
+    - 예외: rollback
+    - 마지막: close
+    """
+    conn = psycopg2.connect(_db_url())
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
 def log_intent(
     utterance: str,
     predicted_intent: str,
@@ -56,6 +82,10 @@ def log_dialog(
     """
     if not _db_url():
         print("⚠ [INTENT_LOGGER] DATABASE_URL not set")
+        return
+        
+    if intent_log_id is None:
+        print("⚠ [INTENT_LOGGER] intent_log_id is None → skip dialog log")
         return
 
     if role not in ("user", "assistant"):

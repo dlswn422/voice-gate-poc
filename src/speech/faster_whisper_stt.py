@@ -177,7 +177,7 @@ class FasterWhisperSTT:
             self.stop()
 
     # ==================================================
-    # STT Worker Thread (🔥 핵심)
+    # STT Worker Thread
     # ==================================================
     def _stt_worker(self):
         print("[STT] STT worker started")

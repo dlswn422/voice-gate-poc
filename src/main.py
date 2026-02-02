@@ -1,15 +1,13 @@
 from __future__ import annotations
 
 import os
-import sys
-import time
 from pathlib import Path
 from dotenv import load_dotenv
 
 
 # ==================================================
-# 🔧 환경 변수 / 스레드 제한 (중요)
-# - 다른 노트북에서 detect 멈춤 방지 핵심
+# 🔧 스레드 / 병렬 처리 제한
+# - 일부 환경에서 detect 멈춤 현상 방지
 # ==================================================
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
@@ -17,12 +15,12 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 
 # ==================================================
-# 환경 변수 로드
-# - src/.env, project root/.env 모두 시도
+# 🌱 환경 변수 로드
+# - src/.env → 프로젝트 루트 .env 순서로 시도
 # ==================================================
 def _load_env():
-    here = Path(__file__).resolve().parent          # .../src
-    root = here.parent                              # .../voice-gate-poc
+    here = Path(__file__).resolve().parent
+    root = here.parent
 
     load_dotenv(here / ".env")
     load_dotenv(root / ".env")
@@ -30,86 +28,71 @@ def _load_env():
 
 _load_env()
 
-print("=" * 60)
-print("[ENV] Python:", sys.version)
-print("[ENV] CWD:", os.getcwd())
-print("[ENV] DATABASE_URL loaded =", bool(os.getenv("DATABASE_URL")))
-print("[ENV] OMP_NUM_THREADS =", os.getenv("OMP_NUM_THREADS"))
-print("[ENV] MKL_NUM_THREADS =", os.getenv("MKL_NUM_THREADS"))
-print("=" * 60)
-
 
 # ==================================================
-# Import (env 설정 이후!)
+# Import (⚠️ env 설정 이후에 import!)
 # ==================================================
 from src.speech.faster_whisper_stt import FasterWhisperSTT  # noqa: E402
 from src.engine.app_engine import AppEngine                  # noqa: E402
 from src.nlu.llm_client import detect_intent_llm             # noqa: E402
 
 
-# --------------------------------------------------
+# ==================================================
 # 🎤 마이크 디바이스 인덱스
-# --------------------------------------------------
+# ==================================================
 MIC_DEVICE_INDEX = 1
 
 
 def main():
     """
-    ParkAssist 메인 진입점 (관측 강화 최종본)
+    ParkAssist 음성 파이프라인 메인 엔트리 포인트
+    - STT → Intent Detect → AppEngine 처리
     """
 
-    print("\n[MAIN] 🚀 Starting ParkAssist voice pipeline")
+    print("[ParkAssist] 🚀 Starting voice pipeline")
 
     # ==================================================
-    # 1️⃣ App Engine
+    # 1️⃣ App Engine 초기화
     # ==================================================
-    print("[MAIN] Initializing AppEngine...")
     engine = AppEngine()
-    print("[MAIN] AppEngine initialized")
 
     # ==================================================
-    # 2️⃣ STT Engine
+    # 2️⃣ STT 엔진 초기화
     # ==================================================
-    print("[MAIN] Initializing STT engine...")
     stt = FasterWhisperSTT(
-        model_size="large-v3",   # ⚠️ 다른 노트북 느리면 medium 권장
+        model_size="large-v3",   # 성능 이슈 시 medium 권장
         device_index=MIC_DEVICE_INDEX,
     )
-    print("[MAIN] STT engine initialized")
 
     # ==================================================
-    # 3️⃣ detect LLM 사전 warm-up (⭐ 중요 ⭐)
-    # - 다른 노트북에서 "detect에서 멈춤" 방지
+    # 3️⃣ Intent LLM warm-up
+    # - 첫 호출 지연 / 멈춤 현상 방지 목적
     # ==================================================
-    print("[MAIN] Warming up intent LLM...")
-    t0 = time.time()
     try:
-        detect_intent_llm("테스트입니다", debug=True)
-    except Exception as e:
-        print("[MAIN] ❌ detect warm-up failed:", repr(e))
-    print(f"[MAIN] detect warm-up done ({time.time() - t0:.2f}s)")
+        detect_intent_llm("테스트입니다", debug=False)
+    except Exception:
+        # warm-up 실패해도 서비스는 계속 진행
+        pass
 
     # ==================================================
     # 4️⃣ STT → AppEngine 콜백 연결
     # ==================================================
     stt.on_text = engine.handle_text
-    print("[MAIN] STT callback connected to AppEngine")
 
     # ==================================================
-    # 5️⃣ Listening
+    # 5️⃣ 마이크 입력 대기
     # ==================================================
-    print("[MAIN] 🎧 Listening for microphone input...")
-    print("[MAIN] (Ctrl+C to stop)\n")
+    print("[ParkAssist] 🎧 Listening... (Ctrl+C to stop)")
 
     try:
         stt.start_listening()
     except KeyboardInterrupt:
-        print("\n[MAIN] KeyboardInterrupt received")
+        pass
     except Exception as e:
-        print("[MAIN] ❌ Fatal error:", repr(e))
+        print("[ParkAssist] ❌ Fatal error:", repr(e))
     finally:
-        print("[MAIN] Shutting down...")
         stt.stop()
+        print("[ParkAssist] 👋 Shutdown complete")
 
 
 if __name__ == "__main__":

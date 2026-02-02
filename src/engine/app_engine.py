@@ -15,28 +15,20 @@ CONFIDENCE_THRESHOLD = 0.75
 SITE_ID = "parkassist_local"
 
 # ==================================================
-# 멀티턴 정책 (핵심)
+# 원턴(즉시 응답) 템플릿
 # ==================================================
-# 구조적으로 "도움 요청" → 무조건 멀티턴
-MULTI_TURN_INTENTS = {
-    Intent.ENTRY_FLOW_ISSUE,
-    Intent.EXIT_FLOW_ISSUE,
-    Intent.PAYMENT_ISSUE,
-    Intent.REGISTRATION_ISSUE,
-    Intent.COMPLAINT,
+ONE_TURN_RESPONSES = {
+    Intent.EXIT: "정산이 완료되면 차단기가 자동으로 열립니다.",
+    Intent.ENTRY: "입차 시 차량 인식 후 차단기가 자동으로 열립니다.",
+    Intent.PAYMENT: "주차 요금은 정산기 또는 출구에서 확인하실 수 있습니다.",
+    Intent.REGISTRATION: "차량 또는 방문자 등록은 키오스크에서 진행하실 수 있습니다.",
+    Intent.TIME_PRICE: "주차 시간 및 요금은 키오스크 화면에서 확인하실 수 있습니다.",
+    Intent.FACILITY: "기기 이상 시 관리실로 문의해 주세요.",
 }
 
-# 구조적으로 "정보 요청" → 1턴 가능
-ONE_TURN_INTENTS = {
-    Intent.PRICE_INQUIRY,
-    Intent.HOW_TO_EXIT,
-    Intent.HOW_TO_REGISTER,
-    Intent.TIME_ISSUE,
-}
-
-# --------------------------------------------------
+# ==================================================
 # DONE 강제 종료 정책
-# --------------------------------------------------
+# ==================================================
 DONE_KEYWORDS = [
     "됐어요", "되었습니다", "해결", "괜찮아요",
     "그만", "종료", "끝", "마칠게",
@@ -60,11 +52,13 @@ def _is_done_utterance(text: str) -> bool:
 
 class AppEngine:
     """
-    주차장 키오스크 CX용 App Engine
+    주차장 키오스크 CX App Engine (FINAL)
 
-    상태:
-    - FIRST_STAGE  : 1차 의도 분류
-    - SECOND_STAGE : 2차 멀티턴 상담
+    설계 요약:
+    - 1차 모델: 의도(주제) 분류만 담당
+    - AppEngine: 멀티턴 여부 판단 + 라우팅
+    - 멀티턴 ❌ → 즉시 원턴 응답
+    - 멀티턴 ⭕ → 2차 LLM 상담
     """
 
     def __init__(self):
@@ -83,59 +77,42 @@ class AppEngine:
         self._ignore_until_ts = 0.0
 
     # ==================================================
-    # confidence 계산 (AppEngine 책임)
+    # confidence 계산
     # ==================================================
     def calculate_confidence(self, text: str, intent: Intent) -> float:
         score = 0.4
         text = text.strip()
 
-        intent_name = getattr(intent, "name", str(intent))
-
-        KEYWORDS_BY_INTENT_NAME = {
-            "EXIT_FLOW_ISSUE": ["출차", "나가", "차단기", "안열려", "안 열려"],
-            "ENTRY_FLOW_ISSUE": ["입차", "들어가", "차단기", "안열려", "안 열려"],
-            "PAYMENT_ISSUE": ["결제", "요금", "카드", "정산", "승인"],
-            "TIME_ISSUE": ["시간", "무료", "초과"],
-            "PRICE_INQUIRY": ["얼마", "요금", "가격"],
-            "HOW_TO_EXIT": ["어떻게", "출차", "나가"],
-            "HOW_TO_REGISTER": ["등록", "어디", "방법"],
+        KEYWORDS_BY_INTENT = {
+            Intent.EXIT: ["출차", "나가", "차단기"],
+            Intent.ENTRY: ["입차", "들어가", "차단기"],
+            Intent.PAYMENT: ["결제", "요금", "카드", "정산"],
+            Intent.REGISTRATION: ["등록", "번호판", "방문"],
+            Intent.TIME_PRICE: ["시간", "무료", "초과", "요금"],
+            Intent.FACILITY: ["기계", "화면", "고장", "이상"],
+            Intent.COMPLAINT: ["왜", "안돼", "이상", "짜증"],
         }
 
-        hits = sum(1 for k in KEYWORDS_BY_INTENT_NAME.get(intent_name, []) if k in text)
-
+        hits = sum(1 for k in KEYWORDS_BY_INTENT.get(intent, []) if k in text)
         score += 0.35 if hits >= 1 else 0.15
 
-        if len(text) < 3:
-            score += 0.05
-        elif any(f in text for f in ["어", "음", "..."]):
-            score += 0.10
-        else:
-            score += 0.25
-
-        INTENT_RISK_WEIGHT_BY_NAME = {
-            "HOW_TO_EXIT": 1.0,
-            "PRICE_INQUIRY": 1.0,
-            "TIME_ISSUE": 0.95,
-            "EXIT_FLOW_ISSUE": 0.85,
-            "ENTRY_FLOW_ISSUE": 0.85,
-            "PAYMENT_ISSUE": 0.85,
-            "REGISTRATION_ISSUE": 0.80,
-            "COMPLAINT": 0.70,
-        }
-
-        score *= INTENT_RISK_WEIGHT_BY_NAME.get(intent_name, 0.6)
+        score += 0.05 if len(text) <= 4 else 0.2
         return round(min(score, 1.0), 2)
 
     # ==================================================
-    # 멀티턴 여부 판단 (정책 핵심)
+    # 멀티턴 여부 판단 (핵심)
     # ==================================================
-    def should_use_multiturn(self, intent: Intent, confidence: float) -> bool:
-        # 구조적으로 도움 요청 → 무조건 멀티턴
-        if intent in MULTI_TURN_INTENTS:
+    def should_use_multiturn(self, intent: Intent, confidence: float, text: str) -> bool:
+        # 불만/감정 표현 → 무조건 멀티턴
+        if intent == Intent.COMPLAINT:
             return True
 
-        # 정보성이라도 confidence 낮으면 확인 필요
-        if intent in ONE_TURN_INTENTS and confidence < CONFIDENCE_THRESHOLD:
+        # 문제/오류 표현 → 확인 질문 필요
+        if any(k in text for k in ["안돼", "이상", "왜", "멈췄"]):
+            return True
+
+        # 분류 신뢰도 낮음 → 확인 필요
+        if confidence < CONFIDENCE_THRESHOLD:
             return True
 
         return False
@@ -148,47 +125,16 @@ class AppEngine:
             return
 
         try:
-            # DONE 강제 종료
             if _is_done_utterance(text):
-                self.dialog_turn_index += 1
-                log_dialog(
-                    intent_log_id=self.intent_log_id,
-                    session_id=self.session_id,
-                    role="user",
-                    content=text,
-                    model="stt",
-                    turn_index=self.dialog_turn_index,
-                )
-
-                self.dialog_turn_index += 1
-                log_dialog(
-                    intent_log_id=self.intent_log_id,
-                    session_id=self.session_id,
-                    role="assistant",
-                    content=FAREWELL_TEXT,
-                    model="system",
-                    turn_index=self.dialog_turn_index,
-                )
-
+                self._log_dialog("user", text)
+                self._log_dialog("assistant", FAREWELL_TEXT, model="system")
                 print(f"[DIALOG] {FAREWELL_TEXT}")
                 self.end_second_stage()
                 self._ignore_until_ts = time.time() + DONE_COOLDOWN_SEC
                 return
 
-            # user 로그
-            self.dialog_turn_index += 1
-            log_dialog(
-                intent_log_id=self.intent_log_id,
-                session_id=self.session_id,
-                role="user",
-                content=text,
-                model="stt",
-                turn_index=self.dialog_turn_index,
-            )
+            self._log_dialog("user", text)
 
-            self.dialog_history.append({"role": "user", "content": text})
-
-            # 2차 LLM 호출
             res = dialog_llm_chat(
                 text,
                 history=self.dialog_history,
@@ -206,18 +152,7 @@ class AppEngine:
             if action == "DONE":
                 reply = FAREWELL_TEXT
 
-            # assistant 로그
-            self.dialog_turn_index += 1
-            log_dialog(
-                intent_log_id=self.intent_log_id,
-                session_id=self.session_id,
-                role="assistant",
-                content=reply,
-                model="llama-3.1-8b",
-                turn_index=self.dialog_turn_index,
-            )
-
-            self.dialog_history.append({"role": "assistant", "content": reply})
+            self._log_dialog("assistant", reply, model="llama-3.1-8b")
             print(f"[DIALOG] {reply}")
 
             if action == "DONE":
@@ -227,13 +162,24 @@ class AppEngine:
         except Exception as e:
             print(f"[ENGINE] 2nd-stage failed: {repr(e)}")
 
+    def _log_dialog(self, role: str, content: str, model: str = "stt"):
+        self.dialog_turn_index += 1
+        log_dialog(
+            intent_log_id=self.intent_log_id,
+            session_id=self.session_id,
+            role=role,
+            content=content,
+            model=model,
+            turn_index=self.dialog_turn_index,
+        )
+        self.dialog_history.append({"role": role, "content": content})
+
     # ==================================================
     # STT 텍스트 엔트리포인트
     # ==================================================
     def handle_text(self, text: str):
         if not text or not text.strip():
             return
-
         if time.time() < self._ignore_until_ts:
             return
 
@@ -242,7 +188,7 @@ class AppEngine:
         print(f"[ENGINE] Text={text}")
 
         # ------------------------------
-        # 2차 멀티턴
+        # 2차 멀티턴 중
         # ------------------------------
         if self.state == "SECOND_STAGE":
             self._handle_second_stage(text)
@@ -253,8 +199,6 @@ class AppEngine:
         # 1차 의도 분류
         # ------------------------------
         result = detect_intent_llm(text)
-        self.first_intent = result.intent.value
-
         result.confidence = self.calculate_confidence(text, result.intent)
 
         print(f"[ENGINE] Intent={result.intent.name}, confidence={result.confidence:.2f}")
@@ -267,14 +211,16 @@ class AppEngine:
             site_id=SITE_ID,
         )
 
-        if self.intent_log_id is None or result.intent == Intent.NONE:
+        if result.intent == Intent.NONE:
             print("=" * 50)
             return
+
+        self.first_intent = result.intent.value
 
         # ------------------------------
         # 멀티턴 여부 판단
         # ------------------------------
-        if self.should_use_multiturn(result.intent, result.confidence):
+        if self.should_use_multiturn(result.intent, result.confidence, text):
             print("[ENGINE] Decision: multiturn → 2nd stage")
 
             self.state = "SECOND_STAGE"
@@ -287,9 +233,25 @@ class AppEngine:
             return
 
         # ------------------------------
-        # 1턴 종료 (정보성)
+        # ✅ 원턴 즉시 응답
         # ------------------------------
-        print("[ENGINE] Decision: one-turn handled by 1st stage")
+        reply = ONE_TURN_RESPONSES.get(
+            result.intent,
+            "안내를 도와드릴 수 있는 상담으로 연결하겠습니다."
+        )
+
+        print("[ENGINE] Decision: one-turn → immediate response")
+        print(f"[ONE-TURN] {reply}")
+
+        log_dialog(
+            intent_log_id=self.intent_log_id,
+            session_id=None,
+            role="assistant",
+            content=reply,
+            model="system",
+            turn_index=0,
+        )
+
         print("=" * 50)
 
     # ==================================================

@@ -11,7 +11,7 @@ import requests
 from src.nlu.intent_schema import IntentResult, Intent
 
 # ==================================================
-# Ollama Native Chat API 설정 (확정)
+# Ollama Native Chat API 설정
 # ==================================================
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
 OLLAMA_MODEL = os.getenv(
@@ -25,49 +25,53 @@ OLLAMA_CHAT_URL = f"{OLLAMA_BASE_URL}/api/chat"
 _JSON_RE = re.compile(r"\{[\s\S]*?\}")
 
 # ==================================================
-# 1차 의도 분류 시스템 프롬프트 (INTENT ONLY)
+# 1차 의도 분류 시스템 프롬프트 (LEVEL-1 INTENT ONLY)
 # ==================================================
 SYSTEM_PROMPT_INTENT = (
-    "너는 '주차장 키오스크 CX' 전용 음성 의도 분류 AI다.\n\n"
-    "사용자의 발화를 아래 의도 중 하나로만 분류하라.\n"
-    "이 분류는 실행이나 제어 판단이 아니라,\n"
-    "사용자가 처한 상황 / 문제 / 문의 유형을 구분하기 위한 것이다.\n\n"
+    "너는 주차장 키오스크 음성 시스템의 1차 의도 분류기다.\n\n"
+    "역할:\n"
+    "- 사용자의 발화를 '주제 단위(Level-1 Intent)'로만 분류한다\n"
+    "- 해결 방법 제시, 실행 판단, 대화 생성은 절대 하지 않는다\n"
+    "- HOW_TO, ISSUE, ERROR 같은 세부 원인은 고려하지 않는다\n\n"
     "[의도 목록]\n"
-    "- ENTRY_FLOW_ISSUE\n"
-    "- EXIT_FLOW_ISSUE\n"
-    "- PAYMENT_ISSUE\n"
-    "- REGISTRATION_ISSUE\n"
-    "- TIME_ISSUE\n"
-    "- PRICE_INQUIRY\n"
-    "- HOW_TO_EXIT\n"
-    "- HOW_TO_REGISTER\n"
-    "- COMPLAINT\n"
-    "- NONE\n\n"
+    "- ENTRY        (입차 관련)\n"
+    "- EXIT         (출차 관련)\n"
+    "- PAYMENT      (요금/결제/정산 관련)\n"
+    "- REGISTRATION (방문자/차량 등록 관련)\n"
+    "- TIME_PRICE   (시간/요금 정책 문의)\n"
+    "- FACILITY     (차단기/기기 이상)\n"
+    "- COMPLAINT    (불만/짜증/혼란 표현)\n"
+    "- NONE         (주차장과 무관)\n\n"
     "[분류 규칙]\n"
-    "- 명령처럼 보여도 상황 설명으로 본다\n"
-    "- 입차 문제와 출차 문제를 문맥으로 구분한다\n"
-    "- 애매해도 반드시 하나의 의도만 선택한다\n"
-    "- 해결 방법이나 실행 판단은 절대 하지 않는다\n\n"
+    "- 명령처럼 보여도 '의도'가 아니라 '주제'로 분류한다\n"
+    "- 문제 상황과 방법 문의를 구분하지 않는다\n"
+    "- 애매해도 반드시 하나의 의도를 선택한다\n\n"
     "[출력 규칙]\n"
     "- 반드시 JSON만 출력한다\n"
     "- 형식: {\"intent\": \"INTENT_NAME\"}\n"
-    "- 다른 텍스트 출력 금지\n"
+    "- 다른 텍스트는 절대 출력하지 않는다\n"
 )
 
 # ==================================================
 # JSON 추출 유틸
 # ==================================================
 def _extract_json(text: str) -> dict:
-    text = (text or "").strip()
+    if not text:
+        raise ValueError("Empty LLM output")
 
-    start = text.find("{")
-    end = text.rfind("}") + 1
-    if start != -1 and end > start:
-        return json.loads(text[start:end])
+    # 1️⃣ 코드블록 제거
+    text = text.strip()
+    text = re.sub(r"```.*?```", "", text, flags=re.S)
 
-    m = _JSON_RE.search(text)
+    # 2️⃣ 첫 JSON 객체만 추출
+    m = re.search(r"\{[^{}]*\}", text)
     if m:
         return json.loads(m.group(0))
+
+    # 3️⃣ 마지막 fallback: intent 키만 강제 추출
+    m = re.search(r'"intent"\s*:\s*"([A-Z_]+)"', text)
+    if m:
+        return {"intent": m.group(1)}
 
     raise ValueError(f"JSON not found in output: {text}")
 
@@ -76,17 +80,19 @@ def _extract_json(text: str) -> dict:
 # ==================================================
 def detect_intent_llm(text: str, debug: bool = True) -> IntentResult:
     """
-    - 1차 intent 분류 전용
-    - confidence는 AppEngine에서 계산
+    1차 의도 분류 전용 함수
+
+    - 입력: STT로 확정된 사용자 발화
+    - 출력: IntentResult (intent + confidence)
+    - 이 단계에서는 절대 해결하지 않는다
     """
 
     if not text or not text.strip():
         return IntentResult(intent=Intent.NONE, confidence=0.0)
 
     if debug:
-        print(f"[LLM] (Ollama) Input text: {text}")
-        print(f"[LLM] (Ollama) base_url={OLLAMA_BASE_URL}")
-        print(f"[LLM] (Ollama) model={OLLAMA_MODEL}")
+        print(f"[LLM] (Intent-1) Input text: {text}")
+        print(f"[LLM] (Intent-1) model={OLLAMA_MODEL}")
 
     prompt = (
         SYSTEM_PROMPT_INTENT
@@ -101,13 +107,15 @@ def detect_intent_llm(text: str, debug: bool = True) -> IntentResult:
         ],
         "stream": False,
         "options": {
+            # 분류는 흔들리면 안 되므로 고정
             "temperature": 0.0,
-            "num_predict": 32,
+            # JSON 하나만 나오면 충분
+            "num_predict": 16,
         },
     }
 
     try:
-        print("[LLM] ⏳ Intent inference started...")
+        print("[LLM] ⏳ Intent-1 inference started...")
         start_ts = time.time()
 
         r = requests.post(
@@ -118,13 +126,13 @@ def detect_intent_llm(text: str, debug: bool = True) -> IntentResult:
         r.raise_for_status()
 
         elapsed_ms = (time.time() - start_ts) * 1000
-        print(f"[LLM] ✅ Intent inference finished ({elapsed_ms:.0f} ms)")
+        print(f"[LLM] ✅ Intent-1 inference finished ({elapsed_ms:.0f} ms)")
 
         data = r.json()
         content = data.get("message", {}).get("content", "")
 
         if debug:
-            print("[LLM] (Ollama) Raw output:")
+            print("[LLM] (Intent-1) Raw output:")
             print(content)
 
         obj = _extract_json(content)
@@ -135,15 +143,16 @@ def detect_intent_llm(text: str, debug: bool = True) -> IntentResult:
         except Exception:
             intent = Intent.NONE
 
-        print(f"[LLM] 🎯 Parsed intent: {intent.name}")
+        print(f"[LLM] 🎯 Intent-1 classified: {intent.name}")
 
+        # confidence는 여기서 계산하지 않는다
         return IntentResult(
             intent=intent,
             confidence=0.0,
         )
 
     except Exception as e:
-        print("[LLM] ❌ Intent inference failed")
+        print("[LLM] ❌ Intent-1 inference failed")
         if debug:
             print(repr(e))
             traceback.print_exc()

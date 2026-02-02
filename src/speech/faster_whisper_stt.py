@@ -18,7 +18,7 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 class FasterWhisperSTT:
     """
-    실시간 STT 엔진 (비동기 안정 최종본)
+    실시간 STT 엔진 (비동기 안정 + 로그 강화 최종본)
 
     구조
     - Audio Thread (sounddevice InputStream)
@@ -31,7 +31,7 @@ class FasterWhisperSTT:
 
     def __init__(
         self,
-        model_size: str = "medium",        # CPU 기준 권장
+        model_size: str = "medium",
         device_index: Optional[int] = None,
         sample_rate: int = 16000,
         input_sample_rate: int = 48000,
@@ -44,7 +44,6 @@ class FasterWhisperSTT:
         temperature: float = 0.0,
         download_root: str = "models",
     ):
-        # 오디오 설정
         self.sample_rate = sample_rate
         self.input_sample_rate = input_sample_rate
         self.chunk_seconds = chunk_seconds
@@ -52,18 +51,14 @@ class FasterWhisperSTT:
         self.silence_chunks = silence_chunks
         self.device_index = device_index
 
-        # STT 필터링
         self.min_utterance_seconds = min_utterance_seconds
         self.min_text_len = min_text_len
 
-        # Whisper 디코딩
         self.beam_size = beam_size
         self.temperature = temperature
 
-        # 콜백
         self.on_text: Optional[Callable[[str], None]] = None
 
-        # 내부 상태
         self._audio_queue: queue.Queue[np.ndarray] = queue.Queue()
         self._stop_event = threading.Event()
 
@@ -89,7 +84,7 @@ class FasterWhisperSTT:
         self._worker_thread.start()
 
         # --------------------------------------------------
-        # Whisper warm-up (첫 추론 멈춤 방지)
+        # Whisper warm-up
         # --------------------------------------------------
         self._warmup()
 
@@ -109,12 +104,12 @@ class FasterWhisperSTT:
                     vad_filter=False,
                 )
             )
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[STT] Warm-up error (ignored): {repr(e)}")
         print("[STT] Warm-up done")
 
     # ==================================================
-    # Resample (48k -> 16k 최적화)
+    # Resample
     # ==================================================
     def _resample_to_16k(self, audio_1d: np.ndarray) -> np.ndarray:
         if self.input_sample_rate == self.sample_rate:
@@ -123,12 +118,14 @@ class FasterWhisperSTT:
         if self.input_sample_rate == 48000 and self.sample_rate == 16000:
             return resample_poly(audio_1d, up=1, down=3).astype(np.float32)
 
-        up = self.sample_rate
-        down = self.input_sample_rate
-        return resample_poly(audio_1d, up=up, down=down).astype(np.float32)
+        return resample_poly(
+            audio_1d,
+            up=self.sample_rate,
+            down=self.input_sample_rate,
+        ).astype(np.float32)
 
     # ==================================================
-    # Audio Thread (입력 + 발화 감지)
+    # Audio Thread
     # ==================================================
     def start_listening(self):
         print("[STT] Listening started (Ctrl+C to stop)")
@@ -150,10 +147,12 @@ class FasterWhisperSTT:
                 while not self._stop_event.is_set():
                     data, overflowed = stream.read(frames_per_chunk)
 
+                    if overflowed:
+                        print("[STT] ⚠️ Audio overflow detected")
+
                     audio = data.squeeze()
                     volume = float(np.max(np.abs(audio))) if audio.size else 0.0
 
-                    # 음성 감지
                     if volume >= self.silence_threshold:
                         if not is_speaking:
                             print("[STT] Speech detected")
@@ -164,9 +163,11 @@ class FasterWhisperSTT:
                         if is_speaking:
                             silent_count += 1
 
-                    # 발화 종료
                     if is_speaking and silent_count >= self.silence_chunks:
-                        print("[STT] Speech ended → enqueue audio")
+                        print(
+                            f"[STT] Speech ended → enqueue audio "
+                            f"(samples={sum(len(b) for b in buffer)})"
+                        )
                         self._audio_queue.put(np.concatenate(buffer))
                         buffer.clear()
                         silent_count = 0
@@ -188,13 +189,17 @@ class FasterWhisperSTT:
             except queue.Empty:
                 continue
 
-            audio_16k = self._resample_to_16k(audio_in)
+            print(f"[STT] Dequeued audio (len={audio_in.shape[0]})")
 
-            # 너무 짧은 발화 컷
+            audio_16k = self._resample_to_16k(audio_in)
+            print(f"[STT] Resampled to 16k (len={audio_16k.shape[0]})")
+
             min_samples = int(self.sample_rate * self.min_utterance_seconds)
             if audio_16k.size < min_samples:
+                print("[STT] Ignored short utterance")
                 continue
 
+            print("[STT] Running whisper transcription...")
             try:
                 segments, _ = self.model.transcribe(
                     audio_16k,
@@ -207,12 +212,15 @@ class FasterWhisperSTT:
                 print(f"[STT] Whisper error: {repr(e)}")
                 continue
 
+            print("[STT] Whisper transcription finished")
+
             text = "".join(seg.text for seg in segments).strip()
 
             if not text or len(text) < self.min_text_len:
+                print("[STT] Empty or too-short transcription")
                 continue
 
-            print(f"[STT] Transcribed text: {text}")
+            print(f"[STT] ✅ Transcribed text: {text}")
 
             if self.on_text:
                 self.on_text(text)

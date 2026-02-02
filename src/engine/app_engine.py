@@ -51,6 +51,9 @@ class AppEngine:
         self.state = "FIRST_STAGE"
         self.session_id = None
 
+        # ✅ 추가: 2차(RAG/LLM) 문서 필터링용 최초 intent
+        self.first_intent = None
+
         # ✅ (추가) 2차 로그/세션 추적용
         self.intent_log_id = None
         self.dialog_turn_index = 0
@@ -116,12 +119,12 @@ class AppEngine:
     # ✅ (추가) 2차 처리(로그 + LLM + DONE 강제 + 배웅 고정)
     # ==================================================
     def _handle_second_stage(self, text: str):
-        # ✅ (추가) DONE 직후 중복 STT 무시
+        # ✅ DONE 직후 중복 STT 무시
         if time.time() < self._ignore_until_ts:
             return
 
         try:
-            # ✅ (추가) DONE 키워드면 LLM 호출 없이 강제 종료 + 배웅 멘트 고정
+            # ✅ DONE 키워드면 LLM 호출 없이 강제 종료 + 배웅 멘트 고정
             if _is_done_utterance(text):
                 self.dialog_turn_index += 1
                 log_dialog(
@@ -148,7 +151,9 @@ class AppEngine:
                 self._ignore_until_ts = time.time() + DONE_COOLDOWN_SEC
                 return
 
-            # 사용자 발화 로그
+            # -----------------------------
+            # (1) user 로그 + history
+            # -----------------------------
             self.dialog_turn_index += 1
             log_dialog(
                 intent_log_id=self.intent_log_id,
@@ -159,25 +164,33 @@ class AppEngine:
                 turn_index=self.dialog_turn_index,
             )
 
-            # ✅ (추가) 멀티턴 유지(선택)
+            # ✅ 멀티턴 유지: user 먼저 append
             self.dialog_history.append({"role": "user", "content": text})
 
-            # ✅ 2차 LLM(+RAG) 호출
+            # -----------------------------
+            # (2) 2차 LLM(+RAG) 호출
+            # -----------------------------
             res = dialog_llm_chat(
                 text,
-                history=self.dialog_history,
-                context={"session_id": self.session_id, "intent_log_id": self.intent_log_id},
+                history=self.dialog_history,  # ✅ 지금까지의 대화 포함
+                context={
+                    "session_id": self.session_id,
+                    "intent_log_id": self.intent_log_id,
+                    "first_intent": self.first_intent,  # ✅ A안 필수
+                },
                 debug=True,
             )
 
             llama_reply = getattr(res, "reply", "") or ""
-            action = getattr(res, "action", None)  # "ASK|SOLVE|DONE|..."
+            action = getattr(res, "action", None)
 
-            # ✅ (추가) 모델이 DONE을 주면 배웅 멘트로 고정 후 종료
+            # ✅ 모델이 DONE을 주면 배웅 멘트로 고정
             if action == "DONE":
                 llama_reply = FAREWELL_TEXT
 
-            # 어시스턴트 로그
+            # -----------------------------
+            # (3) assistant 로그 + history
+            # -----------------------------
             self.dialog_turn_index += 1
             log_dialog(
                 intent_log_id=self.intent_log_id,
@@ -188,17 +201,21 @@ class AppEngine:
                 turn_index=self.dialog_turn_index,
             )
 
+            # ✅ 멀티턴 유지: assistant는 reply 받은 뒤 append
             self.dialog_history.append({"role": "assistant", "content": llama_reply})
 
             print(f"[DIALOG] {llama_reply}")
 
+            # -----------------------------
+            # (4) 종료 처리
+            # -----------------------------
             if action == "DONE":
                 self.end_second_stage()
                 self._ignore_until_ts = time.time() + DONE_COOLDOWN_SEC
 
         except Exception as e:
-            # ✅ STT 콜백이 죽지 않게 여기서 잡아먹음
             print(f"[ENGINE] 2nd-stage failed: {repr(e)}")
+
 
     # ==================================================
     # 🎙️ STT 텍스트 처리 엔트리포인트
@@ -228,6 +245,9 @@ class AppEngine:
         # ==================================================
         try:
             result = detect_intent_llm(text)
+
+            # ✅ 추가: 2차에서 쓰기 위해 최초 intent 저장
+            self.first_intent = result.intent.value
         except Exception as e:
             print("[ENGINE] LLM inference failed:", e)
             print("=" * 50)
@@ -268,7 +288,7 @@ class AppEngine:
             self.session_id = str(uuid.uuid4())   # ✅ 요구사항: session_id 고유 생성
             self.dialog_turn_index = 0
             self.dialog_history = []
-
+            self.first_intent = result.intent.value 
             print(f"[ENGINE] Session started: {self.session_id}")
             print("[ENGINE] Llama will handle this utterance (logging dialog)")
 
@@ -292,3 +312,6 @@ class AppEngine:
         self.intent_log_id = None
         self.dialog_turn_index = 0
         self.dialog_history = []
+        
+        # ✅ 추가: 세션 종료 시 최초 intent도 초기화
+        self.first_intent = None

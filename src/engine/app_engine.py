@@ -54,11 +54,10 @@ class AppEngine:
     """
     주차장 키오스크 CX App Engine (FINAL)
 
-    설계 요약:
-    - 1차 모델: 의도(주제) 분류만 담당
-    - AppEngine: 멀티턴 여부 판단 + 라우팅
-    - 멀티턴 ❌ → 즉시 원턴 응답
-    - 멀티턴 ⭕ → 2차 LLM 상담
+    - 1차 모델: 의도 분류 전용
+    - 원턴 가능 → 즉시 시스템 응답
+    - 원턴 후 추가 발화 → 자동 멀티턴 승격
+    - 멀티턴 → 2차 LLM 상담
     """
 
     def __init__(self):
@@ -75,6 +74,10 @@ class AppEngine:
 
         # DONE 쿨다운
         self._ignore_until_ts = 0.0
+
+        # ✅ 원턴 후 승격용 상태
+        self._just_one_turn = False
+        self._last_one_turn_intent = None
 
     # ==================================================
     # confidence 계산
@@ -95,26 +98,20 @@ class AppEngine:
 
         hits = sum(1 for k in KEYWORDS_BY_INTENT.get(intent, []) if k in text)
         score += 0.35 if hits >= 1 else 0.15
-
         score += 0.05 if len(text) <= 4 else 0.2
+
         return round(min(score, 1.0), 2)
 
     # ==================================================
-    # 멀티턴 여부 판단 (핵심)
+    # 멀티턴 여부 판단
     # ==================================================
     def should_use_multiturn(self, intent: Intent, confidence: float, text: str) -> bool:
-        # 불만/감정 표현 → 무조건 멀티턴
         if intent == Intent.COMPLAINT:
             return True
-
-        # 문제/오류 표현 → 확인 질문 필요
         if any(k in text for k in ["안돼", "이상", "왜", "멈췄"]):
             return True
-
-        # 분류 신뢰도 낮음 → 확인 필요
         if confidence < CONFIDENCE_THRESHOLD:
             return True
-
         return False
 
     # ==================================================
@@ -181,6 +178,26 @@ class AppEngine:
         if not text or not text.strip():
             return
         if time.time() < self._ignore_until_ts:
+            return
+
+        # --------------------------------------------------
+        # ✅ 원턴 직후 추가 발화 → 자동 멀티턴 승격
+        # --------------------------------------------------
+        if self._just_one_turn:
+            self._just_one_turn = False
+            print("[ENGINE] One-turn follow-up detected → escalate to 2nd stage")
+
+            self.state = "SECOND_STAGE"
+            self.session_id = str(uuid.uuid4())
+            self.dialog_turn_index = 0
+            self.dialog_history = []
+            self.first_intent = (
+                self._last_one_turn_intent.value
+                if self._last_one_turn_intent else None
+            )
+
+            self._handle_second_stage(text)
+            print("=" * 50)
             return
 
         print("=" * 50)
@@ -252,6 +269,10 @@ class AppEngine:
             turn_index=0,
         )
 
+        # ✅ 원턴 후 상태 기록
+        self._just_one_turn = True
+        self._last_one_turn_intent = result.intent
+
         print("=" * 50)
 
     # ==================================================
@@ -265,3 +286,5 @@ class AppEngine:
         self.dialog_turn_index = 0
         self.dialog_history = []
         self.first_intent = None
+        self._just_one_turn = False
+        self._last_one_turn_intent = None

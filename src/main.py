@@ -42,9 +42,9 @@ print("=" * 60)
 # ==================================================
 # Import (env 설정 이후!)
 # ==================================================
-from speech.faster_whisper_stt import FasterWhisperSTT  # noqa: E402
-from engine.app_engine import AppEngine                  # noqa: E402
-from nlu.llm_client import detect_intent_llm             # noqa: E402
+from src.speech.faster_whisper_stt import FasterWhisperSTT  # noqa: E402
+from src.engine.app_engine import AppEngine                  # noqa: E402
+from src.nlu.llm_client import detect_intent_llm             # noqa: E402
 
 
 # --------------------------------------------------

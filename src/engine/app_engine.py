@@ -1,7 +1,7 @@
-from nlu.llm_client import detect_intent_llm
-from nlu.intent_schema import Intent
-from engine.intent_logger import log_intent, log_dialog
-from nlu.dialog_llm_client import dialog_llm_chat
+from src.nlu.llm_client import detect_intent_llm
+from src.nlu.intent_schema import Intent
+from src.engine.intent_logger import log_intent, log_dialog
+from src.nlu.dialog_llm_client import dialog_llm_chat
 
 import uuid
 import time

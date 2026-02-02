@@ -9,8 +9,8 @@ from typing import Any, Dict, List, Optional, Literal, Iterable
 
 import requests
 
-from nlu.intent_schema import Intent
-from rag.manual_rag import ManualRAG
+from src.nlu.intent_schema import Intent
+from src.rag.manual_rag import ManualRAG
 
 
 DialogAction = Literal["ASK", "SOLVE", "PROPOSE_OPEN", "PROPOSE_CLOSE", "DONE", "FAILSAFE"]

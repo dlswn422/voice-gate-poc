@@ -41,7 +41,7 @@ DONE_KEYWORDS = [
     "이제 됐", "됐습니다", "해결됐", "정상", "문제없", "됐어", "다 됐", "이만", "끊을게",
 ]
 
-FAREWELL_TEXT = "네, 해결되셨다니 다행입니다. 이용해 주셔서 감사합니다. 안전운전하세요."
+FAREWELL_TEXT = "이용해 주셔서 감사합니다. 안전운전하세요."
 
 
 def _normalize(text: str) -> str:
@@ -89,23 +89,76 @@ SYSTEM_PROMPT = """
 """.strip()
 
 
-# ---------- A안: intent → manuals 파일 후보 매핑 ----------
-# ⚠️ 네 프로젝트 실제 파일명 기준으로 맞춰둠 (로그에 나온 10개)
+# intent → manuals 파일 후보 매핑 (일부 intent는 시스템 내부에서만 쓰일 수 있음)
 INTENT_TO_DOCS: Dict[str, List[str]] = {
     "PAYMENT_ISSUE": ["payment_card_fail.md", "discount_free_time_issue.md"],
     "PRICE_INQUIRY": ["price_inquiry.md"],
     "TIME_ISSUE": ["discount_free_time_issue.md"],
     "REGISTRATION_ISSUE": ["visit_registration_fail.md"],
-    "NETWORK_ISSUE": ["network_terminal_down.md"],
+    "NETWORK_ISSUE": ["network_terminal_down.md", "network_down.md"],
     "ENTRY_FLOW_ISSUE": ["entry_gate_not_open.md", "lpr_mismatch_or_no_entry_record.md"],
-    "EXIT_FLOW_ISSUE": ["exit_gate_not_open.md", "lpr_mismatch_or_no_entry_record.md"],
+    "EXIT_FLOW_ISSUE": ["exit_gate_not_open.md", "exit_barrier_issue.md", "lpr_mismatch_or_no_entry_record.md"],
     "BARRIER_PHYSICAL_FAULT": ["barrier_physical_fault.md"],
-    # 혹시 HELP_REQUEST 같은 넓은 라벨이 오면 failsafe로
-    "HELP_REQUEST": ["failsafe_done.md"],
+    # HELP_REQUEST는 하드필터 금지 + 키워드 기반 후보 추정으로 처리
 }
 
-# RAG
 _rag = ManualRAG()
+
+
+def _infer_docs_for_help_request(user_text: str) -> List[str]:
+    """
+    HELP_REQUEST는 범위가 너무 넓어서 특정 문서로 하드필터하면 빗나가기 쉬움.
+    -> 키워드 기반으로 "우선순위 있는 후보 리스트"를 만들고,
+       retrieve()에서 순서 기반 boost를 줘서 top1이 더 잘 맞게 한다.
+    """
+    t = _normalize(user_text)
+    docs: List[str] = []
+
+    def add(*names: str) -> None:
+        for n in names:
+            if n not in docs:
+                docs.append(n)
+
+    # 결제/정산/카드
+    if any(k in t for k in ["결제", "카드", "정산", "영수증", "승인", "오류", "실패", "환불"]):
+        add("payment_card_fail.md")
+
+    # 무료시간/할인/요금
+    if any(k in t for k in ["무료", "할인", "시간", "추가", "연장", "요금", "금액", "가격"]):
+        add("discount_free_time_issue.md", "price_inquiry.md")
+
+    # 방문등록/차량등록
+    if any(k in t for k in ["방문", "등록", "사전", "권한", "차량등록"]):
+        add("visit_registration_fail.md")
+
+    # 네트워크/통신/연결
+    if any(k in t for k in ["네트워크", "통신", "연결", "인터넷", "서버", "끊", "다운", "오프라인"]):
+        add("network_down.md", "network_terminal_down.md")
+
+    # 입차/출차/게이트
+    if any(k in t for k in ["입차", "들어", "진입"]):
+        # 입차 전용을 앞쪽에 둬야 retrieve에서 top1이 잘 잡힘
+        add("entry_gate_not_open.md", "gate_not_open.md")
+
+    if any(k in t for k in ["출차", "나가", "퇴차", "진출"]):
+        # 출차 전용을 앞쪽에 둬야 retrieve에서 top1이 잘 잡힘
+        add("exit_gate_not_open.md", "exit_barrier_issue.md", "gate_not_open.md")
+
+    # 입차 기록 없음 / 번호판 불일치 / 인식
+    if any(k in t for k in ["입차기록", "기록", "없대", "없다", "번호판", "인식", "lpr", "불일치", "미인식"]):
+        # 이 케이스는 매우 중요하니 앞쪽에 끌어올림
+        # (이미 entry/exit 후보가 들어가 있을 수 있으니 중복 제거는 add가 처리)
+        # 우선순위: lpr 문서를 entry/exit보다 앞에 두는 게 더 자연스러울 때가 많음
+        # -> 이미 docs에 entry/exit가 들어갔다면, lpr을 앞으로 당겨준다.
+        lpr_doc = "lpr_mismatch_or_no_entry_record.md"
+        if lpr_doc not in docs:
+            docs.insert(0, lpr_doc)
+        else:
+            # 이미 있으면 앞으로 이동
+            docs.remove(lpr_doc)
+            docs.insert(0, lpr_doc)
+
+    return docs
 
 
 def _preferred_docs_from_context(context: Optional[Dict[str, Any]]) -> List[str]:
@@ -128,7 +181,7 @@ def _build_manual_context(
         user_text,
         preferred_docs=preferred_docs,
         hard_filter=hard_filter,
-        prefer_boost=0.35,
+        prefer_boost=0.45,  # 순서 기반 boost와 합쳐져서 HELP_REQUEST에서도 top1이 더 잘 맞음
         debug=debug,
     )
     if not hits:
@@ -197,15 +250,36 @@ def dialog_llm_chat(
         )
 
     preferred_docs = _preferred_docs_from_context(context)
-    manual_context = _build_manual_context(
-        user_text,
-        preferred_docs=preferred_docs if preferred_docs else None,
-        hard_filter=True if preferred_docs else False,  # first_intent 없으면 전체검색
-        debug=debug,
-    )
+
+    # HELP_REQUEST는 키워드 기반 후보 추정
+    first_intent = (context or {}).get("first_intent") or ""
+    help_candidates: List[str] = []
+    if first_intent.strip() == "HELP_REQUEST":
+        help_candidates = _infer_docs_for_help_request(user_text)
+
+    # 최종 preferred_docs 결정 (HELP_REQUEST 후보가 있으면 그걸 우선)
+    final_preferred_docs = help_candidates or preferred_docs
+
+    # RAG 실패해도 상담 생성은 계속되게 안전장치
+    try:
+        manual_context = _build_manual_context(
+            user_text,
+            preferred_docs=final_preferred_docs if final_preferred_docs else None,
+            # - 특정 intent 매핑은 하드필터(정확도↑)
+            # - HELP_REQUEST는 하드필터 금지(범위 넓어서 빗나감)
+            hard_filter=(True if (preferred_docs and not help_candidates) else False),
+            debug=debug,
+        )
+    except Exception as e:
+        manual_context = ""
+        if debug:
+            print(f"[RAG] manual build failed: {e}")
 
     if debug:
-        print(f"[RAG] first_intent={(context or {}).get('first_intent')} preferred_docs={preferred_docs}")
+        print(
+            f"[RAG] first_intent={(context or {}).get('first_intent')} "
+            f"preferred_docs={preferred_docs} help_candidates={help_candidates}"
+        )
         print(f"[DIALOG] manual_context_injected={bool(manual_context)} manual_len={len(manual_context)}")
 
     url = f"{OLLAMA_BASE_URL}/api/chat"
@@ -242,7 +316,6 @@ def dialog_llm_chat(
         action = str(obj.get("action", "ASK")).strip()
 
         suggested = str(obj.get("suggested_intent", "NONE")).strip()
-        # suggested_intent는 OPEN/CLOSE/NONE만 허용
         if suggested not in ("OPEN_GATE", "CLOSE_GATE", "NONE"):
             suggested = "NONE"
 
@@ -265,7 +338,6 @@ def dialog_llm_chat(
         if action not in ("ASK", "SOLVE", "PROPOSE_OPEN", "PROPOSE_CLOSE", "DONE", "FAILSAFE"):
             action = "ASK"
 
-        # DONE 재강제
         if _is_done_utterance(user_text) or action == "DONE":
             return DialogResult(
                 reply=FAREWELL_TEXT,
@@ -277,7 +349,6 @@ def dialog_llm_chat(
                 raw=content,
             )
 
-        # PROPOSE_*일 때만 intent 유지
         if action not in ("PROPOSE_OPEN", "PROPOSE_CLOSE"):
             suggested_intent = Intent.NONE
 

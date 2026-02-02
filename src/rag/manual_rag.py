@@ -15,7 +15,6 @@ import requests
 DEFAULT_OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 DEFAULT_EMBED_MODEL = os.getenv("EMBED_MODEL", "nomic-embed-text")
 
-# 실행 위치가 src/이든 루트든, MANUAL_DIR은 보통 "manuals"
 MANUAL_DIR = os.getenv("MANUAL_DIR", "manuals")
 TOP_K = int(os.getenv("RAG_TOP_K", "3"))
 
@@ -45,7 +44,6 @@ def _read_all_manual_texts(manual_dir: str) -> List[Tuple[str, str]]:
 
 
 def _chunk_text(doc_id: str, text: str) -> List[Tuple[str, str]]:
-    # 빈 줄 기준 문단 분리
     paras = [t.strip() for t in text.split("\n\n") if t.strip()]
     chunks: List[Tuple[str, str]] = []
     for i, para in enumerate(paras):
@@ -83,9 +81,8 @@ def _hash_key(embed_model: str, doc_id: str, chunk_id: str, text: str) -> str:
 
 class ManualRAG:
     """
-    - md → 문단 chunk → 임베딩 → in-memory cosine 검색
-    - 캐시: manuals/.rag_cache.json
-    - A안: preferred_docs로 후보 제한 + hard_filter 지원
+    md → 문단 chunk → 임베딩 → in-memory cosine 검색
+    캐시: manuals/.rag_cache.json
     """
 
     def __init__(
@@ -106,7 +103,6 @@ class ManualRAG:
         self._cache_path = os.path.join(_abs_dir(self.manual_dir), CACHE_FILENAME)
         self._cache: Dict[str, List[float]] = {}
 
-        # 마지막 검색 결과(best doc) 추적용
         self.last_best_doc: Optional[str] = None
 
     def _load_cache(self, debug: bool = False):
@@ -180,21 +176,47 @@ class ManualRAG:
         *,
         preferred_docs: Optional[Iterable[str]] = None,
         hard_filter: bool = False,
-        prefer_boost: float = 0.35,
+        prefer_boost: float = 0.45,
         debug: bool = False,
     ) -> List[ManualChunk]:
         """
-        - preferred_docs: 후보 문서 리스트(파일명)
-        - hard_filter=True: 후보 문서 안에서만 검색(A안 핵심)
-        - hard_filter=False: 전체 검색 + 후보 문서 점수 가산
+        preferred_docs:
+          - hard_filter=True  -> 후보 문서 안에서만 검색
+          - hard_filter=False -> 전체 검색 + 후보 문서에 가산점
+        개선:
+          - preferred_docs의 "순서"가 의미있도록, 앞쪽 문서일수록 더 큰 가산점을 준다.
+            (예: HELP_REQUEST 후보에서 exit_gate_not_open.md가 gate_not_open.md보다 더 잘 1등으로 뜨게)
         """
         if not self._built:
             self.build(debug=debug)
 
+        if not self._chunks:
+            self.last_best_doc = None
+            if debug:
+                print(f"[RAG] no chunks indexed (manual_dir={self.manual_dir}).")
+            return []
+
         if top_k is None:
             top_k = self.top_k
 
-        preferred_set = set(preferred_docs or [])
+        preferred_list = list(preferred_docs or [])
+        preferred_set = set(preferred_list)
+
+        # 순서 기반 doc별 boost 테이블 생성
+        # - 앞에 있을수록 boost가 큼
+        # - 총합은 prefer_boost 범위 안에서 부드럽게 감소
+        doc_boost: Dict[str, float] = {}
+        if preferred_list and not hard_filter:
+            n = len(preferred_list)
+            # 예: n=3이면 weights ~ [1.0, 0.7, 0.4]
+            for idx, doc_id in enumerate(preferred_list):
+                if n == 1:
+                    w = 1.0
+                else:
+                    # 1.0 → 0.4로 선형 감소 (너무 급격히 줄지 않게)
+                    w = 1.0 - (0.6 * (idx / (n - 1)))
+                doc_boost[doc_id] = prefer_boost * w
+
         q_emb = _ollama_embed(query, self.base_url, self.embed_model)
 
         scored: List[Tuple[float, ManualChunk]] = []
@@ -204,20 +226,21 @@ class ManualRAG:
 
             s = _cosine(q_emb, c.embedding)
 
-            if preferred_set and (not hard_filter) and c.doc_id in preferred_set:
-                s += prefer_boost
+            if preferred_set and (not hard_filter):
+                s += doc_boost.get(c.doc_id, 0.0)
 
             scored.append((s, c))
 
         scored.sort(key=lambda x: x[0], reverse=True)
         hits = [c for _, c in scored[:top_k]]
 
-        # best_doc 추적
         self.last_best_doc = hits[0].doc_id if hits else None
 
         if debug:
             if preferred_set:
-                print(f"[RAG] preferred_docs={list(preferred_set)} hard_filter={hard_filter} prefer_boost={prefer_boost}")
+                print(f"[RAG] preferred_docs={preferred_list} hard_filter={hard_filter} base_prefer_boost={prefer_boost}")
+                if doc_boost:
+                    print(f"[RAG] doc_boost_table={doc_boost}")
             if self.last_best_doc:
                 print(f"[RAG] best_doc={self.last_best_doc}")
             print("[RAG] top hits:")

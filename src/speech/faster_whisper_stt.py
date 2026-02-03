@@ -4,6 +4,7 @@ import os
 import threading
 import queue
 import time
+import uuid
 from typing import Optional, Callable
 
 import sounddevice as sd
@@ -26,17 +27,13 @@ class FasterWhisperSTT:
     ✔ 기존 로그 전부 유지
     ✔ 최신 발화만 처리 (queue size = 1)
     ✔ 처리 중 추가 발화 시 UX 안내 출력
+    ✔ utterance_id 기반 AppEngine 세션 동기화 가능
 
     STT는 의미 판단 ❌
     STT는 "정확하고 최신 텍스트"만 전달
     """
 
-    # --------------------------------------------------
-    # STT 전처리용 filler word 목록
-    # --------------------------------------------------
-    FILLER_WORDS = [
-        "어", "음", "저기", "그", "아", "뭐지", "이제",
-    ]
+    FILLER_WORDS = ["어", "음", "저기", "그", "아", "뭐지", "이제"]
 
     def __init__(
         self,
@@ -55,9 +52,7 @@ class FasterWhisperSTT:
         auto_calibrate_noise: bool = True,
         noise_calib_seconds: float = 1.0,
         noise_multiplier: float = 4.0,
-        idle_timeout_sec: Optional[float] = None,
     ):
-        # 오디오 설정
         self.sample_rate = sample_rate
         self.input_sample_rate = input_sample_rate
         self.chunk_seconds = chunk_seconds
@@ -65,29 +60,25 @@ class FasterWhisperSTT:
         self.silence_chunks = silence_chunks
         self.device_index = device_index
 
-        # 발화 필터링 기준
         self.min_utterance_seconds = min_utterance_seconds
         self.min_text_len = min_text_len
 
-        # Whisper 옵션
         self.beam_size = beam_size
         self.temperature = temperature
 
-        # 노이즈 캘리브레이션
         self.auto_calibrate_noise = auto_calibrate_noise
         self.noise_calib_seconds = noise_calib_seconds
         self.noise_multiplier = noise_multiplier
-        self.idle_timeout_sec = idle_timeout_sec
 
-        # 콜백
-        self.on_text: Optional[Callable[[str], None]] = None
+        # 콜백: (text, utterance_id)
+        self.on_text: Optional[Callable[[str, str], None]] = None
 
-        # 🔥 큐는 항상 최신 1개만 유지
-        self._audio_queue: queue.Queue[tuple[np.ndarray, float]] = queue.Queue(maxsize=1)
+        # 🔥 최신 발화만 유지
+        self._audio_queue: queue.Queue[
+            tuple[str, np.ndarray, float]
+        ] = queue.Queue(maxsize=1)
 
         self._stop_event = threading.Event()
-
-        # 🔥 STT 처리 중 플래그
         self._is_processing = False
 
         # --------------------------------------------------
@@ -102,9 +93,6 @@ class FasterWhisperSTT:
         )
         print("[STT] Model ready")
 
-        # --------------------------------------------------
-        # STT 워커 스레드
-        # --------------------------------------------------
         self._worker_thread = threading.Thread(
             target=self._stt_worker,
             daemon=True,
@@ -138,29 +126,21 @@ class FasterWhisperSTT:
     def _resample_to_16k(self, audio: np.ndarray) -> np.ndarray:
         if self.input_sample_rate == self.sample_rate:
             return audio.astype(np.float32)
-
         if self.input_sample_rate == 48000:
             return resample_poly(audio, up=1, down=3).astype(np.float32)
-
         return resample_poly(
-            audio,
-            up=self.sample_rate,
-            down=self.input_sample_rate,
+            audio, up=self.sample_rate, down=self.input_sample_rate
         ).astype(np.float32)
 
     # ==================================================
     # STT 전처리
     # ==================================================
     def _clean_text(self, text: str) -> str:
-        text = text.strip()
-
-        tokens = [t for t in text.split() if t not in self.FILLER_WORDS]
-
+        tokens = [t for t in text.strip().split() if t not in self.FILLER_WORDS]
         cleaned = []
         for t in tokens:
             if not cleaned or cleaned[-1] != t:
                 cleaned.append(t)
-
         return " ".join(cleaned).strip()
 
     # ==================================================
@@ -169,11 +149,11 @@ class FasterWhisperSTT:
     def start_listening(self):
         print("[STT] 🎧 Listening... (Ctrl+C to stop)")
 
-        buffer: list[np.ndarray] = []
+        buffer = []
         silent_count = 0
         is_speaking = False
-
         speech_start_ts: Optional[float] = None
+
         frames_per_chunk = int(self.chunk_seconds * self.input_sample_rate)
 
         try:
@@ -187,9 +167,7 @@ class FasterWhisperSTT:
 
                 if self.auto_calibrate_noise:
                     noise = self._measure_noise_floor(
-                        stream,
-                        frames_per_chunk,
-                        self.noise_calib_seconds,
+                        stream, frames_per_chunk, self.noise_calib_seconds
                     )
                     self.silence_threshold = max(
                         self.silence_threshold,
@@ -205,7 +183,7 @@ class FasterWhisperSTT:
                     audio = data.squeeze()
                     volume = float(np.sqrt(np.mean(audio * audio))) if audio.size else 0.0
 
-                    # 🔥 처리 중이면 말하지 말라는 UX 로그
+                    # 🔥 처리 중 UX
                     if self._is_processing and volume >= self.silence_threshold:
                         print("[STT] ⏳ 처리 중입니다. 잠시만 기다려 주세요.")
                         continue
@@ -214,7 +192,6 @@ class FasterWhisperSTT:
                         if not is_speaking:
                             speech_start_ts = time.time()
                             print("[STT] 🟢 Speech detected")
-
                         is_speaking = True
                         buffer.append(audio)
                         silent_count = 0
@@ -225,14 +202,11 @@ class FasterWhisperSTT:
                     if is_speaking and silent_count >= self.silence_chunks:
                         speech_end_ts = time.time()
                         vad_latency = (speech_end_ts - speech_start_ts) * 1000
-
-                        print(
-                            f"[STT] 🔵 Speech ended "
-                            f"(VAD latency={vad_latency:.0f} ms)"
-                        )
+                        print(f"[STT] 🔵 Speech ended (VAD latency={vad_latency:.0f} ms)")
 
                         if buffer:
-                            # 🔥 항상 최신 발화만 유지
+                            utterance_id = str(uuid.uuid4())
+
                             while not self._audio_queue.empty():
                                 try:
                                     self._audio_queue.get_nowait()
@@ -240,7 +214,7 @@ class FasterWhisperSTT:
                                     break
 
                             self._audio_queue.put(
-                                (np.concatenate(buffer), speech_end_ts)
+                                (utterance_id, np.concatenate(buffer), speech_end_ts)
                             )
 
                         buffer.clear()
@@ -256,12 +230,7 @@ class FasterWhisperSTT:
     # ==================================================
     # Noise calibration
     # ==================================================
-    def _measure_noise_floor(
-        self,
-        stream: sd.InputStream,
-        frames_per_chunk: int,
-        secs: float,
-    ) -> float:
+    def _measure_noise_floor(self, stream, frames_per_chunk, secs):
         n_chunks = max(1, int(secs / self.chunk_seconds))
         mx = 0.0
         for _ in range(n_chunks):
@@ -279,15 +248,10 @@ class FasterWhisperSTT:
 
         while not self._stop_event.is_set():
             try:
-                audio_in, speech_end_ts = self._audio_queue.get(timeout=0.1)
+                utterance_id, audio_in, speech_end_ts = self._audio_queue.get(timeout=0.1)
                 dequeue_ts = time.time()
                 queue_delay = (dequeue_ts - speech_end_ts) * 1000
-
-                print(
-                    f"[STT-WORKER] 📥 Audio dequeued "
-                    f"(queue_delay={queue_delay:.0f} ms)"
-                )
-
+                print(f"[STT-WORKER] 📥 Audio dequeued (queue_delay={queue_delay:.0f} ms)")
             except queue.Empty:
                 continue
 
@@ -295,9 +259,7 @@ class FasterWhisperSTT:
                 self._is_processing = True
 
                 audio_16k = self._resample_to_16k(audio_in)
-
-                min_samples = int(self.sample_rate * self.min_utterance_seconds)
-                if audio_16k.size < min_samples:
+                if audio_16k.size < int(self.sample_rate * self.min_utterance_seconds):
                     print("[STT-WORKER] ⚠️ Too short audio, dropped")
                     continue
 
@@ -318,10 +280,8 @@ class FasterWhisperSTT:
                 text = self._clean_text(raw_text)
 
                 print(
-                    f"[STT-TIMING] "
-                    f"queue={queue_delay:.0f} ms | "
-                    f"whisper={whisper_ms:.0f} ms | "
-                    f"total={total_ms:.0f} ms"
+                    f"[STT-TIMING] queue={queue_delay:.0f} ms | "
+                    f"whisper={whisper_ms:.0f} ms | total={total_ms:.0f} ms"
                 )
 
                 if not text or len(text) < self.min_text_len:
@@ -331,11 +291,10 @@ class FasterWhisperSTT:
                 print(f"[STT] 🎤 \"{text}\"")
 
                 if self.on_text:
-                    self.on_text(text)
+                    self.on_text(text, utterance_id=utterance_id)
 
             except Exception as e:
                 print("[STT-WORKER] ❌ Worker error:", repr(e))
-
             finally:
                 self._is_processing = False
 

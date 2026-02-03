@@ -54,7 +54,13 @@ def _is_done_utterance(text: str) -> bool:
 
 class AppEngine:
     """
-    STT → Intent-1(1회) → 정책 판단 → one-turn or SECOND_STAGE → Dialog LLM
+    STT → Intent-1(1회) → 정책 판단
+    → one-turn or SECOND_STAGE → Dialog LLM
+
+    ✅ 해결 사항
+    - one-turn 이후 follow-up 발화 시 SECOND_STAGE 자동 승격
+    - SECOND_STAGE 진입 후 FIRST_STAGE로 되돌아가지 않음
+    - Intent-1은 세션 시작 시 1회만 수행
     """
 
     def __init__(self):
@@ -68,6 +74,8 @@ class AppEngine:
         self.dialog_history = []
 
         self._ignore_until_ts = 0.0
+
+        # 🔑 핵심 상태
         self._just_one_turn = False
         self._none_retry_count = 0
 
@@ -81,7 +89,7 @@ class AppEngine:
             self.dialog_history = []
 
     # --------------------------------------------------
-    # confidence 계산 (복구됨)
+    # confidence 계산
     # --------------------------------------------------
     def calculate_confidence(self, text: str, intent: Intent) -> float:
         score = 0.4
@@ -166,7 +174,7 @@ class AppEngine:
         print(f"[DIALOG] {reply}")
 
     # --------------------------------------------------
-    # STT 엔트리포인트
+    # STT 엔트리포인트 (🔥 핵심 수정 지점)
     # --------------------------------------------------
     def handle_text(self, text):
         if not text or not text.strip():
@@ -178,12 +186,24 @@ class AppEngine:
         print(f"[ENGINE] State={self.state}")
         print(f"[ENGINE] Text={text}")
 
-        # SECOND_STAGE 유지
+        # ✅ 1️⃣ one-turn 직후 follow-up → 무조건 SECOND_STAGE
+        if self._just_one_turn:
+            print("[ENGINE] One-turn follow-up → escalate to SECOND_STAGE")
+            self._just_one_turn = False
+            self.state = "SECOND_STAGE"
+            self._handle_second_stage(text)
+            print("=" * 50)
+            return
+
+        # ✅ 2️⃣ 이미 멀티턴이면 계속 유지
         if self.state == "SECOND_STAGE":
             self._handle_second_stage(text)
             print("=" * 50)
             return
 
+        # --------------------------------------------------
+        # FIRST_STAGE
+        # --------------------------------------------------
         self._ensure_session()
 
         if _is_done_utterance(text):
@@ -194,7 +214,7 @@ class AppEngine:
             print("=" * 50)
             return
 
-        # Intent-1 (단 1회)
+        # Intent-1 (세션 1회)
         result = detect_intent_llm(text)
         result.confidence = self.calculate_confidence(text, result.intent)
 
@@ -211,6 +231,7 @@ class AppEngine:
         self.first_intent = result.intent.value
         self._log_dialog("user", text)
 
+        # Intent.NONE 재질문
         if result.intent == Intent.NONE:
             self._none_retry_count += 1
             if self._none_retry_count == 1:
@@ -219,6 +240,7 @@ class AppEngine:
                 print("=" * 50)
                 return
 
+            print("[ENGINE] Intent.NONE twice → SECOND_STAGE")
             self.state = "SECOND_STAGE"
             self._handle_second_stage(text)
             print("=" * 50)
@@ -226,6 +248,7 @@ class AppEngine:
 
         self._none_retry_count = 0
 
+        # 멀티턴 판단
         if self.should_use_multiturn(result.intent, result.confidence, text):
             print("[ENGINE] Decision: multiturn → SECOND_STAGE")
             self.state = "SECOND_STAGE"
@@ -233,12 +256,13 @@ class AppEngine:
             print("=" * 50)
             return
 
+        # one-turn
         reply = ONE_TURN_RESPONSES.get(result.intent)
         print("[ENGINE] Decision: one-turn")
         print(f"[ONE-TURN] {reply}")
         self._log_dialog("assistant", reply, model="system")
-        self._just_one_turn = True
 
+        self._just_one_turn = True
         print("=" * 50)
 
     # --------------------------------------------------

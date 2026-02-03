@@ -16,11 +16,8 @@ SITE_ID = "parkassist_local"
 
 
 # ==================================================
-# 원턴(즉시 응답) 템플릿 – 개선 버전
+# 원턴(즉시 응답) 템플릿
 # ==================================================
-# 설계 원칙:
-# - 해결 ❌ / 판단 ❌
-# - 안내 + 다음 발화를 유도
 ONE_TURN_RESPONSES = {
     Intent.EXIT: (
         "출차하려면 요금 정산이 완료되어야 차단기가 열립니다. "
@@ -49,24 +46,17 @@ ONE_TURN_RESPONSES = {
 }
 
 
-# ==================================================
-# Intent.NONE 재질문 문구
-# ==================================================
 NONE_RETRY_TEXT = (
     "말씀을 정확히 이해하지 못했어요. "
     "출차, 결제, 등록 중 어떤 도움을 원하시는지 말씀해 주세요."
 )
 
 
-# ==================================================
-# DONE 강제 종료 정책
-# ==================================================
 DONE_KEYWORDS = [
     "됐어요", "되었습니다", "해결", "괜찮아요",
     "그만", "종료", "끝", "마칠게",
     "고마워", "감사", "안녕",
 ]
-
 FAREWELL_TEXT = "네, 해결되셨다니 다행입니다. 이용해 주셔서 감사합니다. 안녕히 가세요."
 DONE_COOLDOWN_SEC = 1.2
 
@@ -84,42 +74,71 @@ def _is_done_utterance(text: str) -> bool:
 
 class AppEngine:
     """
-    주차장 키오스크 CX App Engine (FINAL)
+    STT -> Intent-1(주제) 분류(단 1회) -> (정책) one-turn or multiturn -> Dialog LLM
 
-    핵심 구조:
-    - Intent-1 LLM : 주제(Level-1 Intent)만 분류
-    - AppEngine    : 정책 판단 (원턴 / 멀티턴)
-    - Dialog LLM   : 멀티턴 상담
-
-    정책 요약:
-    - 정보성 → 원턴
-    - 문제/불만/애매 → 멀티턴
-    - 원턴 후 추가 발화 → 자동 멀티턴 승격
-    - Intent.NONE → 재질문 1회 → 그래도 NONE이면 멀티턴
+    ✅ 목표 반영:
+    - 2차(Dialog)에서는 의도 재분류를 하지 않는다.
+    - 첫 턴 Intent-1 결과를 세션이 끝날 때까지 유지한다.
+    - 원턴/Intent.NONE 재질문도 dialog_logs에 남기되, session_id NOT NULL 보장.
     """
 
     def __init__(self):
         self.state = "FIRST_STAGE"
-        self.session_id = None
 
-        self.first_intent = None
-        self.intent_log_id = None
+        # 세션 식별자 (dialog_logs NOT NULL)
+        self.session_id: str | None = None
+
+        # 첫 턴에서만 결정되는 세션 intent (예: "PAYMENT")
+        self.first_intent: str | None = None
+        self.intent_log_id: int | None = None
 
         self.dialog_turn_index = 0
-        self.dialog_history = []
+        self.dialog_history: list[dict[str, str]] = []
 
         self._ignore_until_ts = 0.0
 
-        # 원턴 후 승격용
+        # one-turn 후 follow-up 오면 자동으로 2nd stage 승격
         self._just_one_turn = False
-        self._last_one_turn_intent = None
+        self._last_one_turn_intent: Intent | None = None
 
-        # ✅ NONE 재질문 카운트
+        # Intent.NONE 재질문 카운트
         self._none_retry_count = 0
 
-    # ==================================================
-    # confidence 계산
-    # ==================================================
+    # --------------------------------------------------
+    # 세션 보장 (dialog_logs.session_id NOT NULL)
+    # --------------------------------------------------
+    def _ensure_session(self) -> None:
+        if not self.session_id:
+            self.session_id = str(uuid.uuid4())
+            self.dialog_turn_index = 0
+            self.dialog_history = []
+
+    # --------------------------------------------------
+    # 안전한 dialog 로깅 래퍼
+    # --------------------------------------------------
+    def _log_dialog(self, role: str, content: str, model: str = "stt") -> None:
+        self._ensure_session()
+        self.dialog_turn_index += 1
+        try:
+            log_dialog(
+                intent_log_id=self.intent_log_id,
+                session_id=self.session_id,
+                role=role,
+                content=content,
+                model=model,
+                turn_index=self.dialog_turn_index,
+            )
+        except Exception as e:
+            # 로깅 실패는 흐름을 멈추지 않게
+            print(f"❌ [INTENT_LOGGER] Failed to log dialog: {e}")
+
+        # dialog_llm_client에 넘길 history는 role/user/assistant만 사용
+        if role in ("user", "assistant"):
+            self.dialog_history.append({"role": role, "content": content})
+
+    # --------------------------------------------------
+    # confidence 계산 (기존 유지)
+    # --------------------------------------------------
     def calculate_confidence(self, text: str, intent: Intent) -> float:
         score = 0.4
         text = text.strip()
@@ -140,35 +159,36 @@ class AppEngine:
 
         return round(min(score, 1.0), 2)
 
-    # ==================================================
-    # 멀티턴 판단
-    # ==================================================
+    # --------------------------------------------------
+    # 멀티턴 판단 (기존 유지)
+    # --------------------------------------------------
     def should_use_multiturn(self, intent: Intent, confidence: float, text: str) -> bool:
         if intent == Intent.COMPLAINT:
             return True
-        if any(k in text for k in ["안돼", "이상", "왜", "멈췄"]):
+        if any(k in text for k in ["안돼", "이상", "왜", "멈췄", "실패"]):
             return True
         if confidence < CONFIDENCE_THRESHOLD:
             return True
         return False
 
-    # ==================================================
-    # 2차 멀티턴
-    # ==================================================
+    # --------------------------------------------------
+    # 2차 멀티턴 처리
+    # --------------------------------------------------
     def _handle_second_stage(self, text: str):
         if time.time() < self._ignore_until_ts:
             return
 
         try:
             if _is_done_utterance(text):
-                self._log_dialog("user", text)
+                self._log_dialog("user", text, model="stt")
                 self._log_dialog("assistant", FAREWELL_TEXT, model="system")
                 print(f"[DIALOG] {FAREWELL_TEXT}")
-                self.end_second_stage()
+                self.end_session()
                 self._ignore_until_ts = time.time() + DONE_COOLDOWN_SEC
                 return
 
-            self._log_dialog("user", text)
+            # ✅ SECOND_STAGE에서는 Intent-1 재분류 금지
+            self._log_dialog("user", text, model="stt")
 
             res = dialog_llm_chat(
                 text,
@@ -176,7 +196,7 @@ class AppEngine:
                 context={
                     "session_id": self.session_id,
                     "intent_log_id": self.intent_log_id,
-                    "first_intent": self.first_intent,
+                    "first_intent": self.first_intent,  # ✅ 세션 고정 intent
                 },
                 debug=True,
             )
@@ -191,61 +211,55 @@ class AppEngine:
             print(f"[DIALOG] {reply}")
 
             if action == "DONE":
-                self.end_second_stage()
+                self.end_session()
                 self._ignore_until_ts = time.time() + DONE_COOLDOWN_SEC
 
         except Exception as e:
             print(f"[ENGINE] 2nd-stage failed: {repr(e)}")
 
-    def _log_dialog(self, role: str, content: str, model: str = "stt"):
-        self.dialog_turn_index += 1
-        log_dialog(
-            intent_log_id=self.intent_log_id,
-            session_id=self.session_id,
-            role=role,
-            content=content,
-            model=model,
-            turn_index=self.dialog_turn_index,
-        )
-        self.dialog_history.append({"role": role, "content": content})
-
-    # ==================================================
+    # --------------------------------------------------
     # STT 텍스트 엔트리포인트
-    # ==================================================
+    # --------------------------------------------------
     def handle_text(self, text: str):
         if not text or not text.strip():
             return
         if time.time() < self._ignore_until_ts:
             return
 
-        # 원턴 직후 발화 → 자동 멀티턴
-        if self._just_one_turn:
-            self._just_one_turn = False
-            print("[ENGINE] One-turn follow-up → 2nd stage")
-
-            self.state = "SECOND_STAGE"
-            self.session_id = str(uuid.uuid4())
-            self.dialog_turn_index = 0
-            self.dialog_history = []
-
-            self.first_intent = (
-                self._last_one_turn_intent.value
-                if self._last_one_turn_intent else None
-            )
-
+        # ✅ 이미 멀티턴 세션이면: 바로 2차로만 처리(의도 재분류 X)
+        if self.state == "SECOND_STAGE":
+            print("=" * 50)
+            print(f"[ENGINE] State={self.state}")
+            print(f"[ENGINE] Text={text}")
             self._handle_second_stage(text)
             print("=" * 50)
             return
 
+        # FIRST_STAGE 처리
         print("=" * 50)
         print(f"[ENGINE] State={self.state}")
         print(f"[ENGINE] Text={text}")
 
+        # 세션은 FIRST_STAGE에서도 미리 만들어둔다 (원턴/재질문 로그도 DB에 남기기 위함)
+        self._ensure_session()
+
+        # DONE이면 종료
+        if _is_done_utterance(text):
+            self._log_dialog("user", text, model="stt")
+            self._log_dialog("assistant", FAREWELL_TEXT, model="system")
+            print(f"[DIALOG] {FAREWELL_TEXT}")
+            self.end_session()
+            self._ignore_until_ts = time.time() + DONE_COOLDOWN_SEC
+            print("=" * 50)
+            return
+
+        # 1차 Intent-1 분류 (세션 시작 1회)
         result = detect_intent_llm(text)
         result.confidence = self.calculate_confidence(text, result.intent)
 
         print(f"[ENGINE] Intent={result.intent.name}, confidence={result.confidence:.2f}")
 
+        # intent 로그 (대화 세션의 anchor)
         self.intent_log_id = log_intent(
             utterance=text,
             predicted_intent=result.intent.value,
@@ -253,6 +267,12 @@ class AppEngine:
             source="kiosk",
             site_id=SITE_ID,
         )
+
+        # 세션 고정 intent 저장
+        self.first_intent = result.intent.value
+
+        # user 발화도 dialog_logs에 남김
+        self._log_dialog("user", text, model="stt")
 
         # ------------------------------
         # Intent.NONE 처리 (재질문 1회)
@@ -264,41 +284,31 @@ class AppEngine:
                 print("[ENGINE] Intent.NONE → retry question")
                 print(f"[ONE-TURN] {NONE_RETRY_TEXT}")
 
-                log_dialog(
-                    intent_log_id=self.intent_log_id,
-                    session_id=None,
-                    role="assistant",
-                    content=NONE_RETRY_TEXT,
-                    model="system",
-                    turn_index=0,
-                )
+                self._log_dialog("assistant", NONE_RETRY_TEXT, model="system")
+                self._just_one_turn = False
+                self._last_one_turn_intent = None
+
                 print("=" * 50)
                 return
 
+            # 두 번 NONE이면 멀티턴으로 승격
             print("[ENGINE] Intent.NONE twice → escalate to 2nd stage")
-
             self.state = "SECOND_STAGE"
-            self.session_id = str(uuid.uuid4())
             self.dialog_turn_index = 0
             self.dialog_history = []
-            self.first_intent = None
-
             self._handle_second_stage(text)
             print("=" * 50)
             return
 
         # NONE가 아니면 리셋
         self._none_retry_count = 0
-        self.first_intent = result.intent.value
 
+        # 멀티턴 여부 판단
         if self.should_use_multiturn(result.intent, result.confidence, text):
             print("[ENGINE] Decision: multiturn → 2nd stage")
-
             self.state = "SECOND_STAGE"
-            self.session_id = str(uuid.uuid4())
             self.dialog_turn_index = 0
             self.dialog_history = []
-
             self._handle_second_stage(text)
             print("=" * 50)
             return
@@ -314,32 +324,27 @@ class AppEngine:
         print("[ENGINE] Decision: one-turn")
         print(f"[ONE-TURN] {reply}")
 
-        log_dialog(
-            intent_log_id=self.intent_log_id,
-            session_id=None,
-            role="assistant",
-            content=reply,
-            model="system",
-            turn_index=0,
-        )
+        self._log_dialog("assistant", reply, model="system")
 
+        # follow-up 오면 2nd stage로 승격하기 위한 플래그
         self._just_one_turn = True
         self._last_one_turn_intent = result.intent
 
         print("=" * 50)
 
-    # ==================================================
-    # 종료
-    # ==================================================
-    def end_second_stage(self):
+    # --------------------------------------------------
+    # 세션 종료
+    # --------------------------------------------------
+    def end_session(self):
         print(f"[ENGINE] Session ended: {self.session_id}")
 
         self.state = "FIRST_STAGE"
         self.session_id = None
         self.intent_log_id = None
+        self.first_intent = None
+
         self.dialog_turn_index = 0
         self.dialog_history = []
-        self.first_intent = None
 
         self._just_one_turn = False
         self._last_one_turn_intent = None

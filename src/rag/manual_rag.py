@@ -11,13 +11,16 @@ from typing import List, Dict, Optional, Tuple, Iterable
 
 import requests
 
-
 DEFAULT_OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 DEFAULT_EMBED_MODEL = os.getenv("EMBED_MODEL", "nomic-embed-text")
 
-MANUAL_DIR = os.getenv("MANUAL_DIR", "manuals")
-TOP_K = int(os.getenv("RAG_TOP_K", "3"))
+# ✅ CWD에 의존하지 않고, 항상 "src/manuals"를 기본으로 잡는다.
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))          # .../src/rag
+_SRC_DIR = os.path.abspath(os.path.join(_THIS_DIR, ".."))       # .../src
+_DEFAULT_MANUAL_DIR = os.path.join(_SRC_DIR, "manuals")         # .../src/manuals
 
+MANUAL_DIR = os.getenv("MANUAL_DIR", _DEFAULT_MANUAL_DIR)
+TOP_K = int(os.getenv("RAG_TOP_K", "3"))
 CACHE_FILENAME = os.getenv("RAG_CACHE_FILE", ".rag_cache.json")
 
 
@@ -82,7 +85,7 @@ def _hash_key(embed_model: str, doc_id: str, chunk_id: str, text: str) -> str:
 class ManualRAG:
     """
     md → 문단 chunk → 임베딩 → in-memory cosine 검색
-    캐시: manuals/.rag_cache.json
+    캐시: <manual_dir>/.rag_cache.json
     """
 
     def __init__(
@@ -179,14 +182,6 @@ class ManualRAG:
         prefer_boost: float = 0.45,
         debug: bool = False,
     ) -> List[ManualChunk]:
-        """
-        preferred_docs:
-          - hard_filter=True  -> 후보 문서 안에서만 검색
-          - hard_filter=False -> 전체 검색 + 후보 문서에 가산점
-        개선:
-          - preferred_docs의 "순서"가 의미있도록, 앞쪽 문서일수록 더 큰 가산점을 준다.
-            (예: HELP_REQUEST 후보에서 exit_gate_not_open.md가 gate_not_open.md보다 더 잘 1등으로 뜨게)
-        """
         if not self._built:
             self.build(debug=debug)
 
@@ -202,18 +197,14 @@ class ManualRAG:
         preferred_list = list(preferred_docs or [])
         preferred_set = set(preferred_list)
 
-        # 순서 기반 doc별 boost 테이블 생성
-        # - 앞에 있을수록 boost가 큼
-        # - 총합은 prefer_boost 범위 안에서 부드럽게 감소
+        # 순서 기반 boost 테이블(하드필터 아닐 때만)
         doc_boost: Dict[str, float] = {}
         if preferred_list and not hard_filter:
             n = len(preferred_list)
-            # 예: n=3이면 weights ~ [1.0, 0.7, 0.4]
             for idx, doc_id in enumerate(preferred_list):
                 if n == 1:
                     w = 1.0
                 else:
-                    # 1.0 → 0.4로 선형 감소 (너무 급격히 줄지 않게)
                     w = 1.0 - (0.6 * (idx / (n - 1)))
                 doc_boost[doc_id] = prefer_boost * w
 
@@ -226,7 +217,7 @@ class ManualRAG:
 
             s = _cosine(q_emb, c.embedding)
 
-            if preferred_set and (not hard_filter):
+            if preferred_set and not hard_filter:
                 s += doc_boost.get(c.doc_id, 0.0)
 
             scored.append((s, c))

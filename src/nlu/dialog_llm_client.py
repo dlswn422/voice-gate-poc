@@ -1,11 +1,10 @@
-# src/nlu/dialog_llm_client.py
 from __future__ import annotations
 
 import json
 import os
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Literal, Iterable
+from typing import Any, Dict, List, Optional, Literal, Iterable, Tuple
 
 import requests
 
@@ -36,11 +35,11 @@ OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip(
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
 OLLAMA_TIMEOUT = float(os.getenv("OLLAMA_TIMEOUT", "30"))
 
+
 DONE_KEYWORDS = [
     "됐어요", "되었습니다", "해결", "괜찮아요", "그만", "종료", "끝", "마칠게", "고마워", "감사", "안녕",
     "이제 됐", "됐습니다", "해결됐", "정상", "문제없", "됐어", "다 됐", "이만", "끊을게",
 ]
-
 FAREWELL_TEXT = "이용해 주셔서 감사합니다. 안전운전하세요."
 
 
@@ -55,110 +54,132 @@ def _is_done_utterance(text: str) -> bool:
     return any(_normalize(k) in t for k in DONE_KEYWORDS)
 
 
+def _sanitize_reply(reply: str) -> str:
+    if not reply:
+        return reply
+    reply = reply.replace("\r\n", "\n")
+    reply = re.sub(r"[ \t]+", " ", reply)
+    reply = re.sub(r" *\n *", "\n", reply)
+    return reply.strip()
+
+
+def _strip_markdown_noise(s: str) -> str:
+    """
+    RAG 컨텍스트에서 '# 제목 - TAG' 같은 헤더가 답변으로 튀는 걸 방지하기 위해
+    매뉴얼 chunk 텍스트에서 헤더/구분 라인 등을 제거한다.
+    """
+    lines = []
+    for ln in (s or "").splitlines():
+        t = ln.strip()
+        if not t:
+            continue
+        # markdown heading 제거
+        if t.startswith("#"):
+            continue
+        # 구분선류
+        if re.fullmatch(r"[-=]{3,}", t):
+            continue
+        lines.append(ln)
+    return "\n".join(lines).strip()
+
+
+def _extract_allowed_actions(hits_text: str, limit: int = 10) -> List[str]:
+    """
+    매뉴얼 발췌에서 '사용자가 따라할 수 있는 조치 문장' 후보를 뽑는다.
+    LLM이 매뉴얼을 참고하도록 강제하는 장치(=답변에 최소 1개 포함 유도).
+    """
+    if not hits_text:
+        return []
+
+    actions: List[str] = []
+    seen = set()
+
+    for raw_line in hits_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        # 헤더/메타 제거
+        if line.startswith("#") or line.startswith("(HIT") or line.startswith("[MANUAL_CONTEXT_"):
+            continue
+
+        # bullet/번호/조치: 형태
+        if re.match(r"^[-•\*]\s+", line) or re.match(r"^\d+[.)]\s+", line) or re.match(r"^(조치|확인|안내|재시도)\s*[:：]", line):
+            cand = re.sub(r"^[-•\*]\s+", "", line)
+            cand = re.sub(r"^\d+[.)]\s+", "", cand)
+            cand = re.sub(r"^(조치|확인|안내|재시도)\s*[:：]\s*", "", cand)
+            cand = cand.strip()
+        else:
+            # 명령/권고 느낌 문장만
+            if len(line) < 8:
+                continue
+            if any(k in line for k in ["가능", "추정", "같", "의심"]):
+                continue
+            if not any(k in line for k in ["하세요", "해 주세요", "확인", "점검", "재시도", "문의", "출력", "등록", "재결제", "결제", "버튼"]):
+                continue
+            cand = line
+
+        cand = _sanitize_reply(cand)
+        if not cand:
+            continue
+        if cand in seen:
+            continue
+        seen.add(cand)
+        actions.append(cand)
+        if len(actions) >= limit:
+            break
+
+    return actions
+
+
 SYSTEM_PROMPT = """
 너는 '주차장 키오스크 고객센터 상담사'다.
 
 목표:
-- 사용자의 상황(결제/입차/출차/등록/네트워크/물리 고장 등)을 파악하고,
-- 아래 [MANUAL_CONTEXT_BEGIN ... END]가 제공되면 "그 내용"을 참고해서 실제 조치 방법을 안내한다.
+- 사용자의 상황을 파악하고,
+- 아래 [MANUAL_CONTEXT_BEGIN ... END]가 제공되면 그 내용을 "참고"해서
+  사용자가 바로 따라할 수 있는 조치 안내를 만든다.
 
 중요 규칙:
 1) 한국어로 답한다.
-2) 출력은 반드시 JSON만 출력한다. (추가 텍스트/마크다운 금지)
-3) 질문이 필요하면 1개만 한다.
-4) 매뉴얼 컨텍스트가 있으면:
-   - 단순히 "문제 같아요" 처럼 라벨링만 하지 말고,
-   - 컨텍스트에 있는 '조치/확인/재시도/안내' 중 최소 1개 이상을 구체적으로 포함해서 답해라.
-   - 컨텍스트에 없는 내용은 지어내지 말고, 필요한 정보 1개를 ASK로 질문해라.
-5) 사용자가 해결/종료 의사를 밝히면 action="DONE"으로 설정하고 reply는 짧은 배웅으로 마무리한다.
-6) 차단기 제어 요청이 명확할 때만:
-   - action="PROPOSE_OPEN" 또는 "PROPOSE_CLOSE"
-   - suggested_intent는 OPEN_GATE / CLOSE_GATE
-   - need_confirmation=true + confirm_prompt 포함
+2) 출력은 반드시 JSON 한 개만 출력한다(추가 텍스트/마크다운 금지).
+3) 매뉴얼 컨텍스트가 있으면:
+   - reply에 [ALLOWED_ACTIONS]에서 최소 1개 이상을 반드시 포함해라.
+   - 매뉴얼 제목/헤더(# ...)를 그대로 복사해서 reply로 내보내지 마라.
+   - 매뉴얼에 없는 내용(예: 카드번호/CVV 입력 등)을 지어내지 마라.
+4) 질문이 필요하면 action="ASK"로 하고 질문은 1개만 한다.
+5) 종료/해결 의사면 action="DONE" + 배웅 멘트.
+6) suggested_intent는 OPEN_GATE/CLOSE_GATE/NONE 중 하나만 사용한다.
+   - 차단기 제어 요청이 명확할 때만 PROPOSE_OPEN/PROPOSE_CLOSE를 사용.
+   - 그 외에는 suggested_intent="NONE"로 고정한다.
 
 출력 JSON 스키마:
 {
-  "reply": "사용자에게 보여줄 문장",
+  "reply": "문장",
   "action": "ASK|SOLVE|PROPOSE_OPEN|PROPOSE_CLOSE|DONE|FAILSAFE",
   "suggested_intent": "OPEN_GATE|CLOSE_GATE|NONE",
   "confidence": 0.0~1.0,
   "need_confirmation": true|false,
-  "confirm_prompt": "예/아니오 확인 질문(필요 시)",
-  "slots": { ... }
+  "confirm_prompt": null 또는 문자열,
+  "slots": {}
 }
 """.strip()
 
 
-# intent → manuals 파일 후보 매핑 (일부 intent는 시스템 내부에서만 쓰일 수 있음)
+# ✅ 세션의 첫 intent(ENTRY/EXIT/PAYMENT/...)를 받아
+#   그 intent에 매핑된 "문서 후보"만 RAG 하드필터로 검색
 INTENT_TO_DOCS: Dict[str, List[str]] = {
-    "PAYMENT_ISSUE": ["payment_card_fail.md", "discount_free_time_issue.md"],
-    "PRICE_INQUIRY": ["price_inquiry.md"],
-    "TIME_ISSUE": ["discount_free_time_issue.md"],
-    "REGISTRATION_ISSUE": ["visit_registration_fail.md"],
-    "NETWORK_ISSUE": ["network_terminal_down.md", "network_down.md"],
-    "ENTRY_FLOW_ISSUE": ["entry_gate_not_open.md", "lpr_mismatch_or_no_entry_record.md"],
-    "EXIT_FLOW_ISSUE": ["exit_gate_not_open.md", "exit_barrier_issue.md", "lpr_mismatch_or_no_entry_record.md"],
-    "BARRIER_PHYSICAL_FAULT": ["barrier_physical_fault.md"],
-    # HELP_REQUEST는 하드필터 금지 + 키워드 기반 후보 추정으로 처리
+    "PAYMENT": ["payment_card_fail.md", "discount_free_time_issue.md"],
+    "TIME_PRICE": ["discount_free_time_issue.md", "price_inquiry.md"],
+    "REGISTRATION": ["visit_registration_fail.md"],
+    "ENTRY": ["entry_gate_not_open.md", "lpr_mismatch_or_no_entry_record.md"],
+    "EXIT": ["exit_gate_not_open.md", "lpr_mismatch_or_no_entry_record.md"],
+    "FACILITY": ["barrier_physical_fault.md", "network_terminal_down.md", "failsafe_done.md"],
+    "COMPLAINT": [],  # complaint는 세션 intent로 들어와도, doc 후보는 사용자 발화로 RAG가 고르도록 (하드필터 X)
+    "NONE": [],
 }
 
 _rag = ManualRAG()
-
-
-def _infer_docs_for_help_request(user_text: str) -> List[str]:
-    """
-    HELP_REQUEST는 범위가 너무 넓어서 특정 문서로 하드필터하면 빗나가기 쉬움.
-    -> 키워드 기반으로 "우선순위 있는 후보 리스트"를 만들고,
-       retrieve()에서 순서 기반 boost를 줘서 top1이 더 잘 맞게 한다.
-    """
-    t = _normalize(user_text)
-    docs: List[str] = []
-
-    def add(*names: str) -> None:
-        for n in names:
-            if n not in docs:
-                docs.append(n)
-
-    # 결제/정산/카드
-    if any(k in t for k in ["결제", "카드", "정산", "영수증", "승인", "오류", "실패", "환불"]):
-        add("payment_card_fail.md")
-
-    # 무료시간/할인/요금
-    if any(k in t for k in ["무료", "할인", "시간", "추가", "연장", "요금", "금액", "가격"]):
-        add("discount_free_time_issue.md", "price_inquiry.md")
-
-    # 방문등록/차량등록
-    if any(k in t for k in ["방문", "등록", "사전", "권한", "차량등록"]):
-        add("visit_registration_fail.md")
-
-    # 네트워크/통신/연결
-    if any(k in t for k in ["네트워크", "통신", "연결", "인터넷", "서버", "끊", "다운", "오프라인"]):
-        add("network_down.md", "network_terminal_down.md")
-
-    # 입차/출차/게이트
-    if any(k in t for k in ["입차", "들어", "진입"]):
-        # 입차 전용을 앞쪽에 둬야 retrieve에서 top1이 잘 잡힘
-        add("entry_gate_not_open.md", "gate_not_open.md")
-
-    if any(k in t for k in ["출차", "나가", "퇴차", "진출"]):
-        # 출차 전용을 앞쪽에 둬야 retrieve에서 top1이 잘 잡힘
-        add("exit_gate_not_open.md", "exit_barrier_issue.md", "gate_not_open.md")
-
-    # 입차 기록 없음 / 번호판 불일치 / 인식
-    if any(k in t for k in ["입차기록", "기록", "없대", "없다", "번호판", "인식", "lpr", "불일치", "미인식"]):
-        # 이 케이스는 매우 중요하니 앞쪽에 끌어올림
-        # (이미 entry/exit 후보가 들어가 있을 수 있으니 중복 제거는 add가 처리)
-        # 우선순위: lpr 문서를 entry/exit보다 앞에 두는 게 더 자연스러울 때가 많음
-        # -> 이미 docs에 entry/exit가 들어갔다면, lpr을 앞으로 당겨준다.
-        lpr_doc = "lpr_mismatch_or_no_entry_record.md"
-        if lpr_doc not in docs:
-            docs.insert(0, lpr_doc)
-        else:
-            # 이미 있으면 앞으로 이동
-            docs.remove(lpr_doc)
-            docs.insert(0, lpr_doc)
-
-    return docs
 
 
 def _preferred_docs_from_context(context: Optional[Dict[str, Any]]) -> List[str]:
@@ -171,31 +192,43 @@ def _preferred_docs_from_context(context: Optional[Dict[str, Any]]) -> List[str]
 
 
 def _build_manual_context(
-    user_text: str,
-    *,
-    preferred_docs: Optional[Iterable[str]] = None,
-    hard_filter: bool = True,
-    debug: bool = False,
-) -> str:
-    hits = _rag.retrieve(
-        user_text,
-        preferred_docs=preferred_docs,
-        hard_filter=hard_filter,
-        prefer_boost=0.45,  # 순서 기반 boost와 합쳐져서 HELP_REQUEST에서도 top1이 더 잘 맞음
-        debug=debug,
-    )
+    hits: List[Any],
+) -> Tuple[str, List[str]]:
+    """
+    MANUAL_CONTEXT + ALLOWED_ACTIONS를 함께 구성해서
+    모델이 매뉴얼을 '참고'하도록 강제한다.
+    """
     if not hits:
-        return ""
+        return "", []
+
+    # chunk 원문 합치기(허용 조치 추출용)
+    all_text = "\n".join([getattr(c, "text", "") or "" for c in hits])
+    allowed = _extract_allowed_actions(all_text, limit=10)
 
     lines: List[str] = []
     lines.append("[MANUAL_CONTEXT_BEGIN]")
-    lines.append("아래는 참고 매뉴얼 발췌다. 이 내용을 참고해서 '구체 조치'를 안내하라.")
+    lines.append("아래는 참고 매뉴얼 발췌다. 이 내용을 참고해서 답하라.")
+    lines.append("주의: 제목(# ...)이나 태그를 그대로 복사해 답변으로 내지 말 것.")
+
     for i, c in enumerate(hits, 1):
+        raw = getattr(c, "text", "") or ""
+        cleaned = _strip_markdown_noise(raw)
+        if not cleaned:
+            continue
         lines.append(f"(HIT {i}) doc={c.doc_id} chunk={c.chunk_id}")
-        lines.append(c.text.strip())
+        lines.append(cleaned)
         lines.append("")
+
+    lines.append("[ALLOWED_ACTIONS_BEGIN]")
+    if allowed:
+        for i, a in enumerate(allowed, 1):
+            lines.append(f"{i}. {a}")
+    else:
+        lines.append("NONE")
+    lines.append("[ALLOWED_ACTIONS_END]")
     lines.append("[MANUAL_CONTEXT_END]")
-    return "\n".join(lines).strip()
+
+    return "\n".join(lines).strip(), allowed
 
 
 def _build_messages(
@@ -230,6 +263,61 @@ def _parse_json_only(text: str) -> Dict[str, Any]:
     return json.loads(text[start:end])
 
 
+def _coerce(obj: Dict[str, Any]) -> Dict[str, Any]:
+    reply = _sanitize_reply(str(obj.get("reply", "") or ""))
+    action = str(obj.get("action", "ASK") or "ASK").strip().upper()
+
+    if action not in ("ASK", "SOLVE", "PROPOSE_OPEN", "PROPOSE_CLOSE", "DONE", "FAILSAFE"):
+        action = "ASK"
+
+    # suggested_intent는 오직 OPEN/CLOSE/NONE만 허용
+    suggested = str(obj.get("suggested_intent", "NONE") or "NONE").strip().upper()
+    if suggested not in ("OPEN_GATE", "CLOSE_GATE", "NONE"):
+        suggested = "NONE"
+
+    conf = obj.get("confidence", 0.5)
+    try:
+        confidence = float(conf)
+    except Exception:
+        confidence = 0.5
+    confidence = max(0.0, min(confidence, 1.0))
+
+    need_confirmation = bool(obj.get("need_confirmation", False))
+    confirm_prompt = obj.get("confirm_prompt", None)
+    slots = obj.get("slots", {}) or {}
+
+    # PROPOSE_*가 아니면 confirmation/intent 제거
+    if action not in ("PROPOSE_OPEN", "PROPOSE_CLOSE"):
+        need_confirmation = False
+        confirm_prompt = None
+        suggested = "NONE"
+
+    if action == "PROPOSE_OPEN":
+        suggested = "OPEN_GATE"
+        need_confirmation = True
+        if not confirm_prompt:
+            confirm_prompt = "차단기를 열까요? (예/아니오)"
+    elif action == "PROPOSE_CLOSE":
+        suggested = "CLOSE_GATE"
+        need_confirmation = True
+        if not confirm_prompt:
+            confirm_prompt = "차단기를 닫을까요? (예/아니오)"
+
+    # reply가 매뉴얼 헤더처럼 나오면 제거
+    if reply.lstrip().startswith("#"):
+        reply = ""
+
+    return {
+        "reply": reply,
+        "action": action,
+        "suggested_intent": suggested,
+        "confidence": confidence,
+        "need_confirmation": need_confirmation,
+        "confirm_prompt": confirm_prompt,
+        "slots": slots if isinstance(slots, dict) else {},
+    }
+
+
 def dialog_llm_chat(
     user_text: str,
     *,
@@ -246,42 +334,38 @@ def dialog_llm_chat(
             confidence=1.0,
             need_confirmation=False,
             confirm_prompt=None,
-            raw=None,
         )
 
     preferred_docs = _preferred_docs_from_context(context)
 
-    # HELP_REQUEST는 키워드 기반 후보 추정
-    first_intent = (context or {}).get("first_intent") or ""
-    help_candidates: List[str] = []
-    if first_intent.strip() == "HELP_REQUEST":
-        help_candidates = _infer_docs_for_help_request(user_text)
+    # RAG
+    manual_context = ""
+    allowed_actions: List[str] = []
+    rag_best_doc = None
 
-    # 최종 preferred_docs 결정 (HELP_REQUEST 후보가 있으면 그걸 우선)
-    final_preferred_docs = help_candidates or preferred_docs
-
-    # RAG 실패해도 상담 생성은 계속되게 안전장치
     try:
-        manual_context = _build_manual_context(
+        hits = _rag.retrieve(
             user_text,
-            preferred_docs=final_preferred_docs if final_preferred_docs else None,
-            # - 특정 intent 매핑은 하드필터(정확도↑)
-            # - HELP_REQUEST는 하드필터 금지(범위 넓어서 빗나감)
-            hard_filter=(True if (preferred_docs and not help_candidates) else False),
+            preferred_docs=preferred_docs if preferred_docs else None,
+            # 세션 intent가 명확하면 그 문서 안에서만 검색(정확도↑)
+            hard_filter=True if preferred_docs else False,
+            prefer_boost=0.45,
             debug=debug,
         )
+        rag_best_doc = _rag.last_best_doc
+        manual_context, allowed_actions = _build_manual_context(hits) if hits else ("", [])
     except Exception as e:
-        manual_context = ""
         if debug:
-            print(f"[RAG] manual build failed: {e}")
+            print(f"[RAG] failed: {e}")
+        manual_context = ""
+        allowed_actions = []
 
     if debug:
-        print(
-            f"[RAG] first_intent={(context or {}).get('first_intent')} "
-            f"preferred_docs={preferred_docs} help_candidates={help_candidates}"
-        )
+        print(f"[DIALOG] first_intent={(context or {}).get('first_intent')} preferred_docs={preferred_docs}")
         print(f"[DIALOG] manual_context_injected={bool(manual_context)} manual_len={len(manual_context)}")
+        print(f"[DIALOG] rag_best_doc={rag_best_doc}")
 
+    # LLM 호출
     url = f"{OLLAMA_BASE_URL}/api/chat"
     payload = {
         "model": OLLAMA_MODEL,
@@ -293,6 +377,8 @@ def dialog_llm_chat(
     try:
         r = requests.post(url, json=payload, timeout=OLLAMA_TIMEOUT)
         r.raise_for_status()
+        data = r.json()
+        content = (data.get("message") or {}).get("content", "") or ""
     except Exception as e:
         if debug:
             print(f"❌ [DIALOG] Llama 호출 실패: {e}")
@@ -303,42 +389,17 @@ def dialog_llm_chat(
             confidence=0.0,
         )
 
-    data = r.json()
-    content = (data.get("message") or {}).get("content", "") or ""
     if debug:
         print("🧾 [DIALOG RAW OUTPUT]")
         print(content)
 
+    # 파싱 + 보정
     try:
         obj = _parse_json_only(content)
+        obj = _coerce(obj)
 
-        reply = str(obj.get("reply", "")).strip()
-        action = str(obj.get("action", "ASK")).strip()
-
-        suggested = str(obj.get("suggested_intent", "NONE")).strip()
-        if suggested not in ("OPEN_GATE", "CLOSE_GATE", "NONE"):
-            suggested = "NONE"
-
-        try:
-            suggested_intent = Intent(suggested)
-        except Exception:
-            suggested_intent = Intent.NONE
-
-        conf = obj.get("confidence", 0.5)
-        try:
-            confidence = float(conf)
-        except Exception:
-            confidence = 0.5
-        confidence = max(0.0, min(confidence, 1.0))
-
-        need_confirmation = bool(obj.get("need_confirmation", False))
-        confirm_prompt = obj.get("confirm_prompt", None)
-        slots = obj.get("slots", {}) or {}
-
-        if action not in ("ASK", "SOLVE", "PROPOSE_OPEN", "PROPOSE_CLOSE", "DONE", "FAILSAFE"):
-            action = "ASK"
-
-        if _is_done_utterance(user_text) or action == "DONE":
+        # DONE 재확인
+        if obj["action"] == "DONE":
             return DialogResult(
                 reply=FAREWELL_TEXT,
                 action="DONE",
@@ -349,31 +410,37 @@ def dialog_llm_chat(
                 raw=content,
             )
 
-        if action not in ("PROPOSE_OPEN", "PROPOSE_CLOSE"):
+        # ✅ 매뉴얼이 있는데도 reply가 비었거나 너무 일반적이면(헤더 복붙 방지 후 공백 등)
+        #    allowed_actions에서 1개를 최소로 채워준다.
+        if manual_context and (not obj["reply"]):
+            if allowed_actions:
+                obj["reply"] = allowed_actions[0]
+                obj["action"] = "SOLVE"
+            else:
+                obj["reply"] = "화면에 표시되는 오류 문구가 무엇인가요?"
+                obj["action"] = "ASK"
+
+        # suggested_intent enum 처리 (Intent 타입은 기존 구조 유지)
+        try:
+            suggested_intent = Intent(obj["suggested_intent"])
+        except Exception:
             suggested_intent = Intent.NONE
 
-        if action in ("PROPOSE_OPEN", "PROPOSE_CLOSE"):
-            need_confirmation = True
-            if not confirm_prompt:
-                confirm_prompt = "차단기를 실행할까요? (예/아니오)"
-
-        if not reply:
-            reply = "확인을 위해 한 가지만 더 여쭤볼게요."
-
         return DialogResult(
-            reply=reply,
-            action=action,  # type: ignore
+            reply=obj["reply"],
+            action=obj["action"],  # type: ignore
             suggested_intent=suggested_intent,
-            confidence=confidence,
-            slots=slots if isinstance(slots, dict) else {},
-            need_confirmation=need_confirmation,
-            confirm_prompt=confirm_prompt,
+            confidence=obj["confidence"],
+            need_confirmation=obj["need_confirmation"],
+            confirm_prompt=obj["confirm_prompt"],
+            slots=obj["slots"],
             raw=content,
         )
 
     except Exception:
+        # JSON 파싱 실패 시 안전 ASK
         return DialogResult(
-            reply=content.strip() or "무슨 문제가 있는지 조금 더 자세히 말씀해 주세요.",
+            reply="확인을 위해 한 가지만 여쭤볼게요. 화면에 표시되는 오류 문구가 무엇인가요?",
             action="ASK",
             suggested_intent=Intent.NONE,
             confidence=0.5,

@@ -15,29 +15,20 @@ from scipy.signal import resample_poly
 # --------------------------------------------------
 # Windows + ctranslate2 안정화
 # --------------------------------------------------
-# CPU 추론 시 과도한 스레드 사용 방지
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 
 class FasterWhisperSTT:
     """
-    STT TRACE VERSION (FINAL)
+    STT TRACE VERSION (FINAL - SYNC SAFE)
 
-    목적
-    - 음성 → 텍스트 전체 파이프라인 latency 추적
-    - STT 결과를 1차 Intent 분류에 "최적의 입력"으로 제공
+    ✔ 기존 로그 전부 유지
+    ✔ 최신 발화만 처리 (queue size = 1)
+    ✔ 처리 중 추가 발화 시 UX 안내 출력
 
-    주요 로그
-    - Speech detected 시점
-    - Speech ended (VAD latency)
-    - STT worker queue delay
-    - Whisper inference time
-    - Total STT latency
-
-    설계 원칙
-    - STT는 판단하지 않는다 (의미 해석 ❌)
-    - 최대한 깨끗한 텍스트만 AppEngine으로 전달
+    STT는 의미 판단 ❌
+    STT는 "정확하고 최신 텍스트"만 전달
     """
 
     # --------------------------------------------------
@@ -66,7 +57,7 @@ class FasterWhisperSTT:
         noise_multiplier: float = 4.0,
         idle_timeout_sec: Optional[float] = None,
     ):
-        # 오디오 관련 설정
+        # 오디오 설정
         self.sample_rate = sample_rate
         self.input_sample_rate = input_sample_rate
         self.chunk_seconds = chunk_seconds
@@ -78,7 +69,7 @@ class FasterWhisperSTT:
         self.min_utterance_seconds = min_utterance_seconds
         self.min_text_len = min_text_len
 
-        # Whisper 추론 옵션
+        # Whisper 옵션
         self.beam_size = beam_size
         self.temperature = temperature
 
@@ -88,12 +79,16 @@ class FasterWhisperSTT:
         self.noise_multiplier = noise_multiplier
         self.idle_timeout_sec = idle_timeout_sec
 
-        # STT 결과 콜백
+        # 콜백
         self.on_text: Optional[Callable[[str], None]] = None
 
-        # (audio, speech_end_ts)
-        self._audio_queue: queue.Queue[tuple[np.ndarray, float]] = queue.Queue()
+        # 🔥 큐는 항상 최신 1개만 유지
+        self._audio_queue: queue.Queue[tuple[np.ndarray, float]] = queue.Queue(maxsize=1)
+
         self._stop_event = threading.Event()
+
+        # 🔥 STT 처리 중 플래그
+        self._is_processing = False
 
         # --------------------------------------------------
         # Whisper 모델 로드
@@ -117,14 +112,12 @@ class FasterWhisperSTT:
         self._worker_thread.start()
         print("[STT] Worker started")
 
-        # Whisper warm-up
         self._warmup()
 
     # ==================================================
     # Warm-up
     # ==================================================
     def _warmup(self):
-        """초기 추론 지연 제거용 더미 추론"""
         dummy = np.zeros(int(self.sample_rate * 1.0), dtype=np.float32)
         try:
             list(
@@ -159,17 +152,10 @@ class FasterWhisperSTT:
     # STT 전처리
     # ==================================================
     def _clean_text(self, text: str) -> str:
-        """
-        STT 결과를 1차 Intent 분류에 적합하게 정리
-        - filler word 제거
-        - 중복 단어 정리
-        """
         text = text.strip()
 
-        # filler 제거
         tokens = [t for t in text.split() if t not in self.FILLER_WORDS]
 
-        # 연속 중복 제거
         cleaned = []
         for t in tokens:
             if not cleaned or cleaned[-1] != t:
@@ -199,9 +185,6 @@ class FasterWhisperSTT:
                 blocksize=frames_per_chunk,
             ) as stream:
 
-                # ------------------------------------------
-                # 노이즈 자동 캘리브레이션
-                # ------------------------------------------
                 if self.auto_calibrate_noise:
                     noise = self._measure_noise_floor(
                         stream,
@@ -222,6 +205,11 @@ class FasterWhisperSTT:
                     audio = data.squeeze()
                     volume = float(np.sqrt(np.mean(audio * audio))) if audio.size else 0.0
 
+                    # 🔥 처리 중이면 말하지 말라는 UX 로그
+                    if self._is_processing and volume >= self.silence_threshold:
+                        print("[STT] ⏳ 처리 중입니다. 잠시만 기다려 주세요.")
+                        continue
+
                     if volume >= self.silence_threshold:
                         if not is_speaking:
                             speech_start_ts = time.time()
@@ -234,9 +222,6 @@ class FasterWhisperSTT:
                         if is_speaking:
                             silent_count += 1
 
-                    # ------------------------------------------
-                    # VAD 종료 조건
-                    # ------------------------------------------
                     if is_speaking and silent_count >= self.silence_chunks:
                         speech_end_ts = time.time()
                         vad_latency = (speech_end_ts - speech_start_ts) * 1000
@@ -247,6 +232,13 @@ class FasterWhisperSTT:
                         )
 
                         if buffer:
+                            # 🔥 항상 최신 발화만 유지
+                            while not self._audio_queue.empty():
+                                try:
+                                    self._audio_queue.get_nowait()
+                                except queue.Empty:
+                                    break
+
                             self._audio_queue.put(
                                 (np.concatenate(buffer), speech_end_ts)
                             )
@@ -300,15 +292,15 @@ class FasterWhisperSTT:
                 continue
 
             try:
+                self._is_processing = True
+
                 audio_16k = self._resample_to_16k(audio_in)
 
-                # 너무 짧은 발화 제거
                 min_samples = int(self.sample_rate * self.min_utterance_seconds)
                 if audio_16k.size < min_samples:
                     print("[STT-WORKER] ⚠️ Too short audio, dropped")
                     continue
 
-                # Whisper 추론
                 t0 = time.time()
                 segments, _ = self.model.transcribe(
                     audio_16k,
@@ -343,6 +335,9 @@ class FasterWhisperSTT:
 
             except Exception as e:
                 print("[STT-WORKER] ❌ Worker error:", repr(e))
+
+            finally:
+                self._is_processing = False
 
     # ==================================================
     # Stop

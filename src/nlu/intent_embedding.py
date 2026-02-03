@@ -16,29 +16,24 @@ SITE_ID = "parkassist_local"
 
 
 # ==================================================
-# 원턴(즉시 응답) 템플릿
+# 원턴 응답 템플릿
 # ==================================================
 ONE_TURN_RESPONSES = {
     Intent.EXIT: "출차하려면 요금 정산이 완료되어야 차단기가 열립니다. 혹시 정산은 이미 하셨나요?",
-    Intent.ENTRY: "입차 시 차량이 인식되면 차단기가 자동으로 열립니다. 차량이 인식되지 않았다면 잠시 정차해 주세요.",
-    Intent.PAYMENT: "주차 요금은 정산기나 출구에서 결제하실 수 있습니다. 이미 결제를 진행하셨나요?",
-    Intent.REGISTRATION: "차량이나 방문자 등록은 키오스크에서 진행하실 수 있습니다. 아직 등록 전이신가요?",
-    Intent.TIME_PRICE: "주차 시간과 요금은 키오스크 화면에서 확인하실 수 있습니다. 어느 부분이 궁금하신가요?",
-    Intent.FACILITY: "기기나 차단기에 이상이 있는 경우 관리실 도움을 받으실 수 있습니다. 현재 어떤 문제가 발생했나요?",
+    Intent.ENTRY: "입차 시 차량이 인식되면 차단기가 자동으로 열립니다.",
+    Intent.PAYMENT: "주차 요금은 정산기나 출구에서 결제하실 수 있습니다.",
+    Intent.REGISTRATION: "차량이나 방문자 등록은 키오스크에서 진행하실 수 있습니다.",
+    Intent.TIME_PRICE: "주차 시간과 요금은 키오스크 화면에서 확인하실 수 있습니다.",
+    Intent.FACILITY: "기기 이상 시 관리실로 문의해 주세요.",
 }
 
-NONE_RETRY_TEXT = (
-    "말씀을 정확히 이해하지 못했어요. "
-    "출차, 결제, 등록 중 어떤 도움을 원하시는지 말씀해 주세요."
-)
 
 DONE_KEYWORDS = [
     "됐어요", "되었습니다", "해결", "괜찮아요",
     "그만", "종료", "끝", "마칠게",
     "고마워", "감사", "안녕",
 ]
-
-FAREWELL_TEXT = "네, 해결되셨다니 다행입니다. 이용해 주셔서 감사합니다. 안녕히 가세요."
+FAREWELL_TEXT = "네, 이용해 주셔서 감사합니다. 안녕히 가세요."
 DONE_COOLDOWN_SEC = 1.2
 
 
@@ -54,22 +49,25 @@ def _is_done_utterance(text: str) -> bool:
 
 class AppEngine:
     """
-    STT → Intent-1(1회) → 정책 판단 → one-turn or SECOND_STAGE → Dialog LLM
+    상태 기반 CX AppEngine (FINAL)
+
+    상태:
+    - FIRST_STAGE  : 첫 발화
+    - ONE_TURN     : 원턴 응답 직후
+    - SECOND_STAGE : 멀티턴 상담
     """
 
     def __init__(self):
         self.state = "FIRST_STAGE"
 
         self.session_id = None
-        self.first_intent = None
         self.intent_log_id = None
+        self.first_intent = None
 
         self.dialog_turn_index = 0
         self.dialog_history = []
 
         self._ignore_until_ts = 0.0
-        self._just_one_turn = False
-        self._none_retry_count = 0
 
     # --------------------------------------------------
     # 세션 보장
@@ -81,46 +79,11 @@ class AppEngine:
             self.dialog_history = []
 
     # --------------------------------------------------
-    # confidence 계산 (복구됨)
-    # --------------------------------------------------
-    def calculate_confidence(self, text: str, intent: Intent) -> float:
-        score = 0.4
-
-        KEYWORDS = {
-            Intent.EXIT: ["출차", "나가", "차단기"],
-            Intent.ENTRY: ["입차", "들어가"],
-            Intent.PAYMENT: ["결제", "요금", "정산"],
-            Intent.REGISTRATION: ["등록", "번호판"],
-            Intent.TIME_PRICE: ["시간", "요금"],
-            Intent.FACILITY: ["기계", "고장", "이상"],
-            Intent.COMPLAINT: ["왜", "안돼", "짜증"],
-        }
-
-        hits = sum(1 for k in KEYWORDS.get(intent, []) if k in text)
-        score += 0.35 if hits else 0.15
-        score += 0.05 if len(text) <= 4 else 0.2
-
-        return round(min(score, 1.0), 2)
-
-    # --------------------------------------------------
-    # 멀티턴 판단
-    # --------------------------------------------------
-    def should_use_multiturn(self, intent: Intent, confidence: float, text: str) -> bool:
-        if intent == Intent.COMPLAINT:
-            return True
-        if any(k in text for k in ["안돼", "이상", "왜", "멈췄", "실패"]):
-            return True
-        if confidence < CONFIDENCE_THRESHOLD:
-            return True
-        return False
-
-    # --------------------------------------------------
-    # dialog 로깅
+    # dialog 로그
     # --------------------------------------------------
     def _log_dialog(self, role, content, model="stt"):
         self._ensure_session()
         self.dialog_turn_index += 1
-
         log_dialog(
             intent_log_id=self.intent_log_id,
             session_id=self.session_id,
@@ -129,14 +92,13 @@ class AppEngine:
             model=model,
             turn_index=self.dialog_turn_index,
         )
-
         if role in ("user", "assistant"):
             self.dialog_history.append({"role": role, "content": content})
 
     # --------------------------------------------------
-    # SECOND_STAGE 처리
+    # 멀티턴 처리
     # --------------------------------------------------
-    def _handle_second_stage(self, text):
+    def _handle_second_stage(self, text: str):
         if time.time() < self._ignore_until_ts:
             return
 
@@ -166,9 +128,9 @@ class AppEngine:
         print(f"[DIALOG] {reply}")
 
     # --------------------------------------------------
-    # STT 엔트리포인트
+    # STT 텍스트 엔트리포인트
     # --------------------------------------------------
-    def handle_text(self, text):
+    def handle_text(self, text: str):
         if not text or not text.strip():
             return
         if time.time() < self._ignore_until_ts:
@@ -178,32 +140,36 @@ class AppEngine:
         print(f"[ENGINE] State={self.state}")
         print(f"[ENGINE] Text={text}")
 
-        # SECOND_STAGE 유지
+        # --------------------------------------------------
+        # SECOND_STAGE
+        # --------------------------------------------------
         if self.state == "SECOND_STAGE":
             self._handle_second_stage(text)
             print("=" * 50)
             return
 
-        self._ensure_session()
-
-        if _is_done_utterance(text):
-            self._log_dialog("user", text)
-            self._log_dialog("assistant", FAREWELL_TEXT, model="system")
-            print(f"[DIALOG] {FAREWELL_TEXT}")
-            self.end_session()
+        # --------------------------------------------------
+        # ONE_TURN → 무조건 멀티턴 승격
+        # --------------------------------------------------
+        if self.state == "ONE_TURN":
+            print("[ENGINE] ONE_TURN follow-up → SECOND_STAGE")
+            self.state = "SECOND_STAGE"
+            self._handle_second_stage(text)
             print("=" * 50)
             return
 
-        # Intent-1 (단 1회)
-        result = detect_intent_llm(text)
-        result.confidence = self.calculate_confidence(text, result.intent)
+        # --------------------------------------------------
+        # FIRST_STAGE
+        # --------------------------------------------------
+        self._ensure_session()
 
-        print(f"[ENGINE] Intent={result.intent.name}, confidence={result.confidence:.2f}")
+        result = detect_intent_llm(text)
+        print(f"[ENGINE] Intent={result.intent.name}")
 
         self.intent_log_id = log_intent(
             utterance=text,
             predicted_intent=result.intent.value,
-            predicted_confidence=result.confidence,
+            predicted_confidence=1.0,
             source="kiosk",
             site_id=SITE_ID,
         )
@@ -211,33 +177,27 @@ class AppEngine:
         self.first_intent = result.intent.value
         self._log_dialog("user", text)
 
-        if result.intent == Intent.NONE:
-            self._none_retry_count += 1
-            if self._none_retry_count == 1:
-                self._log_dialog("assistant", NONE_RETRY_TEXT, model="system")
-                print(f"[ONE-TURN] {NONE_RETRY_TEXT}")
-                print("=" * 50)
-                return
-
+        # 멀티턴 필요 조건
+        if result.intent == Intent.COMPLAINT:
+            print("[ENGINE] Decision: multiturn")
             self.state = "SECOND_STAGE"
             self._handle_second_stage(text)
             print("=" * 50)
             return
 
-        self._none_retry_count = 0
+        # --------------------------------------------------
+        # 원턴 응답
+        # --------------------------------------------------
+        reply = ONE_TURN_RESPONSES.get(
+            result.intent,
+            "안내를 도와드릴 수 있는 상담으로 연결하겠습니다."
+        )
 
-        if self.should_use_multiturn(result.intent, result.confidence, text):
-            print("[ENGINE] Decision: multiturn → SECOND_STAGE")
-            self.state = "SECOND_STAGE"
-            self._handle_second_stage(text)
-            print("=" * 50)
-            return
-
-        reply = ONE_TURN_RESPONSES.get(result.intent)
         print("[ENGINE] Decision: one-turn")
         print(f"[ONE-TURN] {reply}")
+
         self._log_dialog("assistant", reply, model="system")
-        self._just_one_turn = True
+        self.state = "ONE_TURN"
 
         print("=" * 50)
 
@@ -246,11 +206,10 @@ class AppEngine:
     # --------------------------------------------------
     def end_session(self):
         print(f"[ENGINE] Session ended: {self.session_id}")
+
         self.state = "FIRST_STAGE"
         self.session_id = None
         self.intent_log_id = None
         self.first_intent = None
         self.dialog_turn_index = 0
         self.dialog_history = []
-        self._just_one_turn = False
-        self._none_retry_count = 0

@@ -16,16 +16,36 @@ SITE_ID = "parkassist_local"
 
 
 # ==================================================
-# 원턴(즉시 응답) 템플릿
+# 원턴(즉시 응답) 템플릿 – 개선 버전
 # ==================================================
-# ⚠️ 원턴 응답은 "안내"만 한다 (해결/판단 ❌)
+# 설계 원칙:
+# - 해결 ❌ / 판단 ❌
+# - 안내 + 다음 행동을 "열어주는" 문장
 ONE_TURN_RESPONSES = {
-    Intent.EXIT: "정산이 완료되면 차단기가 자동으로 열립니다.",
-    Intent.ENTRY: "입차 시 차량 인식 후 차단기가 자동으로 열립니다.",
-    Intent.PAYMENT: "주차 요금은 정산기 또는 출구에서 확인하실 수 있습니다.",
-    Intent.REGISTRATION: "차량 또는 방문자 등록은 키오스크에서 진행하실 수 있습니다.",
-    Intent.TIME_PRICE: "주차 시간 및 요금은 키오스크 화면에서 확인하실 수 있습니다.",
-    Intent.FACILITY: "기기 이상 시 관리실로 문의해 주세요.",
+    Intent.EXIT: (
+        "출차하려면 요금 정산이 완료되어야 차단기가 열립니다. "
+        "혹시 정산은 이미 하셨나요?"
+    ),
+    Intent.ENTRY: (
+        "입차 시 차량이 인식되면 차단기가 자동으로 열립니다. "
+        "차량이 인식되지 않았다면 잠시 정차해 주세요."
+    ),
+    Intent.PAYMENT: (
+        "주차 요금은 정산기나 출구에서 결제하실 수 있습니다. "
+        "이미 결제를 진행하셨나요?"
+    ),
+    Intent.REGISTRATION: (
+        "차량이나 방문자 등록은 키오스크에서 진행하실 수 있습니다. "
+        "아직 등록 전이신가요?"
+    ),
+    Intent.TIME_PRICE: (
+        "주차 시간과 요금은 키오스크 화면에서 확인하실 수 있습니다. "
+        "어느 부분이 궁금하신가요?"
+    ),
+    Intent.FACILITY: (
+        "기기나 차단기에 이상이 있는 경우 관리실 도움을 받으실 수 있습니다. "
+        "현재 어떤 문제가 발생했나요?"
+    ),
 }
 
 
@@ -94,10 +114,6 @@ class AppEngine:
     # confidence 계산 (AppEngine 책임)
     # ==================================================
     def calculate_confidence(self, text: str, intent: Intent) -> float:
-        """
-        - 1차 Intent 결과의 신뢰도를 수치화
-        - 규칙 기반 (운영 튜닝 대상)
-        """
         score = 0.4
         text = text.strip()
 
@@ -113,31 +129,20 @@ class AppEngine:
 
         hits = sum(1 for k in KEYWORDS_BY_INTENT.get(intent, []) if k in text)
         score += 0.35 if hits >= 1 else 0.15
-
-        # 발화 길이 보정
         score += 0.05 if len(text) <= 4 else 0.2
 
         return round(min(score, 1.0), 2)
 
     # ==================================================
-    # 멀티턴 여부 판단 (정책 핵심)
+    # 멀티턴 여부 판단
     # ==================================================
     def should_use_multiturn(self, intent: Intent, confidence: float, text: str) -> bool:
-        """
-        멀티턴이 필요한 경우:
-        - 불만/감정 표현
-        - 오류/문제 신호 포함
-        - 신뢰도 낮음
-        """
         if intent == Intent.COMPLAINT:
             return True
-
         if any(k in text for k in ["안돼", "이상", "왜", "멈췄"]):
             return True
-
         if confidence < CONFIDENCE_THRESHOLD:
             return True
-
         return False
 
     # ==================================================
@@ -148,7 +153,6 @@ class AppEngine:
             return
 
         try:
-            # DONE 처리
             if _is_done_utterance(text):
                 self._log_dialog("user", text)
                 self._log_dialog("assistant", FAREWELL_TEXT, model="system")
@@ -158,10 +162,8 @@ class AppEngine:
                 self._ignore_until_ts = time.time() + DONE_COOLDOWN_SEC
                 return
 
-            # user 로그
             self._log_dialog("user", text)
 
-            # 2차 LLM 호출
             res = dialog_llm_chat(
                 text,
                 history=self.dialog_history,
@@ -211,11 +213,10 @@ class AppEngine:
             return
 
         # --------------------------------------------------
-        # ✅ 원턴 직후 추가 발화 → 자동 멀티턴 승격
+        # 원턴 직후 추가 발화 → 자동 멀티턴 승격
         # --------------------------------------------------
         if self._just_one_turn:
             self._just_one_turn = False
-
             print("[ENGINE] One-turn follow-up detected → escalate to 2nd stage")
 
             self.state = "SECOND_STAGE"
@@ -236,9 +237,6 @@ class AppEngine:
         print(f"[ENGINE] State={self.state}")
         print(f"[ENGINE] Text={text}")
 
-        # ------------------------------
-        # 2차 멀티턴 중
-        # ------------------------------
         if self.state == "SECOND_STAGE":
             self._handle_second_stage(text)
             print("=" * 50)
@@ -282,7 +280,7 @@ class AppEngine:
             return
 
         # ------------------------------
-        # ✅ 원턴 즉시 응답
+        # ✅ 원턴 즉시 응답 (개선된 문구)
         # ------------------------------
         reply = ONE_TURN_RESPONSES.get(
             result.intent,
@@ -301,7 +299,6 @@ class AppEngine:
             turn_index=0,
         )
 
-        # 원턴 후 상태 기록
         self._just_one_turn = True
         self._last_one_turn_intent = result.intent
 

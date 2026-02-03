@@ -51,6 +51,17 @@ SYSTEM_PROMPT_INTENT = (
     "- 다른 텍스트는 절대 출력하지 않는다\n"
 )
 
+# ==================================================
+# 재시도 전용 프롬프트 (Intent.NONE 방지용)
+# ==================================================
+SYSTEM_PROMPT_INTENT_RETRY = (
+    SYSTEM_PROMPT_INTENT
+    + "\n\n"
+    "⚠️ 주의:\n"
+    "아래 발화는 음성 인식 결과라 문장이 불완전하거나 어색할 수 있다.\n"
+    "그래도 가장 가까운 의도 하나를 반드시 선택하라.\n"
+)
+
 
 # ==================================================
 # JSON 추출 유틸 (방어적)
@@ -58,12 +69,6 @@ SYSTEM_PROMPT_INTENT = (
 def _extract_json(text: str) -> dict:
     """
     LLM 출력에서 intent JSON을 최대한 안전하게 추출한다.
-
-    허용 케이스:
-    - 순수 JSON
-    - 코드블록 포함 JSON
-    - 설명 + JSON
-    - JSON 깨졌지만 intent 키는 존재
     """
     if not text:
         raise ValueError("Empty LLM output")
@@ -73,7 +78,7 @@ def _extract_json(text: str) -> dict:
     # 1️⃣ 코드블록 제거
     text = re.sub(r"```.*?```", "", text, flags=re.S)
 
-    # 2️⃣ 가장 첫 JSON 객체 추출
+    # 2️⃣ JSON 객체 추출
     m = re.search(r"\{[^{}]*\}", text)
     if m:
         return json.loads(m.group(0))
@@ -87,21 +92,53 @@ def _extract_json(text: str) -> dict:
 
 
 # ==================================================
-# 1차 의도 분류 (INTENT ONLY)
+# 내부 호출 함수 (단일 시도)
+# ==================================================
+def _classify_once(prompt: str, debug: bool) -> Intent:
+    payload = {
+        "model": OLLAMA_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+        "options": {
+            "temperature": 0.0,
+            "num_predict": 16,
+        },
+    }
+
+    r = requests.post(
+        OLLAMA_CHAT_URL,
+        json=payload,
+        timeout=OLLAMA_TIMEOUT,
+    )
+    r.raise_for_status()
+
+    data = r.json()
+    content = data.get("message", {}).get("content", "")
+
+    if debug:
+        print("[LLM] (Intent-1) Raw output:")
+        print(content)
+
+    obj = _extract_json(content)
+    intent_str = str(obj.get("intent", "NONE")).strip()
+
+    try:
+        return Intent(intent_str)
+    except Exception:
+        return Intent.NONE
+
+
+# ==================================================
+# 1차 의도 분류 (INTENT ONLY, retry 1회)
 # ==================================================
 def detect_intent_llm(text: str, debug: bool = True) -> IntentResult:
     """
     1차(Level-1) 의도 분류 전용 함수
 
-    입력:
-        - STT로 확정된 사용자 발화
-
-    출력:
-        - IntentResult(intent, confidence=0.0)
-
-    ⚠️ 주의
-    - 이 함수는 절대 해결하지 않는다
-    - confidence는 AppEngine에서 계산한다
+    정책:
+    - 1회 시도
+    - Intent.NONE이면 프롬프트 변경 후 1회 재시도
+    - 그래도 실패하면 NONE 확정
     """
 
     if not text or not text.strip():
@@ -111,55 +148,32 @@ def detect_intent_llm(text: str, debug: bool = True) -> IntentResult:
         print(f"[LLM] (Intent-1) Input text: {text}")
         print(f"[LLM] (Intent-1) model={OLLAMA_MODEL}")
 
-    prompt = (
-        SYSTEM_PROMPT_INTENT
-        + "\n\n[사용자 발화]\n"
-        + text
-    )
-
-    payload = {
-        "model": OLLAMA_MODEL,
-        "messages": [
-            {"role": "user", "content": prompt}
-        ],
-        "stream": False,
-        "options": {
-            # 분류는 흔들리면 안 됨
-            "temperature": 0.0,
-            # JSON 하나만 출력하면 충분
-            "num_predict": 16,
-        },
-    }
-
     try:
         print("[LLM] ⏳ Intent-1 inference started...")
         start_ts = time.time()
 
-        r = requests.post(
-            OLLAMA_CHAT_URL,
-            json=payload,
-            timeout=OLLAMA_TIMEOUT,
-        )
-        r.raise_for_status()
+        # ------------------------------
+        # 1차 시도
+        # ------------------------------
+        prompt = SYSTEM_PROMPT_INTENT + "\n\n[사용자 발화]\n" + text
+        intent = _classify_once(prompt, debug)
+
+        # ------------------------------
+        # Intent.NONE → 재시도 1회
+        # ------------------------------
+        if intent == Intent.NONE:
+            if debug:
+                print("[LLM] 🔁 Intent.NONE → retry once with relaxed prompt")
+
+            retry_prompt = (
+                SYSTEM_PROMPT_INTENT_RETRY
+                + "\n\n[사용자 발화]\n"
+                + text
+            )
+            intent = _classify_once(retry_prompt, debug)
 
         elapsed_ms = (time.time() - start_ts) * 1000
         print(f"[LLM] ✅ Intent-1 inference finished ({elapsed_ms:.0f} ms)")
-
-        data = r.json()
-        content = data.get("message", {}).get("content", "")
-
-        if debug:
-            print("[LLM] (Intent-1) Raw output:")
-            print(content)
-
-        obj = _extract_json(content)
-        intent_str = str(obj.get("intent", "NONE")).strip()
-
-        try:
-            intent = Intent(intent_str)
-        except Exception:
-            intent = Intent.NONE
-
         print(f"[LLM] 🎯 Intent-1 classified: {intent.name}")
 
         return IntentResult(
@@ -173,7 +187,6 @@ def detect_intent_llm(text: str, debug: bool = True) -> IntentResult:
             print(repr(e))
             traceback.print_exc()
 
-        # 실패 시에도 시스템은 멈추지 않는다
         return IntentResult(
             intent=Intent.NONE,
             confidence=0.0,

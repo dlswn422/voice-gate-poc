@@ -14,9 +14,11 @@ import re
 CONFIDENCE_THRESHOLD = 0.75
 SITE_ID = "parkassist_local"
 
+
 # ==================================================
 # 원턴(즉시 응답) 템플릿
 # ==================================================
+# ⚠️ 원턴 응답은 "안내"만 한다 (해결/판단 ❌)
 ONE_TURN_RESPONSES = {
     Intent.EXIT: "정산이 완료되면 차단기가 자동으로 열립니다.",
     Intent.ENTRY: "입차 시 차량 인식 후 차단기가 자동으로 열립니다.",
@@ -26,13 +28,14 @@ ONE_TURN_RESPONSES = {
     Intent.FACILITY: "기기 이상 시 관리실로 문의해 주세요.",
 }
 
+
 # ==================================================
 # DONE 강제 종료 정책
 # ==================================================
 DONE_KEYWORDS = [
     "됐어요", "되었습니다", "해결", "괜찮아요",
     "그만", "종료", "끝", "마칠게",
-    "고마워", "감사", "안녕"
+    "고마워", "감사", "안녕",
 ]
 
 FAREWELL_TEXT = "네, 해결되셨다니 다행입니다. 이용해 주셔서 감사합니다. 안녕히 가세요."
@@ -40,6 +43,7 @@ DONE_COOLDOWN_SEC = 1.2
 
 
 def _normalize(text: str) -> str:
+    """DONE 키워드 판별용 정규화"""
     t = text.strip().lower()
     t = re.sub(r"[\s\.\,\!\?\u3002\uFF0E\uFF0C\uFF01\uFF1F]+", "", t)
     return t
@@ -54,17 +58,24 @@ class AppEngine:
     """
     주차장 키오스크 CX App Engine (FINAL)
 
-    - 1차 모델: 의도 분류 전용
-    - 원턴 가능 → 즉시 시스템 응답
+    역할 분리:
+    - STT            : 음성 → 텍스트
+    - Intent-1 LLM   : 주제(Level-1 Intent) 분류만
+    - AppEngine      : 정책 판단 (원턴 / 멀티턴 라우팅)
+    - Dialog LLM     : 멀티턴 상담
+
+    핵심 정책:
+    - 정보성 발화 → 원턴 즉시 응답
+    - 문제/불만/애매 → 멀티턴
     - 원턴 후 추가 발화 → 자동 멀티턴 승격
-    - 멀티턴 → 2차 LLM 상담
     """
 
     def __init__(self):
+        # 상태
         self.state = "FIRST_STAGE"
         self.session_id = None
 
-        # 2차 컨텍스트용
+        # 2차 컨텍스트
         self.first_intent = None
         self.intent_log_id = None
 
@@ -80,9 +91,13 @@ class AppEngine:
         self._last_one_turn_intent = None
 
     # ==================================================
-    # confidence 계산
+    # confidence 계산 (AppEngine 책임)
     # ==================================================
     def calculate_confidence(self, text: str, intent: Intent) -> float:
+        """
+        - 1차 Intent 결과의 신뢰도를 수치화
+        - 규칙 기반 (운영 튜닝 대상)
+        """
         score = 0.4
         text = text.strip()
 
@@ -98,20 +113,31 @@ class AppEngine:
 
         hits = sum(1 for k in KEYWORDS_BY_INTENT.get(intent, []) if k in text)
         score += 0.35 if hits >= 1 else 0.15
+
+        # 발화 길이 보정
         score += 0.05 if len(text) <= 4 else 0.2
 
         return round(min(score, 1.0), 2)
 
     # ==================================================
-    # 멀티턴 여부 판단
+    # 멀티턴 여부 판단 (정책 핵심)
     # ==================================================
     def should_use_multiturn(self, intent: Intent, confidence: float, text: str) -> bool:
+        """
+        멀티턴이 필요한 경우:
+        - 불만/감정 표현
+        - 오류/문제 신호 포함
+        - 신뢰도 낮음
+        """
         if intent == Intent.COMPLAINT:
             return True
+
         if any(k in text for k in ["안돼", "이상", "왜", "멈췄"]):
             return True
+
         if confidence < CONFIDENCE_THRESHOLD:
             return True
+
         return False
 
     # ==================================================
@@ -122,16 +148,20 @@ class AppEngine:
             return
 
         try:
+            # DONE 처리
             if _is_done_utterance(text):
                 self._log_dialog("user", text)
                 self._log_dialog("assistant", FAREWELL_TEXT, model="system")
                 print(f"[DIALOG] {FAREWELL_TEXT}")
+
                 self.end_second_stage()
                 self._ignore_until_ts = time.time() + DONE_COOLDOWN_SEC
                 return
 
+            # user 로그
             self._log_dialog("user", text)
 
+            # 2차 LLM 호출
             res = dialog_llm_chat(
                 text,
                 history=self.dialog_history,
@@ -185,12 +215,14 @@ class AppEngine:
         # --------------------------------------------------
         if self._just_one_turn:
             self._just_one_turn = False
+
             print("[ENGINE] One-turn follow-up detected → escalate to 2nd stage")
 
             self.state = "SECOND_STAGE"
             self.session_id = str(uuid.uuid4())
             self.dialog_turn_index = 0
             self.dialog_history = []
+
             self.first_intent = (
                 self._last_one_turn_intent.value
                 if self._last_one_turn_intent else None
@@ -269,7 +301,7 @@ class AppEngine:
             turn_index=0,
         )
 
-        # ✅ 원턴 후 상태 기록
+        # 원턴 후 상태 기록
         self._just_one_turn = True
         self._last_one_turn_intent = result.intent
 
@@ -280,11 +312,13 @@ class AppEngine:
     # ==================================================
     def end_second_stage(self):
         print(f"[ENGINE] Session ended: {self.session_id}")
+
         self.state = "FIRST_STAGE"
         self.session_id = None
         self.intent_log_id = None
         self.dialog_turn_index = 0
         self.dialog_history = []
         self.first_intent = None
+
         self._just_one_turn = False
         self._last_one_turn_intent = None

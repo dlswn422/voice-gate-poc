@@ -15,21 +15,37 @@ from scipy.signal import resample_poly
 # --------------------------------------------------
 # Windows + ctranslate2 안정화
 # --------------------------------------------------
+# CPU 추론 시 과도한 스레드 사용 방지
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 
 class FasterWhisperSTT:
     """
-    STT TRACE VERSION
+    STT TRACE VERSION (FINAL)
 
-    로그 목적:
-    - 음성 감지 시작 시점
-    - 발화 종료(VAD) 시점
-    - STT worker 큐 대기 시간
-    - Whisper 추론 시간
-    - 전체 STT latency
+    목적
+    - 음성 → 텍스트 전체 파이프라인 latency 추적
+    - STT 결과를 1차 Intent 분류에 "최적의 입력"으로 제공
+
+    주요 로그
+    - Speech detected 시점
+    - Speech ended (VAD latency)
+    - STT worker queue delay
+    - Whisper inference time
+    - Total STT latency
+
+    설계 원칙
+    - STT는 판단하지 않는다 (의미 해석 ❌)
+    - 최대한 깨끗한 텍스트만 AppEngine으로 전달
     """
+
+    # --------------------------------------------------
+    # STT 전처리용 filler word 목록
+    # --------------------------------------------------
+    FILLER_WORDS = [
+        "어", "음", "저기", "그", "아", "뭐지", "이제",
+    ]
 
     def __init__(
         self,
@@ -50,6 +66,7 @@ class FasterWhisperSTT:
         noise_multiplier: float = 4.0,
         idle_timeout_sec: Optional[float] = None,
     ):
+        # 오디오 관련 설정
         self.sample_rate = sample_rate
         self.input_sample_rate = input_sample_rate
         self.chunk_seconds = chunk_seconds
@@ -57,19 +74,24 @@ class FasterWhisperSTT:
         self.silence_chunks = silence_chunks
         self.device_index = device_index
 
+        # 발화 필터링 기준
         self.min_utterance_seconds = min_utterance_seconds
         self.min_text_len = min_text_len
 
+        # Whisper 추론 옵션
         self.beam_size = beam_size
         self.temperature = temperature
 
+        # 노이즈 캘리브레이션
         self.auto_calibrate_noise = auto_calibrate_noise
         self.noise_calib_seconds = noise_calib_seconds
         self.noise_multiplier = noise_multiplier
         self.idle_timeout_sec = idle_timeout_sec
 
+        # STT 결과 콜백
         self.on_text: Optional[Callable[[str], None]] = None
 
+        # (audio, speech_end_ts)
         self._audio_queue: queue.Queue[tuple[np.ndarray, float]] = queue.Queue()
         self._stop_event = threading.Event()
 
@@ -95,12 +117,14 @@ class FasterWhisperSTT:
         self._worker_thread.start()
         print("[STT] Worker started")
 
+        # Whisper warm-up
         self._warmup()
 
     # ==================================================
     # Warm-up
     # ==================================================
     def _warmup(self):
+        """초기 추론 지연 제거용 더미 추론"""
         dummy = np.zeros(int(self.sample_rate * 1.0), dtype=np.float32)
         try:
             list(
@@ -132,6 +156,28 @@ class FasterWhisperSTT:
         ).astype(np.float32)
 
     # ==================================================
+    # STT 전처리
+    # ==================================================
+    def _clean_text(self, text: str) -> str:
+        """
+        STT 결과를 1차 Intent 분류에 적합하게 정리
+        - filler word 제거
+        - 중복 단어 정리
+        """
+        text = text.strip()
+
+        # filler 제거
+        tokens = [t for t in text.split() if t not in self.FILLER_WORDS]
+
+        # 연속 중복 제거
+        cleaned = []
+        for t in tokens:
+            if not cleaned or cleaned[-1] != t:
+                cleaned.append(t)
+
+        return " ".join(cleaned).strip()
+
+    # ==================================================
     # Listening Thread
     # ==================================================
     def start_listening(self):
@@ -153,6 +199,9 @@ class FasterWhisperSTT:
                 blocksize=frames_per_chunk,
             ) as stream:
 
+                # ------------------------------------------
+                # 노이즈 자동 캘리브레이션
+                # ------------------------------------------
                 if self.auto_calibrate_noise:
                     noise = self._measure_noise_floor(
                         stream,
@@ -165,8 +214,6 @@ class FasterWhisperSTT:
                     )
                     print(f"[STT] 🔧 silence_threshold={self.silence_threshold:.5f}")
 
-                last_active_ts = time.time()
-
                 while not self._stop_event.is_set():
                     data, overflowed = stream.read(frames_per_chunk)
                     if overflowed:
@@ -176,7 +223,6 @@ class FasterWhisperSTT:
                     volume = float(np.sqrt(np.mean(audio * audio))) if audio.size else 0.0
 
                     if volume >= self.silence_threshold:
-                        last_active_ts = time.time()
                         if not is_speaking:
                             speech_start_ts = time.time()
                             print("[STT] 🟢 Speech detected")
@@ -188,6 +234,9 @@ class FasterWhisperSTT:
                         if is_speaking:
                             silent_count += 1
 
+                    # ------------------------------------------
+                    # VAD 종료 조건
+                    # ------------------------------------------
                     if is_speaking and silent_count >= self.silence_chunks:
                         speech_end_ts = time.time()
                         vad_latency = (speech_end_ts - speech_start_ts) * 1000
@@ -253,11 +302,13 @@ class FasterWhisperSTT:
             try:
                 audio_16k = self._resample_to_16k(audio_in)
 
+                # 너무 짧은 발화 제거
                 min_samples = int(self.sample_rate * self.min_utterance_seconds)
                 if audio_16k.size < min_samples:
                     print("[STT-WORKER] ⚠️ Too short audio, dropped")
                     continue
 
+                # Whisper 추론
                 t0 = time.time()
                 segments, _ = self.model.transcribe(
                     audio_16k,
@@ -271,7 +322,8 @@ class FasterWhisperSTT:
                 whisper_ms = (t1 - t0) * 1000
                 total_ms = (t1 - speech_end_ts) * 1000
 
-                text = "".join(seg.text for seg in segments).strip()
+                raw_text = "".join(seg.text for seg in segments).strip()
+                text = self._clean_text(raw_text)
 
                 print(
                     f"[STT-TIMING] "
@@ -281,7 +333,7 @@ class FasterWhisperSTT:
                 )
 
                 if not text or len(text) < self.min_text_len:
-                    print("[STT-WORKER] ⚠️ Empty text, skipped")
+                    print("[STT-WORKER] ⚠️ Empty/short text, skipped")
                     continue
 
                 print(f"[STT] 🎤 \"{text}\"")

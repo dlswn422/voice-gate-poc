@@ -23,8 +23,8 @@ def _load_env():
 _load_env()
 print("[ENV] DATABASE_URL loaded =", bool(os.getenv("DATABASE_URL")))
 
-from speech.faster_whisper_stt import FasterWhisperSTT  # noqa: E402
-from engine.app_engine import AppEngine                  # noqa: E402
+from src.speech.faster_whisper_stt import FasterWhisperSTT  # noqa: E402
+from src.engine.app_engine import AppEngine                  # noqa: E402
 
 
 # --------------------------------------------------

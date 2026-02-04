@@ -49,3 +49,7 @@ Thumbs.db
 ############################
 # IDE / Editor
 ###########
+
+# RAG cache
+src/manuals/.rag_cache.json
+

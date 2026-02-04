@@ -1,141 +1,183 @@
-from transformers import AutoModelForCausalLM, AutoTokenizer
-import torch
+# src/nlu/llm_client.py
+from __future__ import annotations
+
 import json
-from nlu.intent_schema import IntentResult, Intent
+import os
+import re
+import time
+import traceback
+import requests
 
-MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
-CACHE_DIR = "models"
-
-_MODEL = None
-_TOKENIZER = None
-
-
-# =========================
-# Qwen 모델 로딩 (1회)
-# =========================
-def load_qwen():
-    global _MODEL, _TOKENIZER
-
-    if _MODEL is None:
-        print("⏳ Qwen LLM 로딩 중...")
-
-        _TOKENIZER = AutoTokenizer.from_pretrained(
-            MODEL_NAME,
-            trust_remote_code=True,
-            cache_dir=CACHE_DIR,
-        )
-
-        _MODEL = AutoModelForCausalLM.from_pretrained(
-            MODEL_NAME,
-            device_map="cpu",
-            torch_dtype=torch.float32,
-            cache_dir=CACHE_DIR,
-        )
-
-        _MODEL.eval()
-        print("✅ Qwen LLM 로딩 완료")
-
-    return _MODEL, _TOKENIZER
+from src.nlu.intent_schema import IntentResult, Intent
 
 
-# =========================
-# Intent 판별 (확장 버전)
-# =========================
+# ==================================================
+# Ollama Native Chat API 설정 (Intent-1 전용)
+# ==================================================
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
+OLLAMA_MODEL = os.getenv(
+    "OLLAMA_INTENT_MODEL",
+    os.getenv("OLLAMA_MODEL", "llama3.1:8b"),
+)
+OLLAMA_TIMEOUT = float(os.getenv("OLLAMA_TIMEOUT", "20"))
+
+OLLAMA_CHAT_URL = f"{OLLAMA_BASE_URL}/api/chat"
+
+
+# ==================================================
+# 1차 의도 분류 시스템 프롬프트 (LEVEL-1 ONLY)
+# ==================================================
+SYSTEM_PROMPT_INTENT = (
+    "너는 주차장 키오스크 음성 시스템의 1차 의도 분류기다.\n\n"
+    "역할:\n"
+    "- 사용자의 발화를 '주제 단위(Level-1 Intent)'로만 분류한다\n"
+    "- 해결 방법 제시, 실행 판단, 대화 생성은 절대 하지 않는다\n"
+    "- HOW_TO, ISSUE, ERROR 같은 세부 원인은 고려하지 않는다\n\n"
+    "[의도 목록]\n"
+    "- ENTRY        (입차 관련)\n"
+    "- EXIT         (출차 관련)\n"
+    "- PAYMENT      (요금/결제/정산 관련)\n"
+    "- REGISTRATION (방문자/차량 등록 관련)\n"
+    "- TIME_PRICE   (시간/요금 정책 문의)\n"
+    "- FACILITY     (차단기/기기 이상)\n"
+    "- COMPLAINT    (불만/짜증/혼란 표현)\n"
+    "- NONE         (주차장과 무관)\n\n"
+    "[분류 규칙]\n"
+    "- 명령처럼 보여도 '행동'이 아닌 '주제'로 분류한다\n"
+    "- 문제 상황과 방법 문의를 구분하지 않는다\n"
+    "- 애매해도 반드시 하나의 의도를 선택한다\n\n"
+    "[출력 규칙]\n"
+    "- 반드시 JSON만 출력한다\n"
+    "- 형식: {\"intent\": \"INTENT_NAME\"}\n"
+    "- 다른 텍스트는 절대 출력하지 않는다\n"
+)
+
+
+# ==================================================
+# JSON 추출 유틸 (방어적)
+# ==================================================
+def _extract_json(text: str) -> dict:
+    """
+    LLM 출력에서 intent JSON을 최대한 안전하게 추출한다.
+
+    허용 케이스:
+    - 순수 JSON
+    - 코드블록 포함 JSON (```json ... ```)
+    - 설명 + JSON
+    - JSON이 조금 깨졌지만 intent 키는 존재
+    """
+    if not text:
+        raise ValueError("Empty LLM output")
+
+    t = text.strip()
+
+    # 1) 가장 큰 JSON 블록(첫 '{' ~ 마지막 '}') 시도
+    start = t.find("{")
+    end = t.rfind("}") + 1
+    if start != -1 and end > start:
+        cand = t[start:end].strip()
+        try:
+            return json.loads(cand)
+        except Exception:
+            pass
+
+    # 2) 가장 첫 JSON 객체(짧은 {...})라도 찾아보기
+    m = re.search(r"\{.*?\}", t, flags=re.S)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except Exception:
+            pass
+
+    # 3) fallback: intent 키만 강제 추출
+    m = re.search(r'"intent"\s*:\s*"([A-Z_]+)"', t)
+    if m:
+        return {"intent": m.group(1)}
+
+    raise ValueError(f"JSON not found in output: {t}")
+
+
+# ==================================================
+# 1차 의도 분류 (INTENT ONLY)
+# ==================================================
 def detect_intent_llm(text: str, debug: bool = True) -> IntentResult:
-    model, tokenizer = load_qwen()
+    """
+    1차(Level-1) 의도 분류 전용 함수
+
+    입력:
+        - STT로 확정된 사용자 발화
+
+    출력:
+        - IntentResult(intent, confidence=0.0)
+
+    ⚠️ 주의
+    - 이 함수는 절대 해결하지 않는다
+    - confidence는 AppEngine에서 계산한다
+    """
+    if not text or not text.strip():
+        return IntentResult(intent=Intent.NONE, confidence=0.0)
 
     if debug:
-        print(f"📥 [LLM INPUT] {text}")
+        print(f"[LLM] (Intent-1) Input text: {text}")
+        print(f"[LLM] (Intent-1) model={OLLAMA_MODEL}")
 
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "너는 '주차장 출입 차단기 제어' 전용 AI다.\n\n"
-                "사용자의 발화를 아래 의도 중 하나로 분류하라:\n\n"
-                "- OPEN_GATE: 지금 당장 차단기를 열어달라는 명시적 요청\n"
-                "- CLOSE_GATE: 차단기를 닫거나 막아달라는 명시적 요청\n"
-                "- HELP_REQUEST: 문이 안 열림, 결제 실패, 등록 오류 등 문제 상황 설명\n"
-                "- INFO_REQUEST: 방문 등록 방법, 절차, 사용법을 묻는 질문\n"
-                "- NONE: 차단기 제어와 무관한 발화\n\n"
-                "⚠️ 매우 중요:\n"
-                "- OPEN_GATE는 '열어줘', '올려줘', '통과할게요' 등 직접 명령일 때만 선택한다\n"
-                "- '문이 안 열려요', '방문등록 했는데 안돼요'는 OPEN_GATE가 아니라 HELP_REQUEST다\n"
-                "- 질문형 문장은 INFO_REQUEST로 분류한다\n"
-                "- 애매하면 반드시 NONE 또는 HELP_REQUEST를 선택한다\n\n"
-                "출력 규칙:\n"
-                "- 반드시 JSON만 출력한다\n"
-                "- 형식: {\"intent\":\"OPEN_GATE|CLOSE_GATE|HELP_REQUEST|INFO_REQUEST|NONE\",\"confidence\":0.0~1.0}"
-            ),
+    prompt = SYSTEM_PROMPT_INTENT + "\n\n[사용자 발화]\n" + text
+
+    payload = {
+        "model": OLLAMA_MODEL,
+        "messages": [
+            {"role": "user", "content": prompt}
+        ],
+        "stream": False,
+        "options": {
+            # 분류는 흔들리면 안 됨
+            "temperature": 0.0,
+            # JSON 하나만 출력하면 충분
+            "num_predict": 32,
         },
-        {
-            "role": "user",
-            "content": text,
-        },
-    ]
+    }
 
-    enc = tokenizer.apply_chat_template(
-        messages,
-        tokenize=True,
-        add_generation_prompt=True,
-        return_tensors="pt",
-    )
-
-    # transformers 버전에 따라 반환 타입이 Tensor 또는 BatchEncoding(dict)일 수 있음
-    if isinstance(enc, torch.Tensor):
-        input_ids = enc
-        attention_mask = None
-    else:
-        input_ids = enc["input_ids"]
-        attention_mask = enc.get("attention_mask", None)
-
-    gen_kwargs = dict(
-        input_ids=input_ids,
-        max_new_tokens=64,
-        do_sample=False,
-        eos_token_id=tokenizer.eos_token_id,
-    )
-    if attention_mask is not None:
-        gen_kwargs["attention_mask"] = attention_mask
-
-    with torch.no_grad():
-        output_ids = model.generate(**gen_kwargs)
-
-    prompt_len = input_ids.shape[-1]
-    generated_ids = output_ids[0][prompt_len:]
-    decoded = tokenizer.decode(generated_ids, skip_special_tokens=True)
-
-    if debug:
-        print("🧾 [LLM RAW OUTPUT]")
-        print(decoded)
-
-    # =========================
-    # JSON 파싱 + Enum 변환
-    # =========================
     try:
-        start = decoded.find("{")
-        end = decoded.rfind("}") + 1
-        data = json.loads(decoded[start:end])
+        if debug:
+            print("[LLM] ⏳ Intent-1 inference started...")
+        start_ts = time.time()
 
-        intent_str = data.get("intent", "NONE")
-        confidence = float(data.get("confidence", 0.0))
+        r = requests.post(
+            OLLAMA_CHAT_URL,
+            json=payload,
+            timeout=OLLAMA_TIMEOUT,
+        )
+        r.raise_for_status()
+
+        elapsed_ms = (time.time() - start_ts) * 1000
+        if debug:
+            print(f"[LLM] ✅ Intent-1 inference finished ({elapsed_ms:.0f} ms)")
+
+        data = r.json()
+        content = (data.get("message") or {}).get("content", "") or ""
+
+        if debug:
+            print("[LLM] (Intent-1) Raw output:")
+            print(content)
+
+        obj = _extract_json(content)
+        intent_str = str(obj.get("intent", "NONE")).strip()
 
         try:
             intent = Intent(intent_str)
-        except ValueError:
+        except Exception:
             intent = Intent.NONE
 
-        confidence = max(0.0, min(confidence, 1.0))
-
         if debug:
-            print(
-                f"📊 [LLM PARSED] intent={intent.name}, "
-                f"confidence={confidence:.2f}"
-            )
+            print(f"[LLM] 🎯 Intent-1 classified: {intent.name}")
 
-        return IntentResult(intent=intent, confidence=confidence)
+        return IntentResult(intent=intent, confidence=0.0)
 
     except Exception as e:
+        print("[LLM] ❌ Intent-1 inference failed")
         if debug:
-            print("❌ [LLM PARSE ERROR]", e)
+            print(repr(e))
+            traceback.print_exc()
+
+        # 실패 시에도 시스템은 멈추지 않는다
         return IntentResult(intent=Intent.NONE, confidence=0.0)

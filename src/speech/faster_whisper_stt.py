@@ -1,117 +1,160 @@
+from __future__ import annotations
+
+import os
+import threading
+import queue
+import time
+import uuid
+from typing import Optional, Callable
+
 import sounddevice as sd
 import numpy as np
 from faster_whisper import WhisperModel
-from typing import Optional, Callable
-
 from scipy.signal import resample_poly
+
+
+# --------------------------------------------------
+# Windows + ctranslate2 안정화
+# --------------------------------------------------
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 
 class FasterWhisperSTT:
     """
-    실시간 STT 엔진 (Windows 안정화 + 품질 고도화)
+    STT TRACE VERSION (FINAL - SYNC SAFE)
 
-    ✅ 개선 포인트(이번 수정)
-    - max(abs) 대신 RMS 기반 에너지로 VAD(종료 감지) 안정화
-    - 시작/종료 임계값을 분리(히스테리시스): start_threshold > end_threshold
-    - max_utterance_seconds로 발화가 끝 안 잡혀도 강제 종료 -> 전사 진행
-    - 로그 옵션 강화: speaking 상태에서 energy를 찍어 원인 파악 쉬움
+    ✔ 기존 로그 전부 유지
+    ✔ 최신 발화만 처리 (queue size = 1)
+    ✔ 처리 중 추가 발화 시 UX 안내 출력
+    ✔ utterance_id 기반 AppEngine 세션 동기화 가능
+
+    STT는 의미 판단 ❌
+    STT는 "정확하고 최신 텍스트"만 전달
     """
+
+    FILLER_WORDS = ["어", "음", "저기", "그", "아", "뭐지", "이제"]
 
     def __init__(
         self,
-        model_size: str = "large-v3",
+        model_size: str = "medium",
         device_index: Optional[int] = None,
         sample_rate: int = 16000,
         input_sample_rate: int = 48000,
-        chunk_seconds: float = 0.5,
-
-        # ✅ (중요) 시작/종료 임계값 분리: start_threshold는 "말 시작", end_threshold는 "무음"
-        start_threshold: float = 0.020,
-        end_threshold: float = 0.012,
-
-        # 무음 청크 수(0.5s chunk 기준 4면 약 2초 무음)
-        silence_chunks: int = 4,
-
-        # 너무 짧은 발화/텍스트 제거 기준
-        min_utterance_seconds: float = 0.6,
+        chunk_seconds: float = 0.3,
+        silence_threshold: float = 0.03,
+        silence_chunks: int = 2,
+        min_utterance_seconds: float = 0.4,
         min_text_len: int = 2,
-
-        # ✅ 발화가 끝을 못 잡아도 강제 종료(초)
-        max_utterance_seconds: float = 8.0,
-
-        # 디코딩 안정화
-        beam_size: int = 5,
+        beam_size: int = 1,
         temperature: float = 0.0,
-
-        # 로그
-        log_audio_stats: bool = True,
+        download_root: str = "models",
+        auto_calibrate_noise: bool = True,
+        noise_calib_seconds: float = 1.0,
+        noise_multiplier: float = 4.0,
     ):
         self.sample_rate = sample_rate
         self.input_sample_rate = input_sample_rate
         self.chunk_seconds = chunk_seconds
-
-        self.start_threshold = start_threshold
-        self.end_threshold = end_threshold
+        self.silence_threshold = silence_threshold
         self.silence_chunks = silence_chunks
-
         self.device_index = device_index
 
         self.min_utterance_seconds = min_utterance_seconds
         self.min_text_len = min_text_len
-        self.max_utterance_seconds = max_utterance_seconds
 
         self.beam_size = beam_size
         self.temperature = temperature
-        self.log_audio_stats = log_audio_stats
 
+        self.auto_calibrate_noise = auto_calibrate_noise
+        self.noise_calib_seconds = noise_calib_seconds
+        self.noise_multiplier = noise_multiplier
+
+        # 콜백: (text, utterance_id)
+        self.on_text: Optional[Callable[[str, str], None]] = None
+
+        # 🔥 최신 발화만 유지
+        self._audio_queue: queue.Queue[
+            tuple[str, np.ndarray, float]
+        ] = queue.Queue(maxsize=1)
+
+        self._stop_event = threading.Event()
+        self._is_processing = False
+
+        # --------------------------------------------------
+        # Whisper 모델 로드
+        # --------------------------------------------------
         print("[STT] Loading Faster-Whisper model...")
         self.model = WhisperModel(
             model_size,
             device="cpu",
             compute_type="float32",
-            download_root="models",
+            download_root=download_root,
         )
-        print("[STT] Faster-Whisper model loaded")
+        print("[STT] Model ready")
 
-        self.on_text: Optional[Callable[[str], None]] = None
+        self._worker_thread = threading.Thread(
+            target=self._stt_worker,
+            daemon=True,
+        )
+        self._worker_thread.start()
+        print("[STT] Worker started")
 
-    def _resample_to_16k(self, audio_1d: np.ndarray) -> np.ndarray:
-        """input_sample_rate -> sample_rate (예: 48000 -> 16000)"""
+        self._warmup()
+
+    # ==================================================
+    # Warm-up
+    # ==================================================
+    def _warmup(self):
+        dummy = np.zeros(int(self.sample_rate * 1.0), dtype=np.float32)
+        try:
+            list(
+                self.model.transcribe(
+                    dummy,
+                    language="ko",
+                    beam_size=1,
+                    temperature=0.0,
+                    vad_filter=False,
+                )[0]
+            )
+        except Exception:
+            pass
+
+    # ==================================================
+    # Resample
+    # ==================================================
+    def _resample_to_16k(self, audio: np.ndarray) -> np.ndarray:
         if self.input_sample_rate == self.sample_rate:
-            return audio_1d.astype(np.float32)
+            return audio.astype(np.float32)
+        if self.input_sample_rate == 48000:
+            return resample_poly(audio, up=1, down=3).astype(np.float32)
+        return resample_poly(
+            audio, up=self.sample_rate, down=self.input_sample_rate
+        ).astype(np.float32)
 
-        if self.input_sample_rate == 48000 and self.sample_rate == 16000:
-            return resample_poly(audio_1d, up=1, down=3).astype(np.float32)
+    # ==================================================
+    # STT 전처리
+    # ==================================================
+    def _clean_text(self, text: str) -> str:
+        tokens = [t for t in text.strip().split() if t not in self.FILLER_WORDS]
+        cleaned = []
+        for t in tokens:
+            if not cleaned or cleaned[-1] != t:
+                cleaned.append(t)
+        return " ".join(cleaned).strip()
 
-        up = self.sample_rate
-        down = self.input_sample_rate
-        return resample_poly(audio_1d, up=up, down=down).astype(np.float32)
-
-    @staticmethod
-    def _rms_energy(x: np.ndarray) -> float:
-        """RMS 에너지(잡음/피크에 덜 민감)"""
-        if x.size == 0:
-            return 0.0
-        # float64로 올려서 계산 안정성
-        xx = x.astype(np.float64)
-        return float(np.sqrt(np.mean(xx * xx) + 1e-12))
-
+    # ==================================================
+    # Listening Thread
+    # ==================================================
     def start_listening(self):
-        """마이크 입력 수신 → 발화 감지 → 종료 시 STT 수행"""
-        print("[STT] Listening started (Ctrl+C to stop)")
+        print("[STT] 🎧 Listening... (Ctrl+C to stop)")
 
         buffer = []
         silent_count = 0
         is_speaking = False
+        speech_start_ts: Optional[float] = None
 
         frames_per_chunk = int(self.chunk_seconds * self.input_sample_rate)
-
-        # ✅ 강제 종료 타이머용
-        speaking_chunk_count = 0
-        max_speaking_chunks = max(1, int(self.max_utterance_seconds / self.chunk_seconds))
-
-        # ✅ overflow 추적(디버깅)
-        overflow_hits = 0
 
         try:
             with sd.InputStream(
@@ -121,116 +164,145 @@ class FasterWhisperSTT:
                 dtype="float32",
                 blocksize=frames_per_chunk,
             ) as stream:
-                while True:
+
+                if self.auto_calibrate_noise:
+                    noise = self._measure_noise_floor(
+                        stream, frames_per_chunk, self.noise_calib_seconds
+                    )
+                    self.silence_threshold = max(
+                        self.silence_threshold,
+                        noise * self.noise_multiplier,
+                    )
+                    print(f"[STT] 🔧 silence_threshold={self.silence_threshold:.5f}")
+
+                while not self._stop_event.is_set():
                     data, overflowed = stream.read(frames_per_chunk)
-
                     if overflowed:
-                        overflow_hits += 1
-                        # overflow가 잦으면 chunk_seconds를 1.0으로 늘리는 것도 추천
-                        if self.log_audio_stats and overflow_hits % 10 == 0:
-                            print(f"[STT] ⚠ overflowed count={overflow_hits}")
+                        print("[STT] ⚠️ Audio overflow")
 
-                    audio = np.asarray(data, dtype=np.float32).squeeze()
+                    audio = data.squeeze()
+                    volume = float(np.sqrt(np.mean(audio * audio))) if audio.size else 0.0
 
-                    # ✅ max(abs) 대신 RMS 사용
-                    energy = self._rms_energy(audio)
+                    # 🔥 처리 중 UX
+                    if self._is_processing and volume >= self.silence_threshold:
+                        print("[STT] ⏳ 처리 중입니다. 잠시만 기다려 주세요.")
+                        continue
 
-                    # ---- 시작 감지 ----
-                    if not is_speaking:
-                        if energy >= self.start_threshold:
-                            print("[STT] Speech detected")
-                            is_speaking = True
-                            buffer.append(audio)
-                            silent_count = 0
-                            speaking_chunk_count = 1
-                            if self.log_audio_stats:
-                                print(f"[STT] energy(start)={energy:.4f} start_th={self.start_threshold:.4f}")
-                        else:
-                            # 아직 무음 상태 (원인 파악용: 너무 민감/둔감 확인)
-                            if self.log_audio_stats:
-                                # 너무 시끄러운 환경이면 여기 energy가 계속 높게 찍힘
-                                pass
-                            continue
-
-                    # ---- speaking 상태 ----
-                    else:
+                    if volume >= self.silence_threshold:
+                        if not is_speaking:
+                            speech_start_ts = time.time()
+                            print("[STT] 🟢 Speech detected")
+                        is_speaking = True
                         buffer.append(audio)
-                        speaking_chunk_count += 1
-
-                        # ✅ 종료 감지(히스테리시스): end_threshold 아래로 떨어지면 무음 카운트++
-                        if energy < self.end_threshold:
+                        silent_count = 0
+                    else:
+                        if is_speaking:
                             silent_count += 1
-                        else:
-                            silent_count = 0
 
-                        if self.log_audio_stats:
-                            # speaking 중 에너지/무음카운트 추적 (왜 안 끝나는지 바로 보임)
-                            print(
-                                f"[STT] energy={energy:.4f} end_th={self.end_threshold:.4f} "
-                                f"silent_count={silent_count}/{self.silence_chunks} "
-                                f"dur={speaking_chunk_count*self.chunk_seconds:.1f}s"
+                    if is_speaking and silent_count >= self.silence_chunks:
+                        speech_end_ts = time.time()
+                        vad_latency = (speech_end_ts - speech_start_ts) * 1000
+                        print(f"[STT] 🔵 Speech ended (VAD latency={vad_latency:.0f} ms)")
+
+                        if buffer:
+                            utterance_id = str(uuid.uuid4())
+
+                            while not self._audio_queue.empty():
+                                try:
+                                    self._audio_queue.get_nowait()
+                                except queue.Empty:
+                                    break
+
+                            self._audio_queue.put(
+                                (utterance_id, np.concatenate(buffer), speech_end_ts)
                             )
 
-                        # ✅ 발화 종료 판단: 무음이 연속 silence_chunks 이상
-                        if silent_count >= self.silence_chunks:
-                            print("[STT] Speech ended, running transcription")
-                            self._process_buffer(buffer)
-                            buffer.clear()
-                            silent_count = 0
-                            is_speaking = False
-                            speaking_chunk_count = 0
-                            continue
-
-                        # ✅ 강제 종료: 끝이 안 잡혀도 일정 시간 지나면 전사
-                        if speaking_chunk_count >= max_speaking_chunks:
-                            print("[STT] Max utterance reached, forcing transcription")
-                            self._process_buffer(buffer)
-                            buffer.clear()
-                            silent_count = 0
-                            is_speaking = False
-                            speaking_chunk_count = 0
-                            continue
+                        buffer.clear()
+                        silent_count = 0
+                        is_speaking = False
 
         except KeyboardInterrupt:
-            print("[STT] Listening stopped")
+            self.stop()
+        except Exception as e:
+            print("[STT] Listening error:", repr(e))
+            self.stop()
 
-    def _process_buffer(self, buffer):
-        """누적 오디오 → 16k 변환 → Whisper STT"""
-        if not buffer:
+    # ==================================================
+    # Noise calibration
+    # ==================================================
+    def _measure_noise_floor(self, stream, frames_per_chunk, secs):
+        n_chunks = max(1, int(secs / self.chunk_seconds))
+        mx = 0.0
+        for _ in range(n_chunks):
+            data, _ = stream.read(frames_per_chunk)
+            audio = data.squeeze()
+            v = float(np.sqrt(np.mean(audio * audio))) if audio.size else 0.0
+            mx = max(mx, v)
+        return mx
+
+    # ==================================================
+    # STT Worker Thread
+    # ==================================================
+    def _stt_worker(self):
+        print("[STT-WORKER] 🧵 Worker loop started")
+
+        while not self._stop_event.is_set():
+            try:
+                utterance_id, audio_in, speech_end_ts = self._audio_queue.get(timeout=0.1)
+                dequeue_ts = time.time()
+                queue_delay = (dequeue_ts - speech_end_ts) * 1000
+                print(f"[STT-WORKER] 📥 Audio dequeued (queue_delay={queue_delay:.0f} ms)")
+            except queue.Empty:
+                continue
+
+            try:
+                self._is_processing = True
+
+                audio_16k = self._resample_to_16k(audio_in)
+                if audio_16k.size < int(self.sample_rate * self.min_utterance_seconds):
+                    print("[STT-WORKER] ⚠️ Too short audio, dropped")
+                    continue
+
+                t0 = time.time()
+                segments, _ = self.model.transcribe(
+                    audio_16k,
+                    language="ko",
+                    beam_size=self.beam_size,
+                    temperature=self.temperature,
+                    vad_filter=False,
+                )
+                t1 = time.time()
+
+                whisper_ms = (t1 - t0) * 1000
+                total_ms = (t1 - speech_end_ts) * 1000
+
+                raw_text = "".join(seg.text for seg in segments).strip()
+                text = self._clean_text(raw_text)
+
+                print(
+                    f"[STT-TIMING] queue={queue_delay:.0f} ms | "
+                    f"whisper={whisper_ms:.0f} ms | total={total_ms:.0f} ms"
+                )
+
+                if not text or len(text) < self.min_text_len:
+                    print("[STT-WORKER] ⚠️ Empty/short text, skipped")
+                    continue
+
+                print(f"[STT] 🎤 \"{text}\"")
+
+                if self.on_text:
+                    self.on_text(text, utterance_id=utterance_id)
+
+            except Exception as e:
+                print("[STT-WORKER] ❌ Worker error:", repr(e))
+            finally:
+                self._is_processing = False
+
+    # ==================================================
+    # Stop
+    # ==================================================
+    def stop(self):
+        if self._stop_event.is_set():
             return
-
-        audio_in = np.concatenate(buffer)
-        audio_16k = self._resample_to_16k(audio_in)
-
-        # 너무 짧은 발화 컷
-        min_samples = int(self.sample_rate * self.min_utterance_seconds)
-        if audio_16k.size < min_samples:
-            if self.log_audio_stats:
-                dur = audio_16k.size / float(self.sample_rate)
-                print(f"[STT] Ignored short utterance: {dur:.2f}s")
-            return
-
-        if self.log_audio_stats:
-            peak = float(np.max(np.abs(audio_16k))) if audio_16k.size else 0.0
-            mean_abs = float(np.mean(np.abs(audio_16k))) if audio_16k.size else 0.0
-            dur = audio_16k.size / float(self.sample_rate)
-            print(f"[STT] audio_stats: sec={dur:.2f}, peak={peak:.4f}, mean_abs={mean_abs:.4f}")
-
-        segments, _info = self.model.transcribe(
-            audio_16k,
-            language="ko",
-            beam_size=self.beam_size,
-            temperature=self.temperature,
-            vad_filter=False,
-        )
-
-        text = "".join(seg.text for seg in segments).strip()
-
-        if not text or len(text) < self.min_text_len:
-            print("[STT] No transcription result")
-            return
-
-        print(f"[STT] Transcribed text: {text}")
-
-        if self.on_text:
-            self.on_text(text)
+        self._stop_event.set()
+        print("[STT] Shutdown")

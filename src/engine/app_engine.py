@@ -1,317 +1,407 @@
-from nlu.llm_client import detect_intent_llm
-from nlu.intent_schema import Intent
-from engine.intent_logger import log_intent, log_dialog  # ✅ dialog_logs 적재
-from nlu.dialog_llm_client import dialog_llm_chat        # ✅ 2차 LLM(+RAG) 호출
+from src.nlu.llm_client import detect_intent_llm
+from src.nlu.intent_schema import Intent
+from src.engine.intent_logger import log_intent, log_dialog
+from src.nlu.dialog_llm_client import dialog_llm_chat
 
 import uuid
 import time
 import re
+import os
 
 
-# --------------------------------------------------
+# ==================================================
 # 정책 설정
-# --------------------------------------------------
+# ==================================================
 CONFIDENCE_THRESHOLD = 0.75
 SITE_ID = "parkassist_local"
 
-# ✅ (추가) DONE 강제 종료 키워드(2차에서 우선 적용)
-DONE_KEYWORDS = [
-    "됐어요", "되었습니다", "해결", "괜찮아요", "그만", "종료", "끝", "마칠게", "고마워", "감사", "안녕"
-]
-
-# ✅ (추가) DONE 시 배웅 멘트 고정
-FAREWELL_TEXT = "네, 해결되셨다니 다행입니다. 이용해 주셔서 감사합니다. 안녕히 가세요."
-
-# ✅ (추가) DONE 직후 잔향/중복 STT를 무시하기 위한 쿨다운(초)
+IDLE_TIMEOUT_SEC = 15.0
 DONE_COOLDOWN_SEC = 1.2
 
+# ✅ 2차 고도화 정책: 6턴(사용자 발화 기준) 넘어가면 관리자 호출 + 종료
+SECOND_STAGE_HARD_TURN_LIMIT = int(os.getenv("SECOND_STAGE_HARD_TURN_LIMIT", "6") or 6)
 
+# ✅ Dialog RAW 출력은 기본 OFF (필요할 때만 환경변수로 켜기)
+DEBUG_DIALOG = os.getenv("DEBUG_DIALOG", "0").strip().lower() in ("1", "true", "yes")
+
+
+# ==================================================
+# 슬롯/정형화 정책
+# ==================================================
+SLOT_KEYS = ["symptom", "where", "when", "error_message", "attempted", "card_or_device"]
+
+REQUIRED_SLOTS_BY_INTENT = {
+    "PAYMENT": ["where", "symptom"],
+    "EXIT": ["where", "symptom"],
+    "ENTRY": ["where", "symptom"],
+    "REGISTRATION": ["where", "symptom"],
+    "TIME_PRICE": ["where", "symptom"],
+    "FACILITY": ["where", "symptom"],
+    "COMPLAINT": ["symptom"],
+    "NONE": ["symptom"],
+}
+
+
+def _empty_slots() -> dict:
+    return {k: None for k in SLOT_KEYS}
+
+
+def _norm_intent_name(x) -> str:
+    if not x:
+        return "NONE"
+    s = str(x).strip().upper()
+    if s.startswith("INTENT."):
+        s = s.split(".", 1)[-1]
+    return s if s in REQUIRED_SLOTS_BY_INTENT else "NONE"
+
+
+def _merge_slots(dst: dict, src: dict) -> dict:
+    out = dict(dst or {})
+    if not isinstance(src, dict):
+        return out
+    for k in SLOT_KEYS:
+        if k in src:
+            v = src.get(k)
+            if isinstance(v, str) and not v.strip():
+                v = None
+            out[k] = v
+    return out
+
+
+# ==================================================
+# 원턴 응답 (⚠️ 질문형)
+# ==================================================
+ONE_TURN_RESPONSES = {
+    Intent.EXIT: "출차하려면 요금 정산이 완료되어야 차단기가 열립니다. 혹시 정산은 이미 하셨나요?",
+    Intent.ENTRY: "입차 시 차량이 인식되면 차단기가 자동으로 열립니다. 차량이 인식되지 않았다면 잠시 정차해 주세요.",
+    Intent.PAYMENT: "주차 요금은 정산기나 출구에서 결제하실 수 있습니다. 이미 결제를 진행하셨나요?",
+    Intent.REGISTRATION: "차량이나 방문자 등록은 키오스크에서 진행하실 수 있습니다. 아직 등록 전이신가요?",
+    Intent.TIME_PRICE: "주차 시간과 요금은 키오스크 화면에서 확인하실 수 있습니다. 어느 부분이 궁금하신가요?",
+    Intent.FACILITY: "기기나 차단기에 이상이 있는 경우 관리실 도움을 받으실 수 있습니다. 현재 어떤 문제가 발생했나요?",
+}
+
+NONE_RETRY_TEXT = (
+    "말씀을 정확히 이해하지 못했어요. "
+    "출차, 결제, 등록 중 어떤 도움을 원하시는지 말씀해 주세요."
+)
+
+DONE_KEYWORDS = [
+    "됐어요", "되었습니다", "해결", "괜찮아요",
+    "그만", "종료", "끝", "마칠게",
+    "고마워", "감사", "안녕",
+]
+
+FAREWELL_TEXT = "네, 해결되셨다니 다행입니다. 이용해 주셔서 감사합니다. 안녕히 가세요."
+
+
+# ==================================================
+# 유틸
+# ==================================================
 def _normalize(text: str) -> str:
-    # 공백/구두점 제거해서 키워드 판정 안정화
-    t = text.strip().lower()
-    t = re.sub(r"[\s\.\,\!\?\u3002\uFF0E\uFF0C\uFF01\uFF1F]+", "", t)
-    return t
+    return re.sub(r"[\s\.\,\!\?]+", "", text.strip().lower())
 
 
 def _is_done_utterance(text: str) -> bool:
     t = _normalize(text)
-    return any(k.replace(" ", "") in t for k in DONE_KEYWORDS)
+    return any(_normalize(k) in t for k in DONE_KEYWORDS)
 
 
+# ==================================================
+# AppEngine
+# ==================================================
 class AppEngine:
     """
-    주차장 키오스크 CX용 App Engine
-
-    상태:
-    - FIRST_STAGE  : 1차 의도 분류 단계
-    - SECOND_STAGE : 2차 상담(라마) 단계
+    ✔ 원턴(질문) → 다음 발화는 무조건 2차(SECOND_STAGE)
+    ✔ 2차 고도화:
+        - 첫 2차 응답은 무조건 재질문(ASK) (dialog_llm_client가 강제)
+        - 슬롯/체크리스트 기반 정형화(필수 슬롯 미충족이면 ASK 강제)
+        - intent 전환 허용(new_intent 수신 시 current_intent 변경)
+        - 사용자 발화 6턴 넘으면 관리자 호출 + 종료(ESCALATE_DONE)
     """
 
     def __init__(self):
         self.state = "FIRST_STAGE"
+
         self.session_id = None
-
-        # ✅ 추가: 2차(RAG/LLM) 문서 필터링용 최초 intent
-        self.first_intent = None
-
-        # ✅ (추가) 2차 로그/세션 추적용
+        self.first_intent = None          # 세션 최초 의도(기록용)
+        self.current_intent = None        # ✅ 2차에서 바뀔 수 있는 의도
         self.intent_log_id = None
+
         self.dialog_turn_index = 0
-        self.dialog_history = []   # ✅ (추가) 멀티턴 전달용(선택)
+        self.dialog_history = []
 
-        # ✅ (추가) DONE 직후 쿨다운
+        self._none_retry_count = 0
         self._ignore_until_ts = 0.0
+        self._last_activity_ts = 0.0
 
-    # ==================================================
-    # 🔧 confidence 계산 로직
-    # ==================================================
+        self._last_handled_utterance_id = None
+        self._just_one_turn = False
+
+        # ✅ 2차 사용자 발화 수(SECOND_STAGE에서 user가 들어온 횟수)
+        self.second_stage_user_turns = 0
+
+        # ✅ 2차 슬롯 누적 저장소
+        self.second_stage_slots = _empty_slots()
+
+    # --------------------------------------------------
+    # 세션 시작
+    # --------------------------------------------------
+    def _start_new_session(self):
+        self.session_id = str(uuid.uuid4())
+        self.state = "FIRST_STAGE"
+
+        self.first_intent = None
+        self.current_intent = None
+        self.intent_log_id = None
+
+        self.dialog_turn_index = 0
+        self.dialog_history = []
+
+        self._none_retry_count = 0
+        self._just_one_turn = False
+        self._last_activity_ts = time.time()
+
+        # ✅ 2차 상태 초기화
+        self.second_stage_user_turns = 0
+        self.second_stage_slots = _empty_slots()
+
+        print(f"[ENGINE] 🆕 New session started: {self.session_id}")
+
+    # --------------------------------------------------
+    # 세션 종료
+    # --------------------------------------------------
+    def end_session(self, reason: str = ""):
+        print(f"[ENGINE] 🛑 Session ended ({reason}): {self.session_id}")
+
+        self.session_id = None
+        self.state = "FIRST_STAGE"
+
+        self.first_intent = None
+        self.current_intent = None
+        self.intent_log_id = None
+
+        self.dialog_turn_index = 0
+        self.dialog_history = []
+
+        self._none_retry_count = 0
+        self._just_one_turn = False
+        self._last_handled_utterance_id = None
+
+        # ✅ 2차 상태 리셋
+        self.second_stage_user_turns = 0
+        self.second_stage_slots = _empty_slots()
+
+    # --------------------------------------------------
+    # idle timeout (외부 watchdog용)
+    # --------------------------------------------------
+    def check_idle_timeout(self):
+        if self.session_id and time.time() - self._last_activity_ts >= IDLE_TIMEOUT_SEC:
+            self.end_session(reason="idle-timeout")
+
+    # --------------------------------------------------
+    # confidence (간단 휴리스틱)
+    # --------------------------------------------------
     def calculate_confidence(self, text: str, intent: Intent) -> float:
-        score = 0.0
-        text = text.strip()
-
-        # ✅ (수정) Intent enum이 바뀌어도 안전하도록 name 기반으로 매핑
-        intent_name = getattr(intent, "name", str(intent))
-
-        KEYWORDS_BY_INTENT_NAME = {
-            "EXIT_FLOW_ISSUE": ["출차", "나가", "차단기", "안열려", "안 열려"],
-            "ENTRY_FLOW_ISSUE": ["입차", "들어가", "차단기", "안열려", "안 열려"],
-            "PAYMENT_ISSUE": ["결제", "요금", "카드", "정산", "승인"],
-            "TIME_ISSUE": ["시간", "무료", "초과"],
-            "PRICE_INQUIRY": ["얼마", "요금", "가격"],
-            "HOW_TO_EXIT": ["어떻게", "출차", "나가"],
-            "HOW_TO_REGISTER": ["등록", "어디", "방법"],
-            # ✅ (추가) 너 로그처럼 HELP_REQUEST가 들어오는 경우를 대비(낮게 주고 2차로 넘기기 쉽게)
-            "HELP_REQUEST": ["결제", "차단기", "출차", "입차", "등록", "오류", "안돼", "안 돼"],
+        score = 0.4
+        KEYWORDS = {
+            Intent.EXIT: ["출차", "나가", "차단기"],
+            Intent.ENTRY: ["입차", "들어가"],
+            Intent.PAYMENT: ["결제", "요금", "정산"],
+            Intent.REGISTRATION: ["등록", "번호판"],
+            Intent.TIME_PRICE: ["시간", "요금"],
+            Intent.FACILITY: ["기계", "고장", "이상"],
+            Intent.COMPLAINT: ["왜", "안돼", "짜증"],
         }
-
-        hits = sum(1 for k in KEYWORDS_BY_INTENT_NAME.get(intent_name, []) if k in text)
-
-        if hits >= 2:
-            score += 0.45
-        elif hits == 1:
-            score += 0.30
-        else:
-            score += 0.10
-
-        if len(text) < 3:
-            score += 0.05
-        elif any(f in text for f in ["어", "음", "..."]):
-            score += 0.10
-        else:
-            score += 0.25
-
-        INTENT_RISK_WEIGHT_BY_NAME = {
-            "HOW_TO_EXIT": 1.0,
-            "PRICE_INQUIRY": 1.0,
-            "TIME_ISSUE": 0.9,
-            "EXIT_FLOW_ISSUE": 0.7,
-            "ENTRY_FLOW_ISSUE": 0.7,
-            "PAYMENT_ISSUE": 0.7,
-            "REGISTRATION_ISSUE": 0.6,
-            "COMPLAINT": 0.5,
-            "HELP_REQUEST": 0.7,
-        }
-
-        score *= INTENT_RISK_WEIGHT_BY_NAME.get(intent_name, 0.6)
+        hits = sum(1 for k in KEYWORDS.get(intent, []) if k in text)
+        score += 0.35 if hits else 0.15
+        score += 0.05 if len(text) <= 4 else 0.2
         return round(min(score, 1.0), 2)
 
-    # ==================================================
-    # ✅ (추가) 2차 처리(로그 + LLM + DONE 강제 + 배웅 고정)
-    # ==================================================
-    def _handle_second_stage(self, text: str):
-        # ✅ DONE 직후 중복 STT 무시
-        if time.time() < self._ignore_until_ts:
+    # --------------------------------------------------
+    # dialog log
+    # --------------------------------------------------
+    def _log_dialog(self, role, content, model="stt"):
+        self.dialog_turn_index += 1
+        log_dialog(
+            intent_log_id=self.intent_log_id,
+            session_id=self.session_id,
+            role=role,
+            content=content,
+            model=model,
+            turn_index=self.dialog_turn_index,
+        )
+        if role in ("user", "assistant"):
+            self.dialog_history.append({"role": role, "content": content})
+
+    # --------------------------------------------------
+    # SECOND_STAGE context
+    # --------------------------------------------------
+    def _build_second_stage_context(self) -> dict:
+        cur = _norm_intent_name(self.current_intent or self.first_intent)
+        req = REQUIRED_SLOTS_BY_INTENT.get(cur, ["symptom"])
+
+        return {
+            "session_id": self.session_id,
+            "intent_log_id": self.intent_log_id,
+
+            "first_intent": _norm_intent_name(self.first_intent),
+            "current_intent": cur,
+
+            "turn_count_user": self.second_stage_user_turns,          # 0부터 시작
+            "hard_turn_limit": SECOND_STAGE_HARD_TURN_LIMIT,          # 6
+
+            "slots": self.second_stage_slots,
+            "required_slots": req,
+        }
+
+    # --------------------------------------------------
+    # SECOND_STAGE
+    # --------------------------------------------------
+    def _handle_second_stage(self, text: str, *, already_logged_user: bool = False):
+        # 1) 사용자 종료 발화 → 종료
+        if _is_done_utterance(text):
+            if not already_logged_user:
+                self._log_dialog("user", text)
+            self._log_dialog("assistant", FAREWELL_TEXT, model="system")
+            print(f"[DIALOG] {FAREWELL_TEXT}")
+            self.end_session(reason="done")
+            self._ignore_until_ts = time.time() + DONE_COOLDOWN_SEC
             return
 
-        try:
-            # ✅ DONE 키워드면 LLM 호출 없이 강제 종료 + 배웅 멘트 고정
-            if _is_done_utterance(text):
-                self.dialog_turn_index += 1
-                log_dialog(
-                    intent_log_id=self.intent_log_id,
-                    session_id=self.session_id,
-                    role="user",
-                    content=text,
-                    model="stt",
-                    turn_index=self.dialog_turn_index,
-                )
+        # 2) user 로그(중복 방지)
+        if not already_logged_user:
+            self._log_dialog("user", text)
 
-                self.dialog_turn_index += 1
-                log_dialog(
-                    intent_log_id=self.intent_log_id,
-                    session_id=self.session_id,
-                    role="assistant",
-                    content=FAREWELL_TEXT,
-                    model="system",
-                    turn_index=self.dialog_turn_index,
-                )
+        # history 중복 방지(안전장치)
+        history_for_llm = self.dialog_history
+        if history_for_llm and history_for_llm[-1]["role"] == "user" and history_for_llm[-1]["content"] == text:
+            history_for_llm = history_for_llm[:-1]
 
-                print(f"[DIALOG] {FAREWELL_TEXT}")
-                self.end_second_stage()
-                self._ignore_until_ts = time.time() + DONE_COOLDOWN_SEC
-                return
+        # 3) 2차 모델 호출
+        res = dialog_llm_chat(
+            text,
+            history=history_for_llm,
+            context=self._build_second_stage_context(),
+            debug=DEBUG_DIALOG,
+        )
 
-            # -----------------------------
-            # (1) user 로그 + history
-            # -----------------------------
-            self.dialog_turn_index += 1
-            log_dialog(
-                intent_log_id=self.intent_log_id,
-                session_id=self.session_id,
-                role="user",
-                content=text,
-                model="stt",
-                turn_index=self.dialog_turn_index,
-            )
+        reply = getattr(res, "reply", "") or "조금 더 자세히 말씀해 주실 수 있을까요?"
+        action = (getattr(res, "action", "") or "").strip().upper()
+        new_intent = getattr(res, "new_intent", None)
 
-            # ✅ 멀티턴 유지: user 먼저 append
-            self.dialog_history.append({"role": "user", "content": text})
+        # 4) 슬롯 누적 merge
+        self.second_stage_slots = _merge_slots(self.second_stage_slots, getattr(res, "slots", {}) or {})
 
-            # -----------------------------
-            # (2) 2차 LLM(+RAG) 호출
-            # -----------------------------
-            res = dialog_llm_chat(
-                text,
-                history=self.dialog_history,  # ✅ 지금까지의 대화 포함
-                context={
-                    "session_id": self.session_id,
-                    "intent_log_id": self.intent_log_id,
-                    "first_intent": self.first_intent,  # ✅ A안 필수
-                },
-                debug=True,
-            )
+        # 5) ✅ intent 전환 허용 (new_intent 수신 시)
+        if isinstance(new_intent, str):
+            ni = _norm_intent_name(new_intent)
+            if ni != "NONE" and ni != _norm_intent_name(self.current_intent):
+                print(f"[ENGINE] 🔀 intent switched: {self.current_intent} -> {ni}")
+                self.current_intent = ni
 
-            llama_reply = getattr(res, "reply", "") or ""
-            action = getattr(res, "action", None)
+        # 6) assistant 로그/출력
+        self._log_dialog("assistant", reply, model="llama-3.1-8b")
+        print(f"[DIALOG] {reply}")
 
-            # ✅ 모델이 DONE을 주면 배웅 멘트로 고정
-            if action == "DONE":
-                llama_reply = FAREWELL_TEXT
+        # ✅ 이번 user 입력은 2차에서 1턴 소비
+        self.second_stage_user_turns += 1
 
-            # -----------------------------
-            # (3) assistant 로그 + history
-            # -----------------------------
-            self.dialog_turn_index += 1
-            log_dialog(
-                intent_log_id=self.intent_log_id,
-                session_id=self.session_id,
-                role="assistant",
-                content=llama_reply,
-                model="llama-3.1-8b",
-                turn_index=self.dialog_turn_index,
-            )
+        # 7) 종료 액션 처리
+        if action in ("DONE", "ESCALATE_DONE"):
+            self.end_session(reason=action.lower())
+            self._ignore_until_ts = time.time() + DONE_COOLDOWN_SEC
+            return
 
-            # ✅ 멀티턴 유지: assistant는 reply 받은 뒤 append
-            self.dialog_history.append({"role": "assistant", "content": llama_reply})
+    # --------------------------------------------------
+    # STT 엔트리포인트
+    # --------------------------------------------------
+    def handle_text(self, text: str, *, utterance_id: str | None = None):
+        now = time.time()
 
-            print(f"[DIALOG] {llama_reply}")
-
-            # -----------------------------
-            # (4) 종료 처리
-            # -----------------------------
-            if action == "DONE":
-                self.end_second_stage()
-                self._ignore_until_ts = time.time() + DONE_COOLDOWN_SEC
-
-        except Exception as e:
-            print(f"[ENGINE] 2nd-stage failed: {repr(e)}")
-
-
-    # ==================================================
-    # 🎙️ STT 텍스트 처리 엔트리포인트
-    # ==================================================
-    def handle_text(self, text: str):
         if not text or not text.strip():
             return
-
-        # ✅ (추가) DONE 직후 중복 STT 무시
-        if time.time() < self._ignore_until_ts:
+        if now < self._ignore_until_ts:
             return
+
+        # ✅ 입력이 들어왔으므로 활동 시간 갱신
+        self._last_activity_ts = now
+
+        # STT 중복 방지
+        if utterance_id and utterance_id == self._last_handled_utterance_id:
+            print("[ENGINE] ⚠️ duplicated utterance ignored")
+            return
+        self._last_handled_utterance_id = utterance_id
+
+        if not self.session_id:
+            self._start_new_session()
 
         print("=" * 50)
         print(f"[ENGINE] State={self.state}")
         print(f"[ENGINE] Text={text}")
 
         # ==================================================
-        # 🟢 2차 상담 단계
+        # 🔥 원턴 직후 후속 발화 → 무조건 2차
         # ==================================================
-        if self.state == "SECOND_STAGE":
-            self._handle_second_stage(text)
-            print("=" * 50)
-            return
-
-        # ==================================================
-        # 🔵 1차 의도 분류 단계
-        # ==================================================
-        try:
-            result = detect_intent_llm(text)
-
-            # ✅ 추가: 2차에서 쓰기 위해 최초 intent 저장
-            self.first_intent = result.intent.value
-        except Exception as e:
-            print("[ENGINE] LLM inference failed:", e)
-            print("=" * 50)
-            return
-
-        result.confidence = self.calculate_confidence(text=text, intent=result.intent)
-
-        print(f"[ENGINE] Intent={result.intent.name}, confidence={result.confidence:.2f}")
-
-        # ✅ 1차 로그 적재 + PK 받아서 2차 dialog_logs FK로 사용
-        self.intent_log_id = log_intent(
-            utterance=text,
-            predicted_intent=result.intent.value,
-            predicted_confidence=result.confidence,
-            source="kiosk",
-            site_id=SITE_ID,
-        )
-        print(f"[ENGINE] intent_log_id={self.intent_log_id}")
-
-        # intent_log_id가 None이면 dialog_logs NOT NULL 깨지므로 2차 자체를 스킵
-        if self.intent_log_id is None:
-            print("[ENGINE] intent_log_id is None → skip llama fallback")
-            print("=" * 50)
-            return
-
-        if result.intent == Intent.NONE:
-            print("[ENGINE] Decision: irrelevant utterance")
-            print("=" * 50)
-            return
-
-        # ==================================================
-        # confidence 기준 이하 → 2차(라마 + 로그)
-        # ==================================================
-        if result.confidence < CONFIDENCE_THRESHOLD:
-            print("[ENGINE] Decision: low confidence → llama fallback")
-
+        if self._just_one_turn:
+            print("[ENGINE] 🔁 one-turn follow-up → SECOND_STAGE")
             self.state = "SECOND_STAGE"
-            self.session_id = str(uuid.uuid4())   # ✅ 요구사항: session_id 고유 생성
-            self.dialog_turn_index = 0
-            self.dialog_history = []
-            self.first_intent = result.intent.value 
-            print(f"[ENGINE] Session started: {self.session_id}")
-            print("[ENGINE] Llama will handle this utterance (logging dialog)")
+            self._just_one_turn = False
 
-            # ✅ (수정) 재귀(handle_text 재호출) 금지 → 바로 2차 처리
-            self._handle_second_stage(text)
+            self.second_stage_user_turns = 0
+            self.second_stage_slots = _empty_slots()
+            self.current_intent = _norm_intent_name(self.first_intent)
 
-            print("=" * 50)
+            self._handle_second_stage(text, already_logged_user=False)
             return
 
-        print("[ENGINE] Decision: passed 1st-stage classification")
-        print("[ENGINE] Action: defer execution to next stage")
-        print("=" * 50)
+        # --------------------------------------------------
+        # FIRST_STAGE
+        # --------------------------------------------------
+        if self.state == "FIRST_STAGE":
+            result = detect_intent_llm(text)
+            result.confidence = self.calculate_confidence(text, result.intent)
 
-    # ==================================================
-    # 🔚 상담 종료 시 호출
-    # ==================================================
-    def end_second_stage(self):
-        print(f"[ENGINE] Session ended: {self.session_id}")
-        self.state = "FIRST_STAGE"
-        self.session_id = None
-        self.intent_log_id = None
-        self.dialog_turn_index = 0
-        self.dialog_history = []
-        
-        # ✅ 추가: 세션 종료 시 최초 intent도 초기화
-        self.first_intent = None
+            print(f"[ENGINE] Intent={result.intent.name}, confidence={result.confidence:.2f}")
+
+            self.intent_log_id = log_intent(
+                utterance=text,
+                predicted_intent=result.intent.value,
+                predicted_confidence=result.confidence,
+                source="kiosk",
+                site_id=SITE_ID,
+            )
+
+            self.first_intent = result.intent.value
+            self.current_intent = _norm_intent_name(self.first_intent)
+
+            self._log_dialog("user", text)
+
+            if result.intent == Intent.NONE:
+                self._none_retry_count += 1
+                self._log_dialog("assistant", NONE_RETRY_TEXT, model="system")
+                print(f"[ONE-TURN] {NONE_RETRY_TEXT}")
+                return
+
+            # COMPLAINT 또는 낮은 confidence → 바로 2차
+            if result.intent == Intent.COMPLAINT or result.confidence < CONFIDENCE_THRESHOLD:
+                self.state = "SECOND_STAGE"
+                self.second_stage_user_turns = 0
+                self.second_stage_slots = _empty_slots()
+                self.current_intent = _norm_intent_name(self.first_intent)
+
+                self._handle_second_stage(text, already_logged_user=True)
+                return
+
+            # 원턴(질문형) 응답 후 다음 발화는 2차로
+            reply = ONE_TURN_RESPONSES.get(result.intent)
+            self._log_dialog("assistant", reply, model="system")
+            print(f"[ONE-TURN] {reply}")
+            self._just_one_turn = True
+            return
+
+        # --------------------------------------------------
+        # SECOND_STAGE
+        # --------------------------------------------------
+        if self.state == "SECOND_STAGE":
+            self._handle_second_stage(text, already_logged_user=False)
+            return

@@ -41,27 +41,83 @@ def _read_all_manual_texts(manual_dir: str) -> List[Tuple[str, str]]:
     paths = sorted(glob.glob(os.path.join(base, "*.md")))
     out: List[Tuple[str, str]] = []
     for p in paths:
+        doc_id = os.path.basename(p)
         with open(p, "r", encoding="utf-8") as f:
-            out.append((os.path.basename(p), f.read()))
+            out.append((doc_id, f.read()))
     return out
 
 
-def _chunk_text(doc_id: str, text: str) -> List[Tuple[str, str]]:
-    paras = [t.strip() for t in text.split("\n\n") if t.strip()]
-    chunks: List[Tuple[str, str]] = []
-    for i, para in enumerate(paras):
-        chunk_id = f"{doc_id}::p{i+1}"
-        chunks.append((chunk_id, para))
+def _split_into_chunks(text: str, max_chars: int = 450) -> List[str]:
+    # 빈 줄 기준 문단 분리 후 max_chars로 합치기
+    paras = [p.strip() for p in text.split("\n\n") if p.strip()]
+    chunks: List[str] = []
+    buf = ""
+    for p in paras:
+        if not buf:
+            buf = p
+        elif len(buf) + 2 + len(p) <= max_chars:
+            buf = buf + "\n\n" + p
+        else:
+            chunks.append(buf)
+            buf = p
+    if buf:
+        chunks.append(buf)
     return chunks
 
 
 def _ollama_embed(text: str, base_url: str, model: str, timeout_sec: int = 60) -> List[float]:
-    url = base_url.rstrip("/") + "/api/embeddings"
-    payload = {"model": model, "prompt": text}
-    r = requests.post(url, json=payload, timeout=timeout_sec)
-    r.raise_for_status()
-    data = r.json()
-    return data["embedding"]
+    """임베딩 호출 (Ollama native + OpenAI-compatible 둘 다 지원)
+
+    - Ollama native: POST {base}/api/embeddings  {model, prompt}
+    - OpenAI compat: POST {base}/v1/embeddings   {model, input}
+
+    ✅ /api/embeddings 가 404/405면 /v1/embeddings 로 fallback
+    """
+    b = (base_url or "").rstrip("/")
+
+    # base_url이 이미 /v1면 OpenAI 호환을 우선 시도
+    prefer_openai = b.endswith("/v1") or ("/v1/" in b)
+
+    def _try_ollama() -> List[float]:
+        url = b + "/api/embeddings"
+        payload = {"model": model, "prompt": text}
+        r = requests.post(url, json=payload, timeout=timeout_sec)
+        r.raise_for_status()
+        data = r.json()
+        emb = data.get("embedding")
+        if not emb:
+            raise ValueError(f"no embedding field in response: {data}")
+        return emb
+
+    def _try_openai() -> List[float]:
+        url = (b if b.endswith("/v1") else b + "/v1") + "/embeddings"
+        payload = {"model": model, "input": text}
+        r = requests.post(url, json=payload, timeout=timeout_sec)
+        r.raise_for_status()
+        data = r.json()
+        arr = data.get("data") or []
+        if not arr or not isinstance(arr, list) or not arr[0].get("embedding"):
+            raise ValueError(f"no data[0].embedding in response: {data}")
+        return arr[0]["embedding"]
+
+    tries = [_try_openai, _try_ollama] if prefer_openai else [_try_ollama, _try_openai]
+    last_err = None
+
+    for fn in tries:
+        try:
+            return fn()
+        except requests.HTTPError as e:
+            last_err = e
+            status = getattr(e.response, "status_code", None)
+            # 404/405는 엔드포인트 불일치 가능성이 높아서 fallback
+            if status in (404, 405):
+                continue
+            raise
+        except Exception as e:
+            last_err = e
+            continue
+
+    raise RuntimeError(f"embedding request failed for base_url={base_url}: {last_err}")
 
 
 def _cosine(a: List[float], b: List[float]) -> float:
@@ -94,148 +150,110 @@ class ManualRAG:
         base_url: str = DEFAULT_OLLAMA_BASE_URL,
         embed_model: str = DEFAULT_EMBED_MODEL,
         top_k: int = TOP_K,
+        cache_filename: str = CACHE_FILENAME,
     ):
         self.manual_dir = manual_dir
         self.base_url = base_url
         self.embed_model = embed_model
         self.top_k = top_k
 
-        self._chunks: List[ManualChunk] = []
-        self._built = False
+        # ✅ 캐시 파일은 manual_dir 내부로 고정
+        self.cache_path = os.path.join(_abs_dir(self.manual_dir), cache_filename)
 
-        self._cache_path = os.path.join(_abs_dir(self.manual_dir), CACHE_FILENAME)
-        self._cache: Dict[str, List[float]] = {}
-
+        self.chunks: List[ManualChunk] = []
+        self.cache: Dict[str, List[float]] = {}
         self.last_best_doc: Optional[str] = None
 
-    def _load_cache(self, debug: bool = False):
-        if os.path.exists(self._cache_path):
-            try:
-                with open(self._cache_path, "r", encoding="utf-8") as f:
-                    self._cache = json.load(f)
-                if debug:
-                    print(f"[RAG] cache_path={self._cache_path} cache_items={len(self._cache)}")
-            except Exception as e:
-                if debug:
-                    print(f"[RAG] cache load failed: {e}")
-                self._cache = {}
-        else:
-            if debug:
-                print(f"[RAG] cache not found: {self._cache_path}")
-            self._cache = {}
+        self._load_cache()
+        self.build()
 
-    def _save_cache(self, debug: bool = False):
+    def _load_cache(self):
         try:
-            os.makedirs(os.path.dirname(self._cache_path), exist_ok=True)
-            with open(self._cache_path, "w", encoding="utf-8") as f:
-                json.dump(self._cache, f, ensure_ascii=False)
-            if debug:
-                print(f"[RAG] cache saved: {self._cache_path} (items={len(self._cache)})")
-        except Exception as e:
-            if debug:
-                print(f"[RAG] cache save failed: {e}")
+            if os.path.exists(self.cache_path):
+                with open(self.cache_path, "r", encoding="utf-8") as f:
+                    self.cache = json.load(f)
+        except Exception:
+            self.cache = {}
 
-    def build(self, debug: bool = False):
-        if self._built:
-            return
+    def _save_cache(self):
+        try:
+            with open(self.cache_path, "w", encoding="utf-8") as f:
+                json.dump(self.cache, f, ensure_ascii=False)
+        except Exception:
+            pass
 
-        self._load_cache(debug=debug)
+    def build(self):
+        self.chunks = []
+        manual_texts = _read_all_manual_texts(self.manual_dir)
 
-        texts = _read_all_manual_texts(self.manual_dir)
-        if debug:
-            print(f"[RAG] manual_dir={self.manual_dir} files={len(texts)} embed_model={self.embed_model}")
-
-        chunks: List[ManualChunk] = []
-        cache_hit = 0
-        cache_miss = 0
-
-        for doc_id, full in texts:
-            for chunk_id, chunk_text in _chunk_text(doc_id, full):
+        for doc_id, full_text in manual_texts:
+            parts = _split_into_chunks(full_text)
+            for i, chunk_text in enumerate(parts):
+                chunk_id = str(i)
                 key = _hash_key(self.embed_model, doc_id, chunk_id, chunk_text)
 
-                if key in self._cache:
-                    emb = self._cache[key]
-                    cache_hit += 1
+                if key in self.cache:
+                    emb = self.cache[key]
                 else:
-                    emb = _ollama_embed(chunk_text, self.base_url, self.embed_model)
-                    self._cache[key] = emb
-                    cache_miss += 1
+                    emb = _ollama_embed(
+                        chunk_text,
+                        base_url=self.base_url,
+                        model=self.embed_model,
+                        timeout_sec=60,
+                    )
+                    self.cache[key] = emb
 
-                chunks.append(ManualChunk(doc_id=doc_id, chunk_id=chunk_id, text=chunk_text, embedding=emb))
+                self.chunks.append(
+                    ManualChunk(doc_id=doc_id, chunk_id=chunk_id, text=chunk_text, embedding=emb)
+                )
 
-        self._chunks = chunks
-        self._built = True
-
-        if cache_miss > 0:
-            self._save_cache(debug=debug)
-
-        if debug:
-            print(f"[RAG] indexed_chunks={len(self._chunks)} (cache_hit={cache_hit}, cache_miss={cache_miss})")
+        self._save_cache()
 
     def retrieve(
         self,
         query: str,
-        top_k: Optional[int] = None,
         *,
-        preferred_docs: Optional[Iterable[str]] = None,
+        preferred_docs: Optional[List[str]] = None,
         hard_filter: bool = False,
         prefer_boost: float = 0.45,
         debug: bool = False,
     ) -> List[ManualChunk]:
-        if not self._built:
-            self.build(debug=debug)
+        """
+        - preferred_docs: 특정 문서들만 우선/또는 강제
+        - hard_filter=True면 preferred_docs 밖은 제외(정확도↑)
+        - prefer_boost: preferred_docs에 속한 chunk 점수 가중치
+        """
+        self.last_best_doc = None
 
-        if not self._chunks:
-            self.last_best_doc = None
-            if debug:
-                print(f"[RAG] no chunks indexed (manual_dir={self.manual_dir}).")
-            return []
-
-        if top_k is None:
-            top_k = self.top_k
-
-        preferred_list = list(preferred_docs or [])
-        preferred_set = set(preferred_list)
-
-        # 순서 기반 boost 테이블(하드필터 아닐 때만)
-        doc_boost: Dict[str, float] = {}
-        if preferred_list and not hard_filter:
-            n = len(preferred_list)
-            for idx, doc_id in enumerate(preferred_list):
-                if n == 1:
-                    w = 1.0
-                else:
-                    w = 1.0 - (0.6 * (idx / (n - 1)))
-                doc_boost[doc_id] = prefer_boost * w
-
-        q_emb = _ollama_embed(query, self.base_url, self.embed_model)
+        q_emb = _ollama_embed(
+            query,
+            base_url=self.base_url,
+            model=self.embed_model,
+            timeout_sec=60,
+        )
 
         scored: List[Tuple[float, ManualChunk]] = []
-        for c in self._chunks:
-            if preferred_set and hard_filter and c.doc_id not in preferred_set:
+        for c in self.chunks:
+            if preferred_docs and hard_filter and (c.doc_id not in preferred_docs):
                 continue
 
-            s = _cosine(q_emb, c.embedding)
+            score = _cosine(q_emb, c.embedding)
 
-            if preferred_set and not hard_filter:
-                s += doc_boost.get(c.doc_id, 0.0)
+            if preferred_docs and (c.doc_id in preferred_docs):
+                score += prefer_boost
 
-            scored.append((s, c))
+            scored.append((score, c))
 
         scored.sort(key=lambda x: x[0], reverse=True)
-        hits = [c for _, c in scored[:top_k]]
+        top = scored[: self.top_k]
 
-        self.last_best_doc = hits[0].doc_id if hits else None
+        if top:
+            self.last_best_doc = top[0][1].doc_id
 
         if debug:
-            if preferred_set:
-                print(f"[RAG] preferred_docs={preferred_list} hard_filter={hard_filter} base_prefer_boost={prefer_boost}")
-                if doc_boost:
-                    print(f"[RAG] doc_boost_table={doc_boost}")
-            if self.last_best_doc:
-                print(f"[RAG] best_doc={self.last_best_doc}")
-            print("[RAG] top hits:")
-            for i, c in enumerate(hits, 1):
-                print(f"  {i}) {c.doc_id} / {c.chunk_id}")
+            print(f"[RAG] manual_dir={_abs_dir(self.manual_dir)} cache={self.cache_path}")
+            print(f"[RAG] preferred_docs={preferred_docs} hard_filter={hard_filter} boost={prefer_boost}")
+            for s, c in top:
+                print(f"[RAG] score={s:.4f} doc={c.doc_id} chunk={c.chunk_id}")
 
-        return hits
+        return [c for _, c in top]

@@ -1,99 +1,64 @@
-from __future__ import annotations
-
-import os
-from pathlib import Path
 from dotenv import load_dotenv
+from pathlib import Path
+
+# ==================================================
+# .env 명시적 로드 (중요)
+# ==================================================
+env_path = Path(__file__).resolve().parent / ".env"
+load_dotenv(env_path)
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from faster_whisper import WhisperModel
+
+import src.app_state as app_state
+from src.engine.app_engine import AppEngine
+from src.api.voice import router as voice_router
+from src.api.voice_ws import router as voice_ws_router  # ✅ WebSocket 추가
 
 
 # ==================================================
-# 🔧 스레드 / 병렬 처리 제한
-# - 일부 환경에서 detect 멈춤 현상 방지
+# FastAPI App
 # ==================================================
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS", "1")
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+app = FastAPI(title="ParkAssist Voice API")
 
 
 # ==================================================
-# 🌱 환경 변수 로드
-# - src/.env → 프로젝트 루트 .env 순서로 시도
+# CORS 설정
 # ==================================================
-def _load_env():
-    here = Path(__file__).resolve().parent
-    root = here.parent
-
-    load_dotenv(here / ".env")
-    load_dotenv(root / ".env")
-
-
-_load_env()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # ==================================================
-# Import (⚠️ env 설정 이후에 import!)
+# Startup: 모델 / 엔진 메모리 상주
 # ==================================================
-from src.speech.faster_whisper_stt import FasterWhisperSTT  # noqa: E402
-from src.engine.app_engine import AppEngine                  # noqa: E402
-from src.nlu.llm_client import detect_intent_llm             # noqa: E402
+@app.on_event("startup")
+def startup():
+    print("[Startup] Loading Whisper model...")
 
-
-# ==================================================
-# 🎤 마이크 디바이스 인덱스
-# ==================================================
-MIC_DEVICE_INDEX = 1
-
-
-def main():
-    """
-    ParkAssist 음성 파이프라인 메인 엔트리 포인트
-    - STT → Intent Detect → AppEngine 처리
-    """
-
-    print("[ParkAssist] 🚀 Starting voice pipeline")
-
-    # ==================================================
-    # 1️⃣ App Engine 초기화
-    # ==================================================
-    engine = AppEngine()
-
-    # ==================================================
-    # 2️⃣ STT 엔진 초기화
-    # ==================================================
-    stt = FasterWhisperSTT(
-        model_size="large-v3",   # 성능 이슈 시 medium 권장
-        device_index=MIC_DEVICE_INDEX,
+    # 🔥 전역 상태에 직접 할당 (HTTP / WS 공용)
+    app_state.whisper_model = WhisperModel(
+        "large-v3",
+        device="cpu",
+        compute_type="int8_float32",
     )
 
-    # ==================================================
-    # 3️⃣ Intent LLM warm-up
-    # - 첫 호출 지연 / 멈춤 현상 방지 목적
-    # ==================================================
-    try:
-        detect_intent_llm("테스트입니다", debug=False)
-    except Exception:
-        # warm-up 실패해도 서비스는 계속 진행
-        pass
+    print("[Startup] Initializing AppEngine...")
+    app_state.app_engine = AppEngine()
 
-    # ==================================================
-    # 4️⃣ STT → AppEngine 콜백 연결
-    # ==================================================
-    stt.on_text = engine.handle_text
-
-    # ==================================================
-    # 5️⃣ 마이크 입력 대기
-    # ==================================================
-    print("[ParkAssist] 🎧 Listening... (Ctrl+C to stop)")
-
-    try:
-        stt.start_listening()
-    except KeyboardInterrupt:
-        pass
-    except Exception as e:
-        print("[ParkAssist] ❌ Fatal error:", repr(e))
-    finally:
-        stt.stop()
-        print("[ParkAssist] 👋 Shutdown complete")
+    print("[Startup] ✅ Service ready")
 
 
-if __name__ == "__main__":
-    main()
+# ==================================================
+# Routers
+# ==================================================
+# 기존 HTTP API
+app.include_router(voice_router)
+
+# WebSocket API (상시 마이크)
+app.include_router(voice_ws_router)

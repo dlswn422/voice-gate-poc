@@ -1,75 +1,115 @@
 "use client"
 
-import { useRef, useState } from "react"
+import { useEffect, useRef, useState } from "react"
 
-type Status = "idle" | "listening" | "processing" | "speaking"
+type Status = "idle" | "listening" | "thinking" | "speaking"
 
 const STATUS_TEXT: Record<Status, string> = {
-  idle: "무엇을 도와드릴까요?",
+  idle: "시작 버튼을 눌러 주세요",
   listening: "말씀을 듣고 있어요",
-  processing: "잠시만 기다려주세요",
+  thinking: "잠시만 기다려주세요",
   speaking: "안내를 시작할게요"
 }
+
+const WS_BASE =
+  process.env.NEXT_PUBLIC_WS_BASE || "ws://localhost:8000/ws/voice"
 
 export default function Home() {
   const [status, setStatus] = useState<Status>("idle")
   const [userText, setUserText] = useState("")
   const [botText, setBotText] = useState("")
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null)
-  const chunksRef = useRef<Blob[]>([])
+  const [active, setActive] = useState(false)
 
-  const toggleRecording = async () => {
-    if (status !== "listening") {
-      setStatus("listening")
+  const wsRef = useRef<WebSocket | null>(null)
+  const audioCtxRef = useRef<AudioContext | null>(null)
+  const processorRef = useRef<ScriptProcessorNode | null>(null)
+  const streamRef = useRef<MediaStream | null>(null)
 
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
-      const recorder = new MediaRecorder(stream)
-      mediaRecorderRef.current = recorder
+  // ==================================================
+  // WebSocket + 마이크 시작
+  // ==================================================
+  const startVoice = async () => {
+    if (active) return
 
-      recorder.ondataavailable = (e) => {
-        chunksRef.current.push(e.data)
-      }
+    setActive(true)
+    setStatus("listening")
+    setUserText("")
+    setBotText("")
 
-      recorder.onstop = async () => {
-        setStatus("processing")
+    // WebSocket 연결
+    const ws = new WebSocket(WS_BASE)
+    ws.binaryType = "arraybuffer"
+    wsRef.current = ws
 
-        const audioBlob = new Blob(chunksRef.current, { type: "audio/webm" })
-        chunksRef.current = []
-
-        const formData = new FormData()
-        formData.append("audio", audioBlob)
-
-        const res = await fetch("http://localhost:8000/voice", {
-          method: "POST",
-          body: formData
-        })
-
-        const result = await res.json()
-
-        setUserText(result.user_text)
-        setBotText(result.bot_text)
-
-        if (result.tts_url) {
+    ws.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data)
+        if (data.type === "bot_text") {
+          setBotText(data.text)
           setStatus("speaking")
-          const audio = new Audio(result.tts_url)
-          audio.onended = () => setStatus("idle")
-          audio.play()
-        } else {
-          setStatus("idle")
+          // TTS는 서버 붙인 뒤 여기서 재생
+          setTimeout(() => setStatus("listening"), 800)
         }
+      } catch {
+        // ignore
       }
-
-      recorder.start()
-    } else {
-      mediaRecorderRef.current?.stop()
     }
+
+    ws.onclose = () => {
+      stopVoice()
+    }
+
+    // 마이크 스트림
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+    streamRef.current = stream
+
+    const audioCtx = new AudioContext({ sampleRate: 16000 })
+    audioCtxRef.current = audioCtx
+
+    const source = audioCtx.createMediaStreamSource(stream)
+    const processor = audioCtx.createScriptProcessor(4096, 1, 1)
+    processorRef.current = processor
+
+    processor.onaudioprocess = (e) => {
+      if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return
+
+      const input = e.inputBuffer.getChannelData(0)
+      wsRef.current.send(input.buffer)
+    }
+
+    source.connect(processor)
+    processor.connect(audioCtx.destination)
+  }
+
+  // ==================================================
+  // 종료 처리
+  // ==================================================
+  const stopVoice = () => {
+    setActive(false)
+    setStatus("idle")
+
+    wsRef.current?.close()
+    wsRef.current = null
+
+    processorRef.current?.disconnect()
+    processorRef.current = null
+
+    audioCtxRef.current?.close()
+    audioCtxRef.current = null
+
+    streamRef.current?.getTracks().forEach((t) => t.stop())
+    streamRef.current = null
+  }
+
+  const toggle = () => {
+    active ? stopVoice() : startVoice()
   }
 
   const ringStyle = {
     idle: "from-emerald-300 to-sky-400",
     listening: "from-sky-400 to-blue-500 animate-pulse",
-    processing: "from-amber-300 to-orange-400",
-    speaking: "from-purple-400 to-pink-400"
+    thinking: "from-amber-300 to-orange-400",
+    speaking: "from-purple-400 to-pink-400 animate-pulse"
   }[status]
 
   return (
@@ -81,7 +121,7 @@ export default function Home() {
           PARKING
         </h1>
         <p className="mt-2 text-xs tracking-[0.35em] text-neutral-400 uppercase">
-          voice support
+          voice assistant
         </p>
       </header>
 
@@ -90,9 +130,9 @@ export default function Home() {
         {STATUS_TEXT[status]}
       </p>
 
-      {/* 마이크 버튼 */}
+      {/* 중앙 버튼 */}
       <button
-        onClick={toggleRecording}
+        onClick={toggle}
         className={`
           relative w-44 h-44 rounded-full
           bg-gradient-to-br ${ringStyle}
@@ -102,8 +142,8 @@ export default function Home() {
         `}
       >
         <div className="w-32 h-32 bg-white rounded-full flex items-center justify-center shadow-inner">
-          <span className="text-4xl font-medium text-neutral-700">
-            MIC
+          <span className="text-3xl font-semibold text-neutral-700">
+            {active ? "STOP" : "START"}
           </span>
         </div>
       </button>
@@ -131,7 +171,7 @@ export default function Home() {
 
       {/* 하단 가이드 */}
       <footer className="absolute bottom-10 text-center text-sm text-neutral-500">
-        버튼을 누르고 자연스럽게 말씀해 주세요<br />
+        시작을 누른 뒤 자유롭게 말씀해 주세요<br />
         출차 · 요금 · 정산 문제를 도와드립니다
       </footer>
     </main>

@@ -19,7 +19,7 @@ OLLAMA_MODEL = os.getenv(
     "OLLAMA_INTENT_MODEL",
     os.getenv("OLLAMA_MODEL", "llama3.1:8b"),
 )
-OLLAMA_TIMEOUT = float(os.getenv("OLLAMA_TIMEOUT", "20"))
+OLLAMA_TIMEOUT = float(os.getenv("OLLAMA_TIMEOUT", "120"))
 
 OLLAMA_CHAT_URL = f"{OLLAMA_BASE_URL}/api/chat"
 

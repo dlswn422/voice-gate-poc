@@ -128,3 +128,7 @@ python-dotenv
 # 환경 변수 관리
 # - .env 파일 로드
 # - DATABASE_URL, OLLAMA_BASE_URL 등 관리
+
+
+gtts
+# Google Translate TTS(API)

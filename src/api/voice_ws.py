@@ -5,7 +5,7 @@ import time
 import src.app_state as app_state
 from src.speech.vad import VoiceActivityDetector
 from src.speech.whisper_service import transcribe_pcm_chunks
-
+from src.speech.tts import synthesize  # gTTS
 
 router = APIRouter()
 
@@ -16,11 +16,12 @@ async def voice_ws(websocket: WebSocket):
     WebSocket 기반 상시 음성 대화 엔드포인트
 
     흐름:
-    - 브라우저에서 PCM(Float32) 오디오 스트림 수신
-    - VAD로 발화 시작/종료 판단
-    - 발화 종료 시 Whisper STT
-    - AppEngine으로 텍스트 전달
-    - 응답 텍스트를 WebSocket으로 반환
+    - Float32 PCM 스트림 수신
+    - VAD 발화 감지
+    - STT
+    - AppEngine
+    - gTTS → static 파일 생성
+    - text + tts_url 전송
     """
 
     await websocket.accept()
@@ -35,21 +36,20 @@ async def voice_ws(websocket: WebSocket):
     try:
         while True:
             # ==================================================
-            # 1️⃣ 오디오 chunk 수신 (Float32Array)
+            # 1️⃣ 오디오 chunk 수신
             # ==================================================
             data = await websocket.receive_bytes()
-
             pcm = np.frombuffer(data, dtype=np.float32)
 
             if pcm.size == 0:
                 continue
 
+            now = time.time()
+
             # ==================================================
-            # 2️⃣ VAD 처리
+            # 2️⃣ VAD 판단
             # ==================================================
             is_speech = vad.is_speech(pcm)
-
-            now = time.time()
 
             if is_speech:
                 if not collecting:
@@ -61,22 +61,20 @@ async def voice_ws(websocket: WebSocket):
                 last_voice_ts = now
 
             # ==================================================
-            # 3️⃣ 발화 종료 판단 (무음 지속)
+            # 3️⃣ 발화 종료 판단
             # ==================================================
             if collecting and not is_speech:
                 if now - last_voice_ts >= vad.end_silence_sec:
                     print("[WS] 🛑 Speech ended")
-
                     collecting = False
 
                     # ==================================================
-                    # 4️⃣ STT (발화 단위)
+                    # 4️⃣ STT
                     # ==================================================
                     text = transcribe_pcm_chunks(
                         pcm_buffer,
                         whisper_model=app_state.whisper_model,
                     )
-
                     pcm_buffer.clear()
 
                     if not text:
@@ -85,19 +83,25 @@ async def voice_ws(websocket: WebSocket):
                     print(f"[STT] {text}")
 
                     # ==================================================
-                    # 5️⃣ AppEngine 처리
+                    # 5️⃣ AppEngine
                     # ==================================================
                     reply = app_state.app_engine.handle_text(text)
-
                     print(f"[BOT] {reply}")
 
                     # ==================================================
-                    # 6️⃣ 응답 전송
+                    # 6️⃣ TTS (gTTS → static/tts/*.mp3)
+                    # ==================================================
+                    tts_url = synthesize(reply)
+                    # 예: /static/tts/abcd1234.mp3
+
+                    # ==================================================
+                    # 7️⃣ 프론트로 전송 (🔥 타입 중요)
                     # ==================================================
                     await websocket.send_json(
                         {
-                            "type": "bot_text",
+                            "type": "bot_text",   # 🔥 프론트와 맞춤
                             "text": reply,
+                            "tts_url": tts_url,
                         }
                     )
 

@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useRef, useState } from "react"
+import { useRef, useState } from "react"
 
 type Status = "idle" | "listening" | "thinking" | "speaking"
 
@@ -11,8 +11,9 @@ const STATUS_TEXT: Record<Status, string> = {
   speaking: "안내를 시작할게요"
 }
 
-const WS_BASE =
-  process.env.NEXT_PUBLIC_WS_BASE || "ws://localhost:8000/ws/voice"
+// 🔥 WS 주소 고정
+const WS_BASE = "ws://127.0.0.1:8000/ws/voice"
+const API_BASE = "http://127.0.0.1:8000"
 
 export default function Home() {
   const [status, setStatus] = useState<Status>("idle")
@@ -26,7 +27,7 @@ export default function Home() {
   const streamRef = useRef<MediaStream | null>(null)
 
   // ==================================================
-  // WebSocket + 마이크 시작
+  // ▶️ 음성 시작
   // ==================================================
   const startVoice = async () => {
     if (active) return
@@ -36,30 +37,55 @@ export default function Home() {
     setUserText("")
     setBotText("")
 
-    // WebSocket 연결
+    // 1️⃣ WebSocket 연결
     const ws = new WebSocket(WS_BASE)
     ws.binaryType = "arraybuffer"
     wsRef.current = ws
 
+    ws.onopen = () => {
+      console.log("[WS] connected")
+    }
+
+    // 🔥 여기서 TTS 재생까지 처리
     ws.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data)
+
         if (data.type === "bot_text") {
           setBotText(data.text)
           setStatus("speaking")
-          // TTS는 서버 붙인 뒤 여기서 재생
-          setTimeout(() => setStatus("listening"), 800)
+
+          // 🔊 TTS 자동 재생 (핵심)
+          if (data.tts_url) {
+            const audio = new Audio(
+              data.tts_url.startsWith("http")
+                ? data.tts_url
+                : `${API_BASE}${data.tts_url}`
+            )
+
+            audio.onended = () => {
+              setStatus("listening")
+            }
+
+            audio.play().catch((err) => {
+              console.error("TTS play failed:", err)
+              setStatus("listening")
+            })
+          } else {
+            setStatus("listening")
+          }
         }
-      } catch {
-        // ignore
+      } catch (e) {
+        console.error("WS message parse error", e)
       }
     }
 
     ws.onclose = () => {
+      console.log("[WS] closed")
       stopVoice()
     }
 
-    // 마이크 스트림
+    // 2️⃣ 마이크 스트림
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
     streamRef.current = stream
 
@@ -67,12 +93,13 @@ export default function Home() {
     audioCtxRef.current = audioCtx
 
     const source = audioCtx.createMediaStreamSource(stream)
+
+    // ⚠️ ScriptProcessorNode (지금 단계에서는 안정적)
     const processor = audioCtx.createScriptProcessor(4096, 1, 1)
     processorRef.current = processor
 
     processor.onaudioprocess = (e) => {
       if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return
-
       const input = e.inputBuffer.getChannelData(0)
       wsRef.current.send(input.buffer)
     }
@@ -82,7 +109,7 @@ export default function Home() {
   }
 
   // ==================================================
-  // 종료 처리
+  // ⏹ 종료
   // ==================================================
   const stopVoice = () => {
     setActive(false)
@@ -113,9 +140,9 @@ export default function Home() {
   }[status]
 
   return (
-    <main className="min-h-screen bg-gradient-to-br from-emerald-50 via-sky-50 to-white text-neutral-800 flex flex-col items-center justify-center px-8">
+    <main className="min-h-screen bg-gradient-to-br from-emerald-50 via-sky-50 to-white flex flex-col items-center justify-center px-8 text-neutral-800">
 
-      {/* 브랜드 헤더 */}
+      {/* 헤더 */}
       <header className="absolute top-14 text-center select-none">
         <h1 className="text-4xl font-semibold tracking-[0.28em] text-neutral-800/80">
           PARKING
@@ -125,20 +152,19 @@ export default function Home() {
         </p>
       </header>
 
-      {/* 상태 문구 */}
+      {/* 상태 */}
       <p className="mb-10 text-lg text-neutral-500">
         {STATUS_TEXT[status]}
       </p>
 
-      {/* 중앙 버튼 */}
+      {/* 버튼 */}
       <button
         onClick={toggle}
         className={`
           relative w-44 h-44 rounded-full
           bg-gradient-to-br ${ringStyle}
           flex items-center justify-center
-          shadow-xl
-          transition-all duration-300
+          shadow-xl transition-all duration-300
         `}
       >
         <div className="w-32 h-32 bg-white rounded-full flex items-center justify-center shadow-inner">
@@ -148,17 +174,8 @@ export default function Home() {
         </div>
       </button>
 
-      {/* 대화 영역 */}
+      {/* 대화 */}
       <section className="mt-14 w-full max-w-xl space-y-5">
-        {userText && (
-          <div className="bg-white/70 backdrop-blur p-5 rounded-2xl shadow-sm">
-            <p className="text-xs tracking-wide text-neutral-400 mb-2">
-              VOICE INPUT
-            </p>
-            <p className="text-lg">{userText}</p>
-          </div>
-        )}
-
         {botText && (
           <div className="bg-emerald-100/70 backdrop-blur p-5 rounded-2xl shadow-sm">
             <p className="text-xs tracking-wide text-emerald-600 mb-2">
@@ -169,9 +186,9 @@ export default function Home() {
         )}
       </section>
 
-      {/* 하단 가이드 */}
+      {/* 가이드 */}
       <footer className="absolute bottom-10 text-center text-sm text-neutral-500">
-        시작을 누른 뒤 자유롭게 말씀해 주세요<br />
+        시작을 누른 뒤 자연스럽게 말씀해 주세요<br />
         출차 · 요금 · 정산 문제를 도와드립니다
       </footer>
     </main>

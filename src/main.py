@@ -9,12 +9,14 @@ load_dotenv(env_path)
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+
 from faster_whisper import WhisperModel
 
 import src.app_state as app_state
 from src.engine.app_engine import AppEngine
 from src.api.voice import router as voice_router
-from src.api.voice_ws import router as voice_ws_router  # ✅ WebSocket 추가
+from src.api.voice_ws import router as voice_ws_router  # ✅ WebSocket
 
 
 # ==================================================
@@ -35,13 +37,20 @@ app.add_middleware(
 
 
 # ==================================================
+# Static (TTS mp3 서빙)
+# ==================================================
+# gTTS 결과물: static/tts/*.mp3
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+
+# ==================================================
 # Startup: 모델 / 엔진 메모리 상주
 # ==================================================
 @app.on_event("startup")
 def startup():
     print("[Startup] Loading Whisper model...")
 
-    # 🔥 전역 상태에 직접 할당 (HTTP / WS 공용)
+    # 🔥 HTTP / WebSocket 공용 Whisper 모델
     app_state.whisper_model = WhisperModel(
         "large-v3",
         device="cpu",
@@ -57,8 +66,8 @@ def startup():
 # ==================================================
 # Routers
 # ==================================================
-# 기존 HTTP API
+# 1️⃣ 기존 HTTP API (/voice)
 app.include_router(voice_router)
 
-# WebSocket API (상시 마이크)
+# 2️⃣ WebSocket API (/ws/voice)
 app.include_router(voice_ws_router)

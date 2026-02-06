@@ -17,7 +17,7 @@ from src.rag.manual_rag import ManualRAG
 # ==================================================
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
 OLLAMA_MODEL = os.getenv("DIALOG_MODEL", os.getenv("OLLAMA_MODEL", "llama3.1:8b"))
-OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "60"))
+OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "120"))
 
 DEFAULT_HARD_TURN_LIMIT = int(os.getenv("SECOND_STAGE_HARD_TURN_LIMIT", "6") or 6)
 FAREWELL_TEXT = "이용해 주셔서 감사합니다. 안녕히 가세요."

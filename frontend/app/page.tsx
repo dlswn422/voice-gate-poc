@@ -4,19 +4,12 @@ import { useRef, useState } from "react"
 
 type Status = "idle" | "listening" | "thinking" | "speaking"
 
-const STATUS_TEXT: Record<Status, string> = {
-  idle: "시작 버튼을 눌러 주세요",
-  listening: "말씀을 듣고 있어요",
-  thinking: "잠시만 기다려주세요",
-  speaking: "안내를 시작할게요"
-}
-
 const WS_BASE = "ws://127.0.0.1:8000/ws/voice"
 const API_BASE = "http://127.0.0.1:8000"
 
 export default function Home() {
   /* ===============================
-     상태(UI) + 상태 Ref(로직)
+     상태
   =============================== */
   const [status, _setStatus] = useState<Status>("idle")
   const statusRef = useRef<Status>("idle")
@@ -25,7 +18,9 @@ export default function Home() {
     _setStatus(s)
   }
 
-  const [botText, setBotText] = useState("")
+  const [bubbleText, setBubbleText] = useState(
+    "화면을 터치하거나 말씀해 주세요"
+  )
   const [active, setActive] = useState(false)
 
   /* ===============================
@@ -38,7 +33,7 @@ export default function Home() {
   const streamRef = useRef<MediaStream | null>(null)
 
   /* ===============================
-     🎤 마이크 제어
+     마이크 제어
   =============================== */
   const startMicGraph = () => {
     if (!audioCtxRef.current || !processorRef.current || !sourceRef.current) return
@@ -53,7 +48,6 @@ export default function Home() {
     } catch {}
   }
 
-  // 🔥 물리적 마이크 OFF/ON
   const muteMicHard = () => {
     streamRef.current?.getAudioTracks().forEach(t => (t.enabled = false))
   }
@@ -62,32 +56,27 @@ export default function Home() {
   }
 
   /* ===============================
-     ▶️ 음성 시작
+     음성 시작
   =============================== */
   const startVoice = async () => {
     if (active) return
 
     setActive(true)
-    setBotText("")
     setStatus("listening")
+    setBubbleText("말씀을 듣고 있어요")
 
-    // 1️⃣ WebSocket
     const ws = new WebSocket(WS_BASE)
     ws.binaryType = "arraybuffer"
     wsRef.current = ws
-
-    ws.onopen = () => console.log("[WS] connected")
 
     ws.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data)
         if (data.type === "bot_text") {
-          setBotText(data.text)
-
-          // 🔴 TTS 시작 → STT 완전 차단
           stopMicGraph()
           muteMicHard()
           setStatus("speaking")
+          setBubbleText(data.text)
 
           if (data.tts_url) {
             const audio = new Audio(
@@ -97,44 +86,24 @@ export default function Home() {
             )
 
             audio.onended = () => {
-              // 🔔 백엔드에 TTS 종료 알림 (핵심)
-              wsRef.current?.send(
-                JSON.stringify({ type: "tts_end" })
-              )
-
-              // 잔향 방지 딜레이 후 listening 복귀
               setTimeout(() => {
                 setStatus("listening")
+                setBubbleText("다른 도움이 필요하시면 저를 눌러주세요.")
                 unmuteMicHard()
                 startMicGraph()
               }, 400)
             }
 
             audio.play().catch(() => {
-              wsRef.current?.send(
-                JSON.stringify({ type: "tts_end" })
-              )
               setStatus("listening")
               unmuteMicHard()
               startMicGraph()
             })
-          } else {
-            wsRef.current?.send(
-              JSON.stringify({ type: "tts_end" })
-            )
-            setStatus("listening")
-            unmuteMicHard()
-            startMicGraph()
           }
         }
-      } catch (e) {
-        console.error("WS parse error", e)
-      }
+      } catch {}
     }
 
-    ws.onclose = () => stopVoice()
-
-    // 2️⃣ 마이크
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: {
         echoCancellation: true,
@@ -154,81 +123,71 @@ export default function Home() {
     processorRef.current = processor
 
     processor.onaudioprocess = (e) => {
-      // 🔥 실시간 제어는 반드시 ref로
       if (statusRef.current !== "listening") return
       if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return
-
-      const input = e.inputBuffer.getChannelData(0)
-      wsRef.current.send(input.buffer)
+      wsRef.current.send(e.inputBuffer.getChannelData(0).buffer)
     }
 
     startMicGraph()
   }
 
-  /* ===============================
-     ⏹ 종료
-  =============================== */
-  const stopVoice = () => {
-    setActive(false)
-    setStatus("idle")
-
-    wsRef.current?.close()
-    wsRef.current = null
-
-    stopMicGraph()
-    muteMicHard()
-    processorRef.current = null
-    sourceRef.current = null
-
-    audioCtxRef.current?.close()
-    audioCtxRef.current = null
-
-    streamRef.current?.getTracks().forEach(t => t.stop())
-    streamRef.current = null
+  if (!active && typeof window !== "undefined") {
+    startVoice()
   }
 
-  const toggle = () => (active ? stopVoice() : startVoice())
-
-  const ringStyle = {
-    idle: "from-emerald-300 to-sky-400",
-    listening: "from-sky-400 to-blue-500 animate-pulse",
-    thinking: "from-amber-300 to-orange-400",
-    speaking: "from-purple-400 to-pink-400 animate-pulse"
-  }[status]
-
   return (
-    <main className="min-h-screen bg-gradient-to-br from-emerald-50 via-sky-50 to-white flex flex-col items-center justify-center px-8 text-neutral-800">
-      <header className="absolute top-14 text-center select-none">
-        <h1 className="text-4xl font-semibold tracking-[0.28em] text-neutral-800/80">PARKING</h1>
-        <p className="mt-2 text-xs tracking-[0.35em] text-neutral-400 uppercase">voice assistant</p>
+    <main className="min-h-screen bg-gradient-to-br from-emerald-50 via-sky-50 to-white flex flex-col items-center justify-center px-6 text-neutral-800">
+
+      {/* 로고 (위 여백 축소) */}
+      <header className="absolute top-8 text-center select-none">
+        <h1 className="text-4xl font-semibold tracking-[0.35em]">PARKMATE</h1>
+        <p className="mt-1 text-xs tracking-[0.35em] text-neutral-400 uppercase">
+          Parking Guidance Kiosk
+        </p>
       </header>
 
-      <p className="mb-10 text-lg text-neutral-500">{STATUS_TEXT[status]}</p>
+      {/* 캐릭터 + 말풍선 */}
+      <div className="flex items-start gap-10 max-w-5xl">
 
-      <button
-        onClick={toggle}
-        className={`relative w-44 h-44 rounded-full bg-gradient-to-br ${ringStyle}
-          flex items-center justify-center shadow-xl transition-all duration-300`}
-      >
-        <div className="w-32 h-32 bg-white rounded-full flex items-center justify-center shadow-inner">
-          <span className="text-3xl font-semibold text-neutral-700">
-            {active ? "STOP" : "START"}
-          </span>
-        </div>
-      </button>
+        {/* 캐릭터 (🔥 크게) */}
+        <div className="flex flex-col items-center">
+          <div
+            className={`
+              relative w-56 h-40 rounded-[2.5rem] bg-white shadow-2xl
+              flex items-center justify-center
+              ${status === "speaking" ? "animate-pulse" : ""}
+            `}
+          >
+            {/* 얼굴 */}
+            <div className="w-44 h-28 rounded-2xl bg-gradient-to-br from-emerald-300 to-sky-400 flex items-center justify-center gap-6">
+              <span className="w-4 h-4 bg-white rounded-full" />
+              <span className="w-4 h-4 bg-white rounded-full" />
+            </div>
 
-      <section className="mt-14 w-full max-w-xl space-y-5">
-        {botText && (
-          <div className="bg-emerald-100/70 backdrop-blur p-5 rounded-2xl shadow-sm">
-            <p className="text-xs tracking-wide text-emerald-600 mb-2">SYSTEM RESPONSE</p>
-            <p className="text-lg font-semibold">{botText}</p>
+            {/* 마이크 */}
+            <div className="absolute -bottom-4 w-9 h-9 rounded-full bg-emerald-400 shadow-md" />
           </div>
-        )}
-      </section>
 
-      <footer className="absolute bottom-10 text-center text-sm text-neutral-500">
-        시작을 누른 뒤 자연스럽게 말씀해 주세요<br />
-        출차 · 요금 · 정산 문제를 도와드립니다
+          <p className="mt-4 text-base text-neutral-500">
+            지미 · 주차 안내 파트너
+          </p>
+        </div>
+
+        {/* 말풍선 (자동 확장) */}
+        <div className="relative max-w-2xl bg-white/90 backdrop-blur-xl px-10 py-8 rounded-[2.5rem] shadow-xl border border-emerald-200/40">
+          <div className="absolute left-0 top-16 -translate-x-1/2 w-6 h-6 bg-white rotate-45 border-l border-b border-emerald-200/40" />
+          <p className="text-2xl font-semibold leading-relaxed whitespace-pre-line">
+            {bubbleText}
+          </p>
+        </div>
+      </div>
+
+      {/* 하단 문구 (위로 끌어올림) */}
+      <footer className="absolute bottom-8 text-center text-sm text-neutral-600 leading-relaxed">
+        주차장 이용 중 불편한 점이 있으신가요?<br />
+        <span className="font-semibold text-neutral-700">
+          PARKMATE가 더 나은 주차 경험을 도와드립니다.
+        </span>
       </footer>
     </main>
   )

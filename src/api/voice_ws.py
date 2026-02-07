@@ -7,24 +7,23 @@ import json
 import asyncio
 
 import src.app_state as app_state
-from src.speech.vad import VoiceActivityDetector
 from src.speech.whisper_service import transcribe_pcm_chunks
 from src.speech.tts import synthesize
 
 router = APIRouter()
 
 # ==================================================
-# 🔧 튜닝 포인트 (주변 소음 강한 환경 기준)
+# 🔧 튜닝 포인트 (웹 마이크 기준 확정값)
 # ==================================================
-SILENCE_RMS_THRESHOLD = 0.01     # 🔥 마이크 가까운 음성만 통과
-END_SILENCE_SEC = 0.4
+SILENCE_RMS_THRESHOLD = 0.003
+END_SILENCE_SEC = 0.25
 PRERUN_SILENCE_SEC = 0.2
 MIN_AUDIO_SEC = 0.5
 CUT_AUDIO_SEC = 0.2
 SAMPLE_RATE = 16000
 
-MIN_SPEECH_FRAMES = 5            # 🔥 연속 프레임 조건 (~100ms)
-IGNORE_INPUT_AFTER_TTS_SEC = 0.35  # 🔥 TTS 잔향 차단
+MIN_SPEECH_FRAMES = 3
+IGNORE_INPUT_AFTER_TTS_SEC = 0.35
 
 
 # ==================================================
@@ -45,15 +44,11 @@ async def voice_ws(websocket: WebSocket):
     await websocket.accept()
     print("[WS] 🔌 Client connected")
 
-    vad = VoiceActivityDetector()
-
     pcm_buffer: list[np.ndarray] = []
     collecting = False
     last_non_silence_ts = 0.0
 
     prerun_task: asyncio.Task | None = None
-    prerun_used = False
-
     speech_frame_count = 0
     ignore_until_ts = 0.0
 
@@ -64,20 +59,25 @@ async def voice_ws(websocket: WebSocket):
             message = await websocket.receive()
 
             # --------------------------------------------------
+            # 디버그: 메시지 수신 확인
+            # --------------------------------------------------
+            if "bytes" not in message and "text" not in message:
+                continue
+
+            # --------------------------------------------------
             # 프론트 제어 메시지
             # --------------------------------------------------
             if "text" in message:
                 try:
                     msg = json.loads(message["text"])
                     if msg.get("type") == "tts_end":
+                        print("[WS] 🔁 TTS ended → LISTENING")
                         app_state.app_engine.state = "LISTENING"
                         collecting = False
                         pcm_buffer.clear()
                         prerun_task = None
-                        prerun_used = False
                         speech_frame_count = 0
                         ignore_until_ts = time.time() + IGNORE_INPUT_AFTER_TTS_SEC
-                        print("[WS] 🔁 TTS ended → LISTENING (cooldown)")
                         continue
                 except Exception:
                     continue
@@ -98,6 +98,9 @@ async def voice_ws(websocket: WebSocket):
             now = time.time()
             rms = np.sqrt(np.mean(pcm * pcm))
 
+            # 🔍 디버그 로그 (지금 상태 바로 보이게)
+            print(f"[DEBUG] rms={rms:.5f}, collecting={collecting}")
+
             # --------------------------------------------------
             # THINKING / SPEAKING 중 입력 무시
             # --------------------------------------------------
@@ -105,15 +108,14 @@ async def voice_ws(websocket: WebSocket):
                 collecting = False
                 pcm_buffer.clear()
                 prerun_task = None
-                prerun_used = False
                 speech_frame_count = 0
                 continue
 
             # --------------------------------------------------
-            # 발화 시작 감지 (🔥 핵심 강화)
+            # 🎤 발화 시작 감지 (RMS ONLY)
             # --------------------------------------------------
             if not collecting:
-                if vad.is_speech(pcm) and rms > SILENCE_RMS_THRESHOLD:
+                if rms > SILENCE_RMS_THRESHOLD:
                     speech_frame_count += 1
                 else:
                     speech_frame_count = 0
@@ -122,7 +124,6 @@ async def voice_ws(websocket: WebSocket):
                     collecting = True
                     pcm_buffer.clear()
                     prerun_task = None
-                    prerun_used = False
                     speech_frame_count = 0
                     last_non_silence_ts = now
                     print("[WS] 🎤 Speech started")
@@ -136,13 +137,13 @@ async def voice_ws(websocket: WebSocket):
                 last_non_silence_ts = now
                 continue
 
+            silence_time = now - last_non_silence_ts
+
             # --------------------------------------------------
             # STT pre-run
             # --------------------------------------------------
-            silence_time = now - last_non_silence_ts
-
             if collecting and prerun_task is None and silence_time >= PRERUN_SILENCE_SEC:
-                print("[WS] ⚡ STT pre-run started")
+                print("[WS] ⚡ STT pre-run")
 
                 audio = np.concatenate(pcm_buffer).astype(np.float32)
                 cut_samples = int(SAMPLE_RATE * CUT_AUDIO_SEC)
@@ -158,7 +159,7 @@ async def voice_ws(websocket: WebSocket):
                 )
 
             # --------------------------------------------------
-            # 발화 종료
+            # 🛑 발화 종료
             # --------------------------------------------------
             if collecting and silence_time >= END_SILENCE_SEC:
                 collecting = False
@@ -170,7 +171,6 @@ async def voice_ws(websocket: WebSocket):
                 if total_audio_sec < MIN_AUDIO_SEC:
                     pcm_buffer.clear()
                     prerun_task = None
-                    prerun_used = False
                     continue
 
                 await safe_send(websocket, {
@@ -181,7 +181,6 @@ async def voice_ws(websocket: WebSocket):
                 if prerun_task:
                     try:
                         text = await prerun_task
-                        prerun_used = True
                         print("[WS] ⚡ pre-run STT reused")
                     except Exception:
                         text = ""
@@ -227,7 +226,7 @@ async def voice_ws(websocket: WebSocket):
                 })
 
                 if end_session:
-                    print("[WS] 🛑 Conversation ended → WebSocket close")
+                    print("[WS] 🛑 Conversation ended")
                     app_state.app_engine.state = "IDLE"
                     await safe_close(websocket)
                     break

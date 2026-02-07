@@ -239,8 +239,7 @@ class AppEngine:
         # ==================================================
         if self.state == "FIRST_STAGE":
             result = detect_intent_embedding(text)
-            # result = detect_intent_llm(text)
-
+        
             self.intent_log_id = log_intent(
                 utterance=text,
                 predicted_intent=result.intent.value,

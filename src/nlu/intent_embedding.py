@@ -197,16 +197,18 @@ def detect_intent_embedding(text: str) -> IntentResult:
         f"Score={top_score:.4f}, Gap={gap:.4f}"
     )
 
+    conf = round(float(top_score), 2)
+
     # 5️⃣ 자동 확정 판단
     if top_score >= threshold and gap >= GAP_THRESHOLD:
         print(f"[INTENT-EMBEDDING] ✅ CONFIRMED → {top_intent.value}")
         return IntentResult(
             intent=top_intent,
-            confidence=float(top_score),
+            confidence=conf,
         )
 
     print("[INTENT-EMBEDDING] ⚠️ AMBIGUOUS → NONE")
     return IntentResult(
         intent=Intent.NONE,
-        confidence=float(top_score),
+        confidence=conf,
     )

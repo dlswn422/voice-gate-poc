@@ -52,7 +52,8 @@ def startup():
 
     # 🔥 HTTP / WebSocket 공용 Whisper 모델
     app_state.whisper_model = WhisperModel(
-        "large-v3",
+        #"large-v3",
+        "medium",
         device="cpu",
         compute_type="int8_float32",
     )

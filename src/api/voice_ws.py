@@ -17,12 +17,10 @@ router = APIRouter()
 # RMS 기준: 배경 소음 vs 실제 발화 구분용
 SILENCE_RMS_THRESHOLD = 0.008
 
-# 🔥 가장 중요한 체감 속도 포인트
-# 말이 끝났다고 판단하는 대기 시간
-# (기존 0.7 → 0.4 : 정확도 유지 + 반응 빨라짐)
+# 말이 끝났다고 판단하는 침묵 시간
 END_SILENCE_SEC = 0.4
 
-# 너무 짧은 발화는 STT 안 태우기 (속도 + 오작동 방지)
+# 너무 짧은 발화는 STT 안 태우기
 MIN_AUDIO_SEC = 0.5
 
 
@@ -32,9 +30,7 @@ async def voice_ws(websocket: WebSocket):
     print("[WS] 🔌 Client connected")
 
     # --------------------------------------------------
-    # Silero VAD
-    # - 역할: "말 시작 감지" 전용
-    # - 스트리밍 중 매 chunk마다 쓰지 않음 (중요)
+    # VAD (발화 시작 감지용)
     # --------------------------------------------------
     vad = VoiceActivityDetector()
 
@@ -42,22 +38,21 @@ async def voice_ws(websocket: WebSocket):
     collecting = False
     last_non_silence_ts = 0.0
 
-    # 최초 상태
+    # 최초 상태는 대기
     app_state.app_engine.state = "LISTENING"
 
     try:
         while True:
             # ==================================================
-            # 0️⃣ 메시지 수신 (audio frame or control)
+            # 0️⃣ 메시지 수신
             # ==================================================
             message = await websocket.receive()
 
-            # ---------- (A) 프론트 제어 메시지 ----------
+            # ---------- 프론트 제어 ----------
             if "text" in message:
                 try:
                     msg = json.loads(message["text"])
                     if msg.get("type") == "tts_end":
-                        # TTS 끝 → 다시 듣기 상태
                         app_state.app_engine.state = "LISTENING"
                         collecting = False
                         pcm_buffer.clear()
@@ -66,7 +61,7 @@ async def voice_ws(websocket: WebSocket):
                 except Exception:
                     continue
 
-            # ---------- (B) 오디오 프레임 ----------
+            # ---------- 오디오 프레임 ----------
             if "bytes" not in message:
                 continue
 
@@ -77,14 +72,12 @@ async def voice_ws(websocket: WebSocket):
             now = time.time()
 
             # ==================================================
-            # 1️⃣ RMS 계산 (침묵/소리 판단)
+            # 1️⃣ RMS 계산
             # ==================================================
             rms = np.sqrt(np.mean(pcm * pcm))
 
             # ==================================================
             # 2️⃣ 서버 차단 구간
-            # THINKING / SPEAKING 중에는
-            # 사용자 음성 무시 (기존 로직 유지)
             # ==================================================
             if app_state.app_engine.state in ("SPEAKING", "THINKING"):
                 collecting = False
@@ -93,11 +86,6 @@ async def voice_ws(websocket: WebSocket):
 
             # ==================================================
             # 3️⃣ 발화 시작 판단
-            # --------------------------------------------------
-            # ✔️ 아직 collecting 전:
-            #     → Silero VAD + RMS
-            # ✔️ collecting 이후:
-            #     → RMS만 사용 (속도/안정성)
             # ==================================================
             if not collecting:
                 is_speech = vad.is_speech(pcm) or rms > SILENCE_RMS_THRESHOLD
@@ -124,11 +112,9 @@ async def voice_ws(websocket: WebSocket):
                 if not pcm_buffer:
                     continue
 
-                # 전체 음성 길이 계산 (초)
                 total_samples = sum(len(chunk) for chunk in pcm_buffer)
                 total_audio_sec = total_samples / 16000.0
 
-                # 너무 짧은 발화는 무시
                 if total_audio_sec < MIN_AUDIO_SEC:
                     pcm_buffer.clear()
                     app_state.app_engine.state = "LISTENING"
@@ -136,7 +122,7 @@ async def voice_ws(websocket: WebSocket):
                     continue
 
                 # ==================================================
-                # 5️⃣ 프론트에 THINKING 알림 (체감 속도)
+                # 5️⃣ THINKING 알림 (UX)
                 # ==================================================
                 await websocket.send_json({
                     "type": "assistant_state",
@@ -160,7 +146,7 @@ async def voice_ws(websocket: WebSocket):
                 print(f"[STT] {text}")
 
                 # ==================================================
-                # 7️⃣ AppEngine 처리
+                # 7️⃣ AppEngine
                 # ==================================================
                 app_state.app_engine.state = "THINKING"
                 result = app_state.app_engine.handle_text(text)
@@ -182,7 +168,7 @@ async def voice_ws(websocket: WebSocket):
                     tts_url = synthesize(reply_text)
 
                 # ==================================================
-                # 9️⃣ 프론트로 응답
+                # 9️⃣ 프론트 응답
                 # ==================================================
                 await websocket.send_json({
                     "type": "assistant_message",
@@ -193,13 +179,13 @@ async def voice_ws(websocket: WebSocket):
                 })
 
                 # ==================================================
-                # 🔟 대화 종료
+                # 🔟 대화 완전 종료
                 # ==================================================
                 if end_session:
-                    app_state.app_engine.state = "LISTENING"
+                    app_state.app_engine.state = "IDLE"
                     collecting = False
                     pcm_buffer.clear()
-                    print("[WS] 🛑 Conversation ended")
+                    print("[WS] 🛑 Conversation ended → IDLE")
 
     except WebSocketDisconnect:
         print("[WS] ❌ Client disconnected")

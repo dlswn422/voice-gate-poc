@@ -33,7 +33,7 @@ ONE_TURN_RESPONSES = {
 }
 
 # ==================================================
-# NONE 시 안내 메시지 (원래 기능 유지)
+# NONE 시 안내 메시지
 # ==================================================
 NONE_RETRY_TEXT = (
     "말씀을 정확히 이해하지 못했어요. "
@@ -68,9 +68,10 @@ class AppEngine:
     """
     AppEngine (FINAL)
 
-    ✔ Intent 확정 → 원턴
-    ✔ Intent NONE → 안내 메시지 (원래 UX)
-    ✔ NONE 다음 발화 → 2차 대화 승격
+    ✔ 1차 Intent → 원턴 응답
+    ✔ 원턴 시 키워드 UI 노출(one_turn)
+    ✔ 키워드 클릭 = 일반 발화와 동일 처리
+    ✔ 이후 무조건 SECOND_STAGE
     """
 
     def __init__(self):
@@ -89,7 +90,7 @@ class AppEngine:
         self.dialog_history = []
 
         self._ignore_until_ts = 0.0
-        self._just_one_turn = False  # ⭐ 핵심 플래그
+        self._just_one_turn = False
 
         self.second_turn_count_user = 0
         self.second_slots = {}
@@ -137,7 +138,7 @@ class AppEngine:
             })
 
     # --------------------------------------------------
-    # 응답 포맷
+    # 응답 포맷 (⭐ UI 연동 포함)
     # --------------------------------------------------
     def _make_response(
         self,
@@ -145,6 +146,8 @@ class AppEngine:
         *,
         conversation_state: str,
         end_session: bool = False,
+        one_turn: bool = False,
+        intent: str | None = None,
     ) -> Dict[str, Any]:
         return {
             "type": "assistant_message",
@@ -152,6 +155,8 @@ class AppEngine:
             "conversation_state": conversation_state,
             "end_session": end_session,
             "session_id": self.session_id,
+            "one_turn": one_turn,     # ⭐ 키워드 UI 트리거
+            "intent": intent,         # ⭐ EXIT / PAYMENT / NONE ...
         }
 
     # --------------------------------------------------
@@ -208,10 +213,16 @@ class AppEngine:
     # --------------------------------------------------
     # 메인 엔트리
     # --------------------------------------------------
-    def handle_text(self, text: str) -> Dict[str, Any]:
+    def handle_text(self, text: Any) -> Dict[str, Any]:
         now = time.time()
 
-        if not text or not text.strip():
+        # ==================================================
+        # ⭐ UI 키워드 입력 처리
+        # ==================================================
+        if isinstance(text, dict) and text.get("type") == "ui_keyword":
+            text = text.get("text", "")
+
+        if not isinstance(text, str) or not text.strip():
             return self._make_response(
                 "다시 한 번 말씀해 주세요.",
                 conversation_state="WAITING_USER",
@@ -227,7 +238,7 @@ class AppEngine:
             self._start_new_session()
 
         # ==================================================
-        # ⭐ 원턴 이후 (NONE 포함) → SECOND_STAGE
+        # ⭐ 원턴 이후 → SECOND_STAGE
         # ==================================================
         if self._just_one_turn:
             self.state = "SECOND_STAGE"
@@ -239,7 +250,7 @@ class AppEngine:
         # ==================================================
         if self.state == "FIRST_STAGE":
             result = detect_intent_embedding(text)
-        
+
             self.intent_log_id = log_intent(
                 utterance=text,
                 predicted_intent=result.intent.value,
@@ -252,21 +263,21 @@ class AppEngine:
             self._log_dialog("user", text)
 
             # --------------------------------------------------
-            # 🔹 NONE → 안내 메시지 (원래 UX 유지)
+            # NONE → 원턴 + 키워드
             # --------------------------------------------------
             if result.intent == Intent.NONE:
                 self._log_dialog("assistant", NONE_RETRY_TEXT)
-
-                # ⭐ 다음 턴에서 2차로 올리기 위한 플래그
                 self._just_one_turn = True
 
                 return self._make_response(
                     NONE_RETRY_TEXT,
                     conversation_state="WAITING_USER",
+                    one_turn=True,
+                    intent=Intent.NONE.value,
                 )
 
             # --------------------------------------------------
-            # 🔹 확정 Intent → 원턴 응답
+            # 확정 Intent → 원턴 응답
             # --------------------------------------------------
             reply = ONE_TURN_RESPONSES.get(
                 result.intent,
@@ -279,6 +290,8 @@ class AppEngine:
             return self._make_response(
                 reply,
                 conversation_state="WAITING_USER",
+                one_turn=True,
+                intent=self.first_intent,
             )
 
         # ==================================================

@@ -132,7 +132,7 @@ async def voice_ws(websocket: WebSocket):
             speech_duration = now - speech_start_ts
 
             # --------------------------------------------------
-            # STT pre-run (1회)
+            # STT pre-run
             # --------------------------------------------------
             if prerun_task is None and silence_time >= PRERUN_SILENCE_SEC:
                 audio = np.concatenate(pcm_buffer).astype(np.float32)
@@ -150,7 +150,7 @@ async def voice_ws(websocket: WebSocket):
                 print("[WS] ⚡ STT pre-run")
 
             # --------------------------------------------------
-            # 🛑 발화 종료 (침묵 OR 시간 강제)
+            # 🛑 발화 종료
             # --------------------------------------------------
             if silence_time >= END_SILENCE_SEC or speech_duration >= MAX_SPEECH_SEC:
                 collecting = False
@@ -163,7 +163,6 @@ async def voice_ws(websocket: WebSocket):
                     prerun_task = None
                     continue
 
-                # ✅ THINKING 상태를 서버가 명시적으로 보냄
                 await safe_send(websocket, {
                     "type": "assistant_state",
                     "state": "THINKING",
@@ -172,7 +171,6 @@ async def voice_ws(websocket: WebSocket):
                 if prerun_task:
                     try:
                         text = await prerun_task
-                        print("[WS] ⚡ pre-run STT reused")
                     except Exception:
                         text = ""
                 else:
@@ -201,12 +199,11 @@ async def voice_ws(websocket: WebSocket):
                     io_state = "SPEAKING"
                     tts_url = synthesize(reply_text)
 
-                    await safe_send(websocket, {
-                        "type": "assistant_message",
-                        "text": reply_text,
-                        "tts_url": tts_url,
-                        "end_session": end_session,
-                    })
+                    # ⭐ 핵심 수정: AppEngine 결과 그대로 전달
+                    payload = dict(result)
+                    payload["tts_url"] = tts_url
+
+                    await safe_send(websocket, payload)
 
                 if end_session:
                     print("[WS] 🛑 Conversation ended")

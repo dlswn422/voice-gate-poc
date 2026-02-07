@@ -2,10 +2,34 @@
 
 import { useRef, useState } from "react"
 
+/* ===============================
+   Types
+=============================== */
 type Status = "idle" | "listening" | "thinking" | "speaking"
+type Intent =
+  | "EXIT"
+  | "ENTRY"
+  | "PAYMENT"
+  | "REGISTRATION"
+  | "TIME_PRICE"
+  | "FACILITY"
+  | "NONE"
 
+/* ===============================
+   Constants
+=============================== */
 const WS_BASE = "ws://127.0.0.1:8000/ws/voice"
 const API_BASE = "http://127.0.0.1:8000"
+
+const INTENT_UI_KEYWORDS: Record<Intent, string[]> = {
+  EXIT: ["차단기 안 열림", "출차 안 됨", "차량 인식 안 됨", "출구에서 멈춤", "기타"],
+  ENTRY: ["입차 안 됨", "차단기 안 열림", "차량 인식 안 됨", "만차로 표시됨", "기타"],
+  PAYMENT: ["결제 안 됨", "카드 오류", "요금 이상", "결제 방법 문의", "기타"],
+  REGISTRATION: ["차량 등록", "방문자 등록", "등록 방법 문의", "등록했는데 안 됨", "기타"],
+  TIME_PRICE: ["주차 시간 문의", "요금 문의", "할인 적용 문의", "요금 기준", "기타"],
+  FACILITY: ["기기 멈춤", "화면 안 보임", "버튼 안 됨", "차단기 이상", "기타"],
+  NONE: ["출차 관련", "입차 관련", "결제 관련", "등록 관련", "기타 문의"],
+}
 
 export default function Home() {
   /* ===============================
@@ -21,7 +45,12 @@ export default function Home() {
   const [bubbleText, setBubbleText] = useState(
     "문의하실 내용이 있으시면\n저를 눌러주세요."
   )
+
   const [active, setActive] = useState(false)
+
+  // ⭐ 원턴 키워드 UI 상태
+  const [showKeywords, setShowKeywords] = useState(false)
+  const [currentIntent, setCurrentIntent] = useState<Intent | null>(null)
 
   /* ===============================
      Refs
@@ -42,7 +71,7 @@ export default function Home() {
   }
 
   /* ===============================
-     음성 시작 (최초 1회)
+     음성 시작
   =============================== */
   const startVoice = async () => {
     if (active) return
@@ -50,7 +79,6 @@ export default function Home() {
     setActive(true)
     setStatus("listening")
 
-    /* ---------- WebSocket ---------- */
     const ws = new WebSocket(WS_BASE)
     ws.binaryType = "arraybuffer"
     wsRef.current = ws
@@ -59,23 +87,27 @@ export default function Home() {
       try {
         const data = JSON.parse(event.data)
 
-        /* ===============================
-           🧠 THINKING (서버 신호 ONLY)
-        =============================== */
+        /* THINKING */
         if (data.type === "assistant_state" && data.state === "THINKING") {
           setStatus("thinking")
           setBubbleText("잠시만요…\n생각 중이에요.")
+          setShowKeywords(false)
           return
         }
 
-        /* ===============================
-           🤖 실제 응답
-        =============================== */
+        /* ASSISTANT MESSAGE */
         if (data.type === "assistant_message") {
-          const { text, tts_url, end_session } = data
+          const { text, tts_url, end_session, one_turn, intent } = data
 
-          if (text) {
-            setBubbleText(text)
+          if (text) setBubbleText(text)
+
+          // ⭐ 원턴일 때만 키워드 표시
+          if (one_turn && intent) {
+            setShowKeywords(true)
+            setCurrentIntent(intent)
+          } else {
+            setShowKeywords(false)
+            setCurrentIntent(null)
           }
 
           if (tts_url) {
@@ -91,10 +123,7 @@ export default function Home() {
             audio.onended = () => {
               setStatus("listening")
               unmuteMicHard()
-
-              wsRef.current?.send(
-                JSON.stringify({ type: "tts_end" })
-              )
+              wsRef.current?.send(JSON.stringify({ type: "tts_end" }))
             }
 
             audio.play()
@@ -103,9 +132,9 @@ export default function Home() {
           if (end_session) {
             setStatus("idle")
             setActive(false)
-            setBubbleText(
-              "문의하실 내용이 있으시면\n저를 눌러주세요."
-            )
+            setShowKeywords(false)
+            setCurrentIntent(null)
+            setBubbleText("문의하실 내용이 있으시면\n저를 눌러주세요.")
           }
         }
       } catch (e) {
@@ -135,7 +164,6 @@ export default function Home() {
     processor.onaudioprocess = (e) => {
       if (statusRef.current !== "listening") return
       if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return
-
       wsRef.current.send(e.inputBuffer.getChannelData(0).buffer)
     }
   }
@@ -146,6 +174,7 @@ export default function Home() {
   return (
     <main className="min-h-screen bg-gradient-to-br from-emerald-50 via-sky-50 to-white flex items-center justify-center px-6 text-neutral-800">
 
+      {/* ✅ PARKMATE 헤더 유지 */}
       <header className="absolute top-8 text-center select-none">
         <h1 className="text-4xl font-semibold tracking-[0.35em]">
           PARKMATE
@@ -213,6 +242,43 @@ export default function Home() {
           <p className="text-2xl font-semibold leading-relaxed whitespace-pre-line break-words">
             {bubbleText}
           </p>
+
+          {/* ⭐ 원턴 키워드 UI (추가된 부분) */}
+          {showKeywords && currentIntent && (
+            <>
+              <p className="mt-6 text-sm text-neutral-500">
+                이 중 어떤 문의가 있으실까요?
+              </p>
+
+              <div className="mt-4 grid grid-cols-2 gap-3">
+                {INTENT_UI_KEYWORDS[currentIntent].map((kw) => (
+                  <button
+                    key={kw}
+                    onClick={() => {
+                      wsRef.current?.send(
+                        JSON.stringify({
+                          type: "ui_keyword",
+                          text: kw,
+                        })
+                      )
+                      setShowKeywords(false)
+                    }}
+                    className="
+                      py-3 px-4
+                      rounded-xl
+                      border border-neutral-300
+                      bg-white
+                      text-base
+                      hover:bg-neutral-100
+                      transition
+                    "
+                  >
+                    {kw}
+                  </button>
+                ))}
+              </div>
+            </>
+          )}
         </div>
       </div>
     </main>

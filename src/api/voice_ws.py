@@ -16,7 +16,7 @@ router = APIRouter()
 # ==================================================
 
 # 배경 소음 vs 실제 발화 구분용 RMS 임계값
-SILENCE_RMS_THRESHOLD = 0.008
+SILENCE_RMS_THRESHOLD = 0.012
 
 # "말이 끝났다"고 판단하는 최종 침묵 시간
 # 너무 줄이면 문장 중간에서 끊김

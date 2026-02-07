@@ -9,6 +9,7 @@ import asyncio
 import src.app_state as app_state
 from src.speech.whisper_service import transcribe_pcm_chunks
 from src.speech.tts import synthesize
+from src.nlu.dialog_llm_stream import dialog_llm_stream
 
 router = APIRouter()
 
@@ -59,13 +60,7 @@ async def voice_ws(websocket: WebSocket):
             message = await websocket.receive()
 
             # --------------------------------------------------
-            # 디버그: 메시지 수신 확인
-            # --------------------------------------------------
-            if "bytes" not in message and "text" not in message:
-                continue
-
-            # --------------------------------------------------
-            # 프론트 제어 메시지
+            # 프론트 제어 메시지 (TTS 종료)
             # --------------------------------------------------
             if "text" in message:
                 try:
@@ -80,7 +75,7 @@ async def voice_ws(websocket: WebSocket):
                         ignore_until_ts = time.time() + IGNORE_INPUT_AFTER_TTS_SEC
                         continue
                 except Exception:
-                    continue
+                    pass
 
             # --------------------------------------------------
             # 오디오 프레임
@@ -98,9 +93,6 @@ async def voice_ws(websocket: WebSocket):
             now = time.time()
             rms = np.sqrt(np.mean(pcm * pcm))
 
-            # 🔍 디버그 로그 (지금 상태 바로 보이게)
-            print(f"[DEBUG] rms={rms:.5f}, collecting={collecting}")
-
             # --------------------------------------------------
             # THINKING / SPEAKING 중 입력 무시
             # --------------------------------------------------
@@ -112,7 +104,7 @@ async def voice_ws(websocket: WebSocket):
                 continue
 
             # --------------------------------------------------
-            # 🎤 발화 시작 감지 (RMS ONLY)
+            # 🎤 발화 시작 감지 (RMS 기반)
             # --------------------------------------------------
             if not collecting:
                 if rms > SILENCE_RMS_THRESHOLD:
@@ -173,11 +165,6 @@ async def voice_ws(websocket: WebSocket):
                     prerun_task = None
                     continue
 
-                await safe_send(websocket, {
-                    "type": "assistant_state",
-                    "state": "THINKING",
-                })
-
                 if prerun_task:
                     try:
                         text = await prerun_task
@@ -199,37 +186,44 @@ async def voice_ws(websocket: WebSocket):
 
                 print(f"[STT] {text}")
 
-                # --------------------------------------------------
-                # AppEngine
-                # --------------------------------------------------
-                app_state.app_engine.state = "THINKING"
-                result = app_state.app_engine.handle_text(text)
+                # ==================================================
+                # 🧠 Dialog LLM Stream 연결 (핵심)
+                # ==================================================
+                async for event in dialog_llm_stream(
+                    user_text=text,
+                    history=app_state.app_engine.dialog_history,
+                    context={
+                        "session_id": app_state.app_engine.session_id,
+                        "intent": app_state.app_engine.first_intent,
+                        "turn_count_user": app_state.app_engine.second_turn_count_user,
+                        "hard_turn_limit": 6,
+                        "slots": app_state.app_engine.second_slots,
+                        "pending_slot": app_state.app_engine.second_pending_slot,
+                    },
+                    debug=True,
+                ):
+                    # THINKING / MESSAGE / DONE 그대로 전달
+                    await safe_send(websocket, event)
 
-                reply_text = result.get("text", "")
-                conversation_state = result.get("conversation_state", "WAITING_USER")
-                end_session = result.get("end_session", False)
+                    # MESSAGE → TTS 실행
+                    if event.get("type") == "assistant_message":
+                        reply_text = event.get("text", "")
+                        if reply_text:
+                            app_state.app_engine.state = "SPEAKING"
+                            tts_url = synthesize(reply_text)
+                            await safe_send(websocket, {
+                                "type": "tts_start",
+                                "tts_url": tts_url,
+                            })
 
-                # --------------------------------------------------
-                # TTS
-                # --------------------------------------------------
-                tts_url = None
-                if reply_text:
-                    app_state.app_engine.state = "SPEAKING"
-                    tts_url = synthesize(reply_text)
-
-                await safe_send(websocket, {
-                    "type": "assistant_message",
-                    "text": reply_text,
-                    "tts_url": tts_url,
-                    "conversation_state": conversation_state,
-                    "end_session": end_session,
-                })
-
-                if end_session:
-                    print("[WS] 🛑 Conversation ended")
-                    app_state.app_engine.state = "IDLE"
-                    await safe_close(websocket)
-                    break
+                    # DONE → 엔진 상태 동기화
+                    if event.get("type") == "assistant_done":
+                        app_state.app_engine.second_slots = event.get("slots") or {}
+                        app_state.app_engine.second_pending_slot = event.get("pending_slot")
+                        app_state.app_engine.first_intent = (
+                            event.get("new_intent") or app_state.app_engine.first_intent
+                        )
+                        break
 
     except WebSocketDisconnect:
         print("[WS] ❌ Client disconnected")

@@ -50,6 +50,9 @@ export default function Home() {
   const [showKeywords, setShowKeywords] = useState(false)
   const [currentIntent, setCurrentIntent] = useState<Intent | null>(null)
 
+  // 🔔 관리실 팝업
+  const [showAdminPopup, setShowAdminPopup] = useState(false)
+
   /* ===============================
      Refs
   =============================== */
@@ -66,10 +69,13 @@ export default function Home() {
   }
 
   /* ===============================
-     음성 시작
+     음성 시작 (FIXED)
   =============================== */
   const startVoice = async () => {
     if (active) return
+
+    unmuteMicHard()
+    statusRef.current = "listening"
 
     setActive(true)
     setStatus("listening")
@@ -93,7 +99,33 @@ export default function Home() {
         }
 
         if (data.type === "assistant_message") {
-          const { text, tts_url, end_session, one_turn, intent } = data
+          const {
+            text,
+            tts_url,
+            end_session,
+            one_turn,
+            intent,
+            system_action,
+          } = data
+
+          /* 🚨 관리실 호출 */
+          if (system_action === "CALL_ADMIN") {
+            muteMicHard()
+            setShowAdminPopup(true)
+            setShowKeywords(false)
+            setCurrentIntent(null)
+
+            setTimeout(() => {
+              setShowAdminPopup(false)
+              setActive(false)
+              setStatus("idle")
+              setBubbleText(
+                "문의하실 내용이 있으시면\n저를 누르고 말씀해주세요."
+              )
+            }, 1800)
+
+            return
+          }
 
           if (text) setBubbleText(text)
 
@@ -110,14 +142,12 @@ export default function Home() {
             setStatus("speaking")
 
             const audio = new Audio(
-              tts_url.startsWith("http")
-                ? tts_url
-                : `${API_BASE}${tts_url}`
+              tts_url.startsWith("http") ? tts_url : `${API_BASE}${tts_url}`
             )
 
             audio.onended = () => {
-              setStatus("listening")
               unmuteMicHard()
+              setStatus("listening")
               wsRef.current?.send(JSON.stringify({ type: "tts_end" }))
             }
 
@@ -125,9 +155,11 @@ export default function Home() {
           }
 
           if (end_session) {
-            setStatus("idle")
             setActive(false)
-            setBubbleText("문의하실 내용이 있으시면\n저를 누르고 말씀해주세요.")
+            setStatus("idle")
+            setBubbleText(
+              "문의하실 내용이 있으시면\n저를 누르고 말씀해주세요."
+            )
             setShowKeywords(false)
             setCurrentIntent(null)
           }
@@ -168,12 +200,22 @@ export default function Home() {
      UI
   =============================== */
   return (
-    <main className="min-h-screen bg-gradient-to-br from-emerald-50 via-sky-50 to-white flex items-center justify-center px-6 text-neutral-800 font-[Pretendard]">
+    <main className="min-h-screen bg-gradient-to-br from-emerald-50 via-sky-50 to-white flex items-center justify-center px-6 font-[Pretendard]">
 
-      <header className="absolute top-8 text-center select-none">
-        <h1 className="text-4xl font-semibold tracking-[0.35em]">
-          PARKMATE
-        </h1>
+      {/* 🔔 관리실 팝업 */}
+      {showAdminPopup && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm">
+          <div className="bg-white rounded-2xl px-10 py-8 shadow-2xl text-center">
+            <p className="text-2xl font-semibold">🔔 관리실에 연락했습니다</p>
+            <p className="mt-2 text-neutral-600">
+              직원이 곧 도와드릴 예정입니다.
+            </p>
+          </div>
+        </div>
+      )}
+
+      <header className="absolute top-8 text-center">
+        <h1 className="text-4xl font-semibold tracking-[0.35em]">PARKMATE</h1>
         <p className="mt-1 text-xs tracking-[0.35em] text-neutral-400 uppercase">
           Parking Guidance Kiosk
         </p>
@@ -183,10 +225,7 @@ export default function Home() {
         {/* 🤖 지미 */}
         <div
           onClick={startVoice}
-          className={`
-            relative z-10 cursor-pointer select-none
-            ${status === "thinking" ? "animate-bounce" : ""}
-          `}
+          className={`cursor-pointer ${status === "thinking" ? "animate-bounce" : ""}`}
         >
           <div className="w-56 h-40 rounded-[2.5rem] bg-white shadow-2xl flex items-center justify-center">
             <div className="w-44 h-28 rounded-2xl bg-gradient-to-br from-emerald-300 to-sky-400 flex items-center justify-center gap-6">
@@ -194,68 +233,38 @@ export default function Home() {
               <span className="w-4 h-4 bg-white rounded-full" />
             </div>
           </div>
-          <p className="mt-4 text-center text-base text-neutral-500">
+          <p className="mt-4 text-center text-neutral-500">
             지미 · 주차 안내 파트너
           </p>
         </div>
 
         {/* 💬 말풍선 */}
-        <div className="relative ml-6 -translate-y-12 max-w-[520px] bg-white px-10 py-8 rounded-[2.2rem] shadow-[0_20px_40px_rgba(0,0,0,0.12)]">
-          {/* 말풍선 꼬리 */}
-          <div
-            className="
-              absolute
-              left-[-14px]
-              bottom-1/2
-              -translate-y-1/2
-              w-0 h-0
-              border-t-[10px] border-t-transparent
-              border-b-[10px] border-b-transparent
-              border-r-[16px] border-r-white
-            "
-          />
+        <div className="relative ml-6 -translate-y-12 max-w-[520px] bg-white px-10 py-8 rounded-[2.2rem] shadow-xl">
+          <div className="absolute left-[-14px] bottom-1/2 -translate-y-1/2 w-0 h-0 border-t-[10px] border-b-[10px] border-r-[16px] border-transparent border-r-white" />
 
-          <p className="text-[22px] font-medium leading-relaxed whitespace-pre-line">
+          <p className="text-[22px] leading-relaxed whitespace-pre-line">
             {bubbleText}
           </p>
 
           {(showKeywords && currentIntent) || showIdleKeywords ? (
-            <>
-              <p className="mt-6 text-sm text-neutral-500">
-                어떤 문의를 도와드릴까요?
-              </p>
-
-              <div className="mt-4 grid grid-cols-2 gap-3">
-                {(showKeywords && currentIntent
-                  ? INTENT_UI_KEYWORDS[currentIntent]
-                  : INTENT_UI_KEYWORDS.NONE
-                ).map((kw) => (
-                  <button
-                    key={kw}
-                    onClick={() => {
-                      wsRef.current?.send(
-                        JSON.stringify({ type: "ui_keyword", text: kw })
-                      )
-                      setShowKeywords(false)
-                    }}
-                    className="
-                      py-3 px-4
-                      rounded-full
-                      border border-neutral-300
-                      bg-white
-                      text-[16px]
-                      font-semibold
-                      text-neutral-800
-                      hover:bg-neutral-100
-                      active:scale-[0.97]
-                      transition
-                    "
-                  >
-                    {kw}
-                  </button>
-                ))}
-              </div>
-            </>
+            <div className="mt-4 grid grid-cols-2 gap-3">
+              {(showKeywords && currentIntent
+                ? INTENT_UI_KEYWORDS[currentIntent]
+                : INTENT_UI_KEYWORDS.NONE
+              ).map((kw) => (
+                <button
+                  key={kw}
+                  onClick={() =>
+                    wsRef.current?.send(
+                      JSON.stringify({ type: "ui_keyword", text: kw })
+                    )
+                  }
+                  className="py-3 px-4 rounded-full border font-semibold hover:bg-neutral-100 transition"
+                >
+                  {kw}
+                </button>
+              ))}
+            </div>
           ) : null}
         </div>
       </div>

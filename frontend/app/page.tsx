@@ -22,13 +22,13 @@ const WS_BASE = "ws://127.0.0.1:8000/ws/voice"
 const API_BASE = "http://127.0.0.1:8000"
 
 const INTENT_UI_KEYWORDS: Record<Intent, string[]> = {
-  EXIT: ["차단기 안 열림", "출차 안 됨", "차량 인식 안 됨", "출구에서 멈춤", "기타"],
-  ENTRY: ["입차 안 됨", "차단기 안 열림", "차량 인식 안 됨", "만차로 표시됨", "기타"],
-  PAYMENT: ["결제 안 됨", "카드 오류", "요금 이상", "결제 방법 문의", "기타"],
-  REGISTRATION: ["차량 등록", "방문자 등록", "등록 방법 문의", "등록했는데 안 됨", "기타"],
-  TIME_PRICE: ["주차 시간 문의", "요금 문의", "할인 적용 문의", "요금 기준", "기타"],
-  FACILITY: ["기기 멈춤", "화면 안 보임", "버튼 안 됨", "차단기 이상", "기타"],
-  NONE: ["출차 관련", "입차 관련", "결제 관련", "등록 관련", "기타 문의"],
+  EXIT: ["차단기 안 열림", "출차 안 됨", "차량 인식 안 됨", "출구에서 멈춤", "기타", "관리실 호출"],
+  ENTRY: ["입차 안 됨", "차단기 안 열림", "차량 인식 안 됨", "만차로 표시됨", "기타", "관리실 호출"],
+  PAYMENT: ["결제 안 됨", "카드 오류", "요금 이상", "결제 방법 문의", "기타", "관리실 호출"],
+  REGISTRATION: ["차량 등록", "방문자 등록", "등록 방법 문의", "등록했는데 안 됨", "기타", "관리실 호출"],
+  TIME_PRICE: ["주차 시간 문의", "요금 문의", "할인 적용 문의", "요금 기준", "기타", "관리실 호출"],
+  FACILITY: ["기기 멈춤", "화면 안 보임", "버튼 안 됨", "차단기 이상", "기타", "관리실 호출"],
+  NONE: ["출차 관련", "입차 관련", "결제 관련", "방문등록 관련", "기타 문의", "관리실 호출"],
 }
 
 export default function Home() {
@@ -43,12 +43,10 @@ export default function Home() {
   }
 
   const [bubbleText, setBubbleText] = useState(
-    "문의하실 내용이 있으시면\n저를 눌러주세요."
+    "문의하실 내용이 있으시면\n저를 누르고 말씀해주세요."
   )
 
   const [active, setActive] = useState(false)
-
-  // ⭐ 원턴 키워드 UI 상태
   const [showKeywords, setShowKeywords] = useState(false)
   const [currentIntent, setCurrentIntent] = useState<Intent | null>(null)
 
@@ -59,9 +57,6 @@ export default function Home() {
   const audioCtxRef = useRef<AudioContext | null>(null)
   const streamRef = useRef<MediaStream | null>(null)
 
-  /* ===============================
-     마이크 하드 차단 / 복구
-  =============================== */
   const muteMicHard = () => {
     streamRef.current?.getAudioTracks().forEach(t => (t.enabled = false))
   }
@@ -78,6 +73,9 @@ export default function Home() {
 
     setActive(true)
     setStatus("listening")
+    setBubbleText("말씀해 주세요.")
+    setShowKeywords(false)
+    setCurrentIntent(null)
 
     const ws = new WebSocket(WS_BASE)
     ws.binaryType = "arraybuffer"
@@ -87,7 +85,6 @@ export default function Home() {
       try {
         const data = JSON.parse(event.data)
 
-        /* THINKING */
         if (data.type === "assistant_state" && data.state === "THINKING") {
           setStatus("thinking")
           setBubbleText("잠시만요…\n생각 중이에요.")
@@ -95,13 +92,11 @@ export default function Home() {
           return
         }
 
-        /* ASSISTANT MESSAGE */
         if (data.type === "assistant_message") {
           const { text, tts_url, end_session, one_turn, intent } = data
 
           if (text) setBubbleText(text)
 
-          // ⭐ 원턴일 때만 키워드 표시
           if (one_turn && intent) {
             setShowKeywords(true)
             setCurrentIntent(intent)
@@ -132,9 +127,9 @@ export default function Home() {
           if (end_session) {
             setStatus("idle")
             setActive(false)
+            setBubbleText("문의하실 내용이 있으시면\n저를 누르고 말씀해주세요.")
             setShowKeywords(false)
             setCurrentIntent(null)
-            setBubbleText("문의하실 내용이 있으시면\n저를 눌러주세요.")
           }
         }
       } catch (e) {
@@ -142,7 +137,6 @@ export default function Home() {
       }
     }
 
-    /* ---------- Microphone ---------- */
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: {
         echoCancellation: true,
@@ -168,13 +162,14 @@ export default function Home() {
     }
   }
 
+  const showIdleKeywords = status === "idle" && !active
+
   /* ===============================
      UI
   =============================== */
   return (
-    <main className="min-h-screen bg-gradient-to-br from-emerald-50 via-sky-50 to-white flex items-center justify-center px-6 text-neutral-800">
+    <main className="min-h-screen bg-gradient-to-br from-emerald-50 via-sky-50 to-white flex items-center justify-center px-6 text-neutral-800 font-[Pretendard]">
 
-      {/* ✅ PARKMATE 헤더 유지 */}
       <header className="absolute top-8 text-center select-none">
         <h1 className="text-4xl font-semibold tracking-[0.35em]">
           PARKMATE
@@ -185,53 +180,34 @@ export default function Home() {
       </header>
 
       <div className="relative flex items-center">
-        {/* 🤖 루미 */}
+        {/* 🤖 지미 */}
         <div
           onClick={startVoice}
-          className="relative z-10 cursor-pointer select-none"
+          className={`
+            relative z-10 cursor-pointer select-none
+            ${status === "thinking" ? "animate-bounce" : ""}
+          `}
         >
-          <div
-            className={`
-              relative w-56 h-40 rounded-[2.5rem] bg-white shadow-2xl
-              flex items-center justify-center
-              ${
-                status === "speaking"
-                  ? "animate-pulse"
-                  : status === "thinking"
-                  ? "animate-bounce"
-                  : ""
-              }
-            `}
-          >
+          <div className="w-56 h-40 rounded-[2.5rem] bg-white shadow-2xl flex items-center justify-center">
             <div className="w-44 h-28 rounded-2xl bg-gradient-to-br from-emerald-300 to-sky-400 flex items-center justify-center gap-6">
               <span className="w-4 h-4 bg-white rounded-full" />
               <span className="w-4 h-4 bg-white rounded-full" />
             </div>
           </div>
-
           <p className="mt-4 text-center text-base text-neutral-500">
             지미 · 주차 안내 파트너
           </p>
         </div>
 
         {/* 💬 말풍선 */}
-        <div
-          className={`
-            relative ml-6 -translate-y-12
-            max-w-[520px]
-            bg-white
-            px-10 py-8
-            rounded-[2.2rem]
-            shadow-[0_20px_40px_rgba(0,0,0,0.12)]
-            transition-all duration-300
-            ${status === "thinking" ? "animate-pulse" : ""}
-          `}
-        >
+        <div className="relative ml-6 -translate-y-12 max-w-[520px] bg-white px-10 py-8 rounded-[2.2rem] shadow-[0_20px_40px_rgba(0,0,0,0.12)]">
+          {/* 말풍선 꼬리 */}
           <div
             className="
               absolute
               left-[-14px]
-              bottom-[28px]
+              bottom-1/2
+              -translate-y-1/2
               w-0 h-0
               border-t-[10px] border-t-transparent
               border-b-[10px] border-b-transparent
@@ -239,37 +215,39 @@ export default function Home() {
             "
           />
 
-          <p className="text-2xl font-semibold leading-relaxed whitespace-pre-line break-words">
+          <p className="text-[22px] font-medium leading-relaxed whitespace-pre-line">
             {bubbleText}
           </p>
 
-          {/* ⭐ 원턴 키워드 UI (추가된 부분) */}
-          {showKeywords && currentIntent && (
+          {(showKeywords && currentIntent) || showIdleKeywords ? (
             <>
               <p className="mt-6 text-sm text-neutral-500">
-                이 중 어떤 문의가 있으실까요?
+                어떤 문의를 도와드릴까요?
               </p>
 
               <div className="mt-4 grid grid-cols-2 gap-3">
-                {INTENT_UI_KEYWORDS[currentIntent].map((kw) => (
+                {(showKeywords && currentIntent
+                  ? INTENT_UI_KEYWORDS[currentIntent]
+                  : INTENT_UI_KEYWORDS.NONE
+                ).map((kw) => (
                   <button
                     key={kw}
                     onClick={() => {
                       wsRef.current?.send(
-                        JSON.stringify({
-                          type: "ui_keyword",
-                          text: kw,
-                        })
+                        JSON.stringify({ type: "ui_keyword", text: kw })
                       )
                       setShowKeywords(false)
                     }}
                     className="
                       py-3 px-4
-                      rounded-xl
+                      rounded-full
                       border border-neutral-300
                       bg-white
-                      text-base
+                      text-[16px]
+                      font-semibold
+                      text-neutral-800
                       hover:bg-neutral-100
+                      active:scale-[0.97]
                       transition
                     "
                   >
@@ -278,7 +256,7 @@ export default function Home() {
                 ))}
               </div>
             </>
-          )}
+          ) : null}
         </div>
       </div>
     </main>

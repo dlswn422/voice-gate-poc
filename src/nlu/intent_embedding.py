@@ -1,215 +1,212 @@
-from src.nlu.llm_client import detect_intent_llm
-from src.nlu.intent_schema import Intent
-from src.engine.intent_logger import log_intent, log_dialog
-from src.nlu.dialog_llm_client import dialog_llm_chat
+from __future__ import annotations
 
-import uuid
-import time
-import re
+"""
+임베딩 기반 1차 의도 분류 모듈 (운영 최종본)
 
+이 모듈의 역할은 "정답을 맞히는 것"이 아니다.
 
-# --------------------------------------------------
-# 정책 설정
-# --------------------------------------------------
-CONFIDENCE_THRESHOLD = 0.75
-SITE_ID = "parkassist_local"
+설계 목적
+--------------------------------------------------
+- 1차 의도 분류를 '빠른 라우팅 단계'로 사용한다
+- 확신 있는 경우에만 intent를 확정한다
+- 애매한 경우에는 절대 억지로 분류하지 않는다
+- LLM은 여기서 절대 호출하지 않는다
+- 애매한 케이스는 Decision Layer(AppEngine)에서
+  2차 대화형 모델로 자연스럽게 넘긴다
+
+핵심 철학
+--------------------------------------------------
+❌ 이 단계에서 모든 걸 맞히려 하지 않는다
+✅ 이 단계에서 "자동화해도 안전한 것"만 처리한다
+"""
+
+import numpy as np
+from typing import Dict, List
+
+from sentence_transformers import SentenceTransformer
+from src.nlu.intent_schema import Intent, IntentResult
 
 
 # ==================================================
-# 원턴 응답 템플릿
+# Embedding Model
+#
+# - 의미 유사도 계산 전용
+# - 분류기 ❌ / 추론기 ❌
+# - 빠르고 안정적인 CPU 모델
 # ==================================================
-ONE_TURN_RESPONSES = {
-    Intent.EXIT: "출차하려면 요금 정산이 완료되어야 차단기가 열립니다. 혹시 정산은 이미 하셨나요?",
-    Intent.ENTRY: "입차 시 차량이 인식되면 차단기가 자동으로 열립니다.",
-    Intent.PAYMENT: "주차 요금은 정산기나 출구에서 결제하실 수 있습니다.",
-    Intent.REGISTRATION: "차량이나 방문자 등록은 키오스크에서 진행하실 수 있습니다.",
-    Intent.TIME_PRICE: "주차 시간과 요금은 키오스크 화면에서 확인하실 수 있습니다.",
-    Intent.FACILITY: "기기 이상 시 관리실로 문의해 주세요.",
+_EMBEDDING_MODEL = SentenceTransformer(
+    "sentence-transformers/all-MiniLM-L6-v2"
+)
+
+
+# ==================================================
+# Intent Prototype 문장
+#
+# - 실제 STT 발화 스타일
+# - 규칙 설명 ❌
+# - 의미 anchor 용도
+# ==================================================
+INTENT_PROTOTYPES: Dict[Intent, List[str]] = {
+    Intent.EXIT: [
+        "출차하려는데 안 열려요",
+        "차를 빼려고 합니다",
+        "출구에서 멈췄어요",
+        "차단기가 안 올라가요",
+    ],
+    Intent.ENTRY: [
+        "입차하려는데 안 열려요",
+        "차가 인식이 안 돼요",
+        "들어가려고 하는데 막혔어요",
+    ],
+    Intent.PAYMENT: [
+        "주차비 결제가 안 돼요",
+        "요금이 이상해요",
+        "정산을 못 했어요",
+        "결제 어디서 해요",
+    ],
+    Intent.REGISTRATION: [
+        "차량 등록해야 하나요",
+        "방문자 등록 어디서 해요",
+    ],
+    Intent.TIME_PRICE: [
+        "주차 시간 얼마나 됐어요",
+        "요금 기준이 어떻게 돼요",
+        "얼마 나왔는지 알고 싶어요",
+    ],
+    Intent.FACILITY: [
+        "기계가 고장난 것 같아요",
+        "차단기가 멈췄어요",
+        "기기가 안 돼요",
+    ],
+    Intent.COMPLAINT: [
+        "왜 안 되는 거죠",
+        "너무 불편해요",
+        "짜증나요",
+        "이상해요",
+    ],
 }
 
 
-DONE_KEYWORDS = [
-    "됐어요", "되었습니다", "해결", "괜찮아요",
-    "그만", "종료", "끝", "마칠게",
-    "고마워", "감사", "안녕",
-]
-FAREWELL_TEXT = "네, 이용해 주셔서 감사합니다. 안녕히 가세요."
-DONE_COOLDOWN_SEC = 1.2
+# ==================================================
+# Intent별 자동 확정 기준
+#
+# NONE 증가 = 실패 ❌
+# NONE 증가 = 안전성 ⭕
+# ==================================================
+INTENT_THRESHOLDS: Dict[Intent, float] = {
+    Intent.EXIT: 0.72,
+    Intent.ENTRY: 0.72,
+    Intent.PAYMENT: 0.72,
+    Intent.TIME_PRICE: 0.68,
+    Intent.REGISTRATION: 0.68,
+    Intent.FACILITY: 0.65,
+    Intent.COMPLAINT: 0.60,
+}
+
+# top1 / top2 유사도 차이 기준
+GAP_THRESHOLD = 0.015
 
 
-def _normalize(text: str) -> str:
-    t = text.strip().lower()
-    return re.sub(r"[\s\.\,\!\?]+", "", t)
+# ==================================================
+# 도메인 키워드 보정
+#
+# - 임베딩을 뒤엎지 않음
+# - 상식 수준의 미세 보정만
+# ==================================================
+KEYWORD_BOOST: Dict[Intent, List[str]] = {
+    Intent.PAYMENT: ["결제", "카드", "정산", "요금", "주차비"],
+    Intent.EXIT: ["출차", "출구", "나가"],
+    Intent.ENTRY: ["입차", "들어가"],
+    Intent.REGISTRATION: ["등록", "번호판", "방문"],
+}
+
+KEYWORD_BOOST_SCORE = 0.06  # 절대 키우지 말 것
 
 
-def _is_done_utterance(text: str) -> bool:
-    t = _normalize(text)
-    return any(k.replace(" ", "") in t for k in DONE_KEYWORDS)
+# ==================================================
+# Prototype Embedding 사전 계산
+# ==================================================
+_INTENT_EMBEDDINGS: Dict[Intent, np.ndarray] = {}
+
+for intent, sentences in INTENT_PROTOTYPES.items():
+    vecs = _EMBEDDING_MODEL.encode(
+        sentences,
+        normalize_embeddings=True,
+    )
+    _INTENT_EMBEDDINGS[intent] = np.mean(vecs, axis=0)
 
 
-class AppEngine:
+def _cosine(a: np.ndarray, b: np.ndarray) -> float:
+    """normalize_embeddings=True → dot = cosine"""
+    return float(np.dot(a, b))
+
+
+# ==================================================
+# 최종 1차 의도 분류
+# ==================================================
+def detect_intent_embedding(text: str) -> IntentResult:
     """
-    상태 기반 CX AppEngine (FINAL)
+    임베딩 + 도메인 바이어스 기반 1차 의도 분류
 
-    상태:
-    - FIRST_STAGE  : 첫 발화
-    - ONE_TURN     : 원턴 응답 직후
-    - SECOND_STAGE : 멀티턴 상담
+    ❌ 틀릴 바엔 확정하지 않는다
+    ⭕ 확실할 때만 자동화한다
     """
 
-    def __init__(self):
-        self.state = "FIRST_STAGE"
+    print("\n" + "=" * 60)
+    print(f"[INTENT-EMBEDDING] Input text: {text}")
 
-        self.session_id = None
-        self.intent_log_id = None
-        self.first_intent = None
+    if not text or not text.strip():
+        print("[INTENT-EMBEDDING] Empty input → NONE")
+        return IntentResult(intent=Intent.NONE, confidence=0.0)
 
-        self.dialog_turn_index = 0
-        self.dialog_history = []
+    # 1️⃣ 사용자 발화 임베딩
+    user_vec = _EMBEDDING_MODEL.encode(
+        text,
+        normalize_embeddings=True,
+    )
 
-        self._ignore_until_ts = 0.0
+    # 2️⃣ 유사도 계산
+    scores: Dict[Intent, float] = {}
+    for intent, proto_vec in _INTENT_EMBEDDINGS.items():
+        scores[intent] = _cosine(user_vec, proto_vec)
 
-    # --------------------------------------------------
-    # 세션 보장
-    # --------------------------------------------------
-    def _ensure_session(self):
-        if not self.session_id:
-            self.session_id = str(uuid.uuid4())
-            self.dialog_turn_index = 0
-            self.dialog_history = []
+    # 3️⃣ 키워드 보정
+    for intent, keywords in KEYWORD_BOOST.items():
+        if any(k in text for k in keywords):
+            scores[intent] += KEYWORD_BOOST_SCORE
+            print(
+                f"[INTENT-EMBEDDING] 🔑 Keyword boost → "
+                f"{intent.value} (+{KEYWORD_BOOST_SCORE})"
+            )
 
-    # --------------------------------------------------
-    # dialog 로그
-    # --------------------------------------------------
-    def _log_dialog(self, role, content, model="stt"):
-        self._ensure_session()
-        self.dialog_turn_index += 1
-        log_dialog(
-            intent_log_id=self.intent_log_id,
-            session_id=self.session_id,
-            role=role,
-            content=content,
-            model=model,
-            turn_index=self.dialog_turn_index,
-        )
-        if role in ("user", "assistant"):
-            self.dialog_history.append({"role": role, "content": content})
+    # 4️⃣ 정렬
+    sorted_scores = sorted(
+        scores.items(), key=lambda x: x[1], reverse=True
+    )
 
-    # --------------------------------------------------
-    # 멀티턴 처리
-    # --------------------------------------------------
-    def _handle_second_stage(self, text: str):
-        if time.time() < self._ignore_until_ts:
-            return
+    for intent, score in sorted_scores:
+        print(f"  - {intent.value:<15} : {score:.4f}")
 
-        if _is_done_utterance(text):
-            self._log_dialog("user", text)
-            self._log_dialog("assistant", FAREWELL_TEXT, model="system")
-            print(f"[DIALOG] {FAREWELL_TEXT}")
-            self.end_session()
-            self._ignore_until_ts = time.time() + DONE_COOLDOWN_SEC
-            return
+    top_intent, top_score = sorted_scores[0]
+    second_score = sorted_scores[1][1]
+    gap = top_score - second_score
+    threshold = INTENT_THRESHOLDS.get(top_intent, 0.7)
 
-        self._log_dialog("user", text)
+    print(
+        f"[INTENT-EMBEDDING] Top={top_intent.value}, "
+        f"Score={top_score:.4f}, Gap={gap:.4f}"
+    )
 
-        res = dialog_llm_chat(
-            text,
-            history=self.dialog_history,
-            context={
-                "session_id": self.session_id,
-                "intent_log_id": self.intent_log_id,
-                "first_intent": self.first_intent,
-            },
-            debug=True,
+    # 5️⃣ 자동 확정 판단
+    if top_score >= threshold and gap >= GAP_THRESHOLD:
+        print(f"[INTENT-EMBEDDING] ✅ CONFIRMED → {top_intent.value}")
+        return IntentResult(
+            intent=top_intent,
+            confidence=float(top_score),
         )
 
-        reply = getattr(res, "reply", "") or ""
-        self._log_dialog("assistant", reply, model="llama-3.1-8b")
-        print(f"[DIALOG] {reply}")
-
-    # --------------------------------------------------
-    # STT 텍스트 엔트리포인트
-    # --------------------------------------------------
-    def handle_text(self, text: str):
-        if not text or not text.strip():
-            return
-        if time.time() < self._ignore_until_ts:
-            return
-
-        print("=" * 50)
-        print(f"[ENGINE] State={self.state}")
-        print(f"[ENGINE] Text={text}")
-
-        # --------------------------------------------------
-        # SECOND_STAGE
-        # --------------------------------------------------
-        if self.state == "SECOND_STAGE":
-            self._handle_second_stage(text)
-            print("=" * 50)
-            return
-
-        # --------------------------------------------------
-        # ONE_TURN → 무조건 멀티턴 승격
-        # --------------------------------------------------
-        if self.state == "ONE_TURN":
-            print("[ENGINE] ONE_TURN follow-up → SECOND_STAGE")
-            self.state = "SECOND_STAGE"
-            self._handle_second_stage(text)
-            print("=" * 50)
-            return
-
-        # --------------------------------------------------
-        # FIRST_STAGE
-        # --------------------------------------------------
-        self._ensure_session()
-
-        result = detect_intent_llm(text)
-        print(f"[ENGINE] Intent={result.intent.name}")
-
-        self.intent_log_id = log_intent(
-            utterance=text,
-            predicted_intent=result.intent.value,
-            predicted_confidence=1.0,
-            source="kiosk",
-            site_id=SITE_ID,
-        )
-
-        self.first_intent = result.intent.value
-        self._log_dialog("user", text)
-
-        # 멀티턴 필요 조건
-        if result.intent == Intent.COMPLAINT:
-            print("[ENGINE] Decision: multiturn")
-            self.state = "SECOND_STAGE"
-            self._handle_second_stage(text)
-            print("=" * 50)
-            return
-
-        # --------------------------------------------------
-        # 원턴 응답
-        # --------------------------------------------------
-        reply = ONE_TURN_RESPONSES.get(
-            result.intent,
-            "안내를 도와드릴 수 있는 상담으로 연결하겠습니다."
-        )
-
-        print("[ENGINE] Decision: one-turn")
-        print(f"[ONE-TURN] {reply}")
-
-        self._log_dialog("assistant", reply, model="system")
-        self.state = "ONE_TURN"
-
-        print("=" * 50)
-
-    # --------------------------------------------------
-    # 세션 종료
-    # --------------------------------------------------
-    def end_session(self):
-        print(f"[ENGINE] Session ended: {self.session_id}")
-
-        self.state = "FIRST_STAGE"
-        self.session_id = None
-        self.intent_log_id = None
-        self.first_intent = None
-        self.dialog_turn_index = 0
-        self.dialog_history = []
+    print("[INTENT-EMBEDDING] ⚠️ AMBIGUOUS → NONE")
+    return IntentResult(
+        intent=Intent.NONE,
+        confidence=float(top_score),
+    )

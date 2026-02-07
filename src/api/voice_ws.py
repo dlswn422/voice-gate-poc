@@ -25,10 +25,13 @@ async def voice_ws(websocket: WebSocket):
     collecting = False
     last_non_silence_ts = 0.0
 
+    # 🔥 최초 상태는 반드시 LISTENING
+    app_state.app_engine.state = "LISTENING"
+
     try:
         while True:
             # ==================================================
-            # 0️⃣ WS 메시지 수신 (audio or control)
+            # 0️⃣ 메시지 수신 (audio or control)
             # ==================================================
             message = await websocket.receive()
 
@@ -37,9 +40,11 @@ async def voice_ws(websocket: WebSocket):
                 try:
                     msg = json.loads(message["text"])
                     if msg.get("type") == "tts_end":
-                        # 🔁 TTS 종료 → 다시 청취 가능
+                        # 🔥 여기서 반드시 LISTENING으로 복귀
                         app_state.app_engine.state = "LISTENING"
-                        print("[WS] 🔁 State -> LISTENING")
+                        collecting = False
+                        pcm_buffer.clear()
+                        print("[WS] 🔁 TTS ended → LISTENING")
                         continue
                 except Exception:
                     continue
@@ -61,10 +66,9 @@ async def voice_ws(websocket: WebSocket):
 
             # ==================================================
             # 🔒 2️⃣ 서버 차단 구간
-            # - TTS 재생 중
-            # - 응답 생성/대기 중
             # ==================================================
             if app_state.app_engine.state in ("SPEAKING", "THINKING"):
+                # 🔥 여기서 last_non_silence_ts 갱신 금지
                 collecting = False
                 pcm_buffer.clear()
                 continue

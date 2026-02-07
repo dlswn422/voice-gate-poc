@@ -47,7 +47,7 @@ async def voice_ws(websocket: WebSocket):
     await websocket.accept()
     print("[WS] 🔌 Client connected")
 
-    # IO 상태 (엔진과 분리)
+    # IO 상태 (엔진 상태와 완전히 분리)
     io_state = "LISTENING"   # LISTENING | SPEAKING
 
     pcm_buffer: list[np.ndarray] = []
@@ -65,7 +65,7 @@ async def voice_ws(websocket: WebSocket):
             message = await websocket.receive()
 
             # --------------------------------------------------
-            # 프론트 → TTS 종료 신호
+            # 프론트 → TTS 종료
             # --------------------------------------------------
             if "text" in message:
                 try:
@@ -162,6 +162,12 @@ async def voice_ws(websocket: WebSocket):
                     pcm_buffer.clear()
                     prerun_task = None
                     continue
+
+                # ✅ THINKING 상태를 서버가 명시적으로 보냄
+                await safe_send(websocket, {
+                    "type": "assistant_state",
+                    "state": "THINKING",
+                })
 
                 if prerun_task:
                     try:

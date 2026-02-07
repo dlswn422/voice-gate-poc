@@ -7,9 +7,6 @@ type Status = "idle" | "listening" | "thinking" | "speaking"
 const WS_BASE = "ws://127.0.0.1:8000/ws/voice"
 const API_BASE = "http://127.0.0.1:8000"
 
-// 🔥 말 끝났다고 느끼는 UX 기준
-const THINKING_DELAY_MS = 700
-
 export default function Home() {
   /* ===============================
      상태
@@ -33,8 +30,6 @@ export default function Home() {
   const audioCtxRef = useRef<AudioContext | null>(null)
   const streamRef = useRef<MediaStream | null>(null)
 
-  const silenceTimerRef = useRef<NodeJS.Timeout | null>(null)
-
   /* ===============================
      마이크 하드 차단 / 복구
   =============================== */
@@ -44,29 +39,6 @@ export default function Home() {
 
   const unmuteMicHard = () => {
     streamRef.current?.getAudioTracks().forEach(t => (t.enabled = true))
-  }
-
-  /* ===============================
-     THINKING 타이머
-  =============================== */
-  const resetSilenceTimer = () => {
-    if (silenceTimerRef.current) {
-      clearTimeout(silenceTimerRef.current)
-    }
-
-    silenceTimerRef.current = setTimeout(() => {
-      if (statusRef.current === "listening") {
-        setStatus("thinking")
-        setBubbleText("잠시만요…\n생각 중이에요.")
-      }
-    }, THINKING_DELAY_MS)
-  }
-
-  const clearSilenceTimer = () => {
-    if (silenceTimerRef.current) {
-      clearTimeout(silenceTimerRef.current)
-      silenceTimerRef.current = null
-    }
   }
 
   /* ===============================
@@ -88,12 +60,11 @@ export default function Home() {
         const data = JSON.parse(event.data)
 
         /* ===============================
-           ✅ THINKING 상태 (서버 즉시 신호)
+           🧠 THINKING (서버 신호 ONLY)
         =============================== */
         if (data.type === "assistant_state" && data.state === "THINKING") {
-          clearSilenceTimer()
           setStatus("thinking")
-          setBubbleText("잠시만요…\n확인 중이에요.")
+          setBubbleText("잠시만요…\n생각 중이에요.")
           return
         }
 
@@ -101,8 +72,6 @@ export default function Home() {
            🤖 실제 응답
         =============================== */
         if (data.type === "assistant_message") {
-          clearSilenceTimer()
-
           const { text, tts_url, end_session } = data
 
           if (text) {
@@ -167,7 +136,6 @@ export default function Home() {
       if (statusRef.current !== "listening") return
       if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return
 
-      resetSilenceTimer()
       wsRef.current.send(e.inputBuffer.getChannelData(0).buffer)
     }
   }
@@ -230,7 +198,6 @@ export default function Home() {
             ${status === "thinking" ? "animate-pulse" : ""}
           `}
         >
-          {/* 🗨️ 꼬리 – 말풍선과 '붙어있는' 느낌 */}
           <div
             className="
               absolute

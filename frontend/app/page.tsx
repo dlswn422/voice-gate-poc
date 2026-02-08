@@ -42,10 +42,7 @@ export default function Home() {
     _setStatus(s)
   }
 
-  const [bubbleText, setBubbleText] = useState(
-    "어떤 문의가 있으실까요?"
-  )
-
+  const [bubbleText, setBubbleText] = useState("어떤 문의가 있으실까요?")
   const [active, setActive] = useState(false)
   const [showKeywords, setShowKeywords] = useState(false)
   const [currentIntent, setCurrentIntent] = useState<Intent | null>(null)
@@ -68,7 +65,7 @@ export default function Home() {
   }
 
   /* ===============================
-     음성 시작 (문제 상황에서만)
+     음성 상담 (출차 문제만)
 =============================== */
   const startVoice = async () => {
     if (active) return
@@ -91,7 +88,6 @@ export default function Home() {
         if (data.type === "assistant_state" && data.state === "THINKING") {
           setStatus("thinking")
           setBubbleText("잠시만요…\n확인 중이에요.")
-          setShowKeywords(false)
           return
         }
 
@@ -101,8 +97,6 @@ export default function Home() {
           if (system_action === "CALL_ADMIN") {
             muteMicHard()
             setShowAdminPopup(true)
-            setShowKeywords(false)
-            setCurrentIntent(null)
 
             setTimeout(() => {
               setShowAdminPopup(false)
@@ -149,7 +143,7 @@ export default function Home() {
           }
         }
       } catch (e) {
-        console.error("[WS] parse error", e)
+        console.error(e)
       }
     }
 
@@ -175,7 +169,7 @@ export default function Home() {
   }
 
   /* ===============================
-     번호판 업로드 (유일한 시작점)
+     번호판 업로드
 =============================== */
   const handlePlateUpload = async (file: File) => {
     if (active) return
@@ -198,25 +192,21 @@ export default function Home() {
         setStatus("idle")
         return
       }
-      
-      // ENTRY
-      if (data.direction === "ENTRY") {
-        setBubbleText(data.message)
-        setStatus("idle")
 
-        if (data.tts_url) {
-          const audio = new Audio(
-            data.tts_url.startsWith("http")
-              ? data.tts_url
-              : `${API_BASE}${data.tts_url}`
-          )
-          audio.play()
-        }
+      setBubbleText(data.message)
+      setStatus("idle")
+
+      if (data.tts_url) {
+        const audio = new Audio(
+          data.tts_url.startsWith("http")
+            ? data.tts_url
+            : `${API_BASE}${data.tts_url}`
+        )
+        audio.play()
       }
 
-      // EXIT
-      if (data.direction === "EXIT") {
-        setBubbleText("출차 차량으로 확인됐어요.\n문제가 있으시면 말씀해 주세요.")
+      // 🔥 출차 + 결제 안됨 → 음성 상담
+      if (data.direction === "EXIT" && data.paid === false) {
         startVoice()
       }
 
@@ -241,6 +231,8 @@ export default function Home() {
 =============================== */
   return (
     <main className="min-h-screen bg-gradient-to-br from-emerald-50 via-sky-50 to-white flex items-center justify-center px-6 font-[Pretendard]">
+
+      {/* 🔔 관리실 팝업 */}
       {showAdminPopup && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm">
           <div className="bg-white rounded-2xl px-10 py-8 shadow-2xl text-center">
@@ -250,6 +242,7 @@ export default function Home() {
         </div>
       )}
 
+      {/* 🔝 PARKMATE 헤더 */}
       <header className="absolute top-8 text-center">
         <h1 className="text-4xl font-semibold tracking-[0.35em]">PARKMATE</h1>
         <p className="mt-1 text-xs tracking-[0.35em] text-neutral-400 uppercase">
@@ -258,6 +251,7 @@ export default function Home() {
       </header>
 
       <div className="relative flex items-center">
+        {/* 🤖 지미 */}
         <div className={`${status === "thinking" ? "animate-bounce" : ""}`}>
           <div className="w-56 h-40 rounded-[2.5rem] bg-white shadow-2xl flex items-center justify-center">
             <div className="w-44 h-28 rounded-2xl bg-gradient-to-br from-emerald-300 to-sky-400 flex items-center justify-center gap-6">
@@ -268,9 +262,15 @@ export default function Home() {
           <p className="mt-4 text-center text-neutral-500">지미 · 주차 안내 파트너</p>
         </div>
 
+        {/* 💬 말풍선 */}
         <div className="relative ml-6 -translate-y-12 max-w-[520px] bg-white px-10 py-8 rounded-[2.2rem] shadow-xl">
-          <div className="absolute left-[-14px] bottom-1/2 -translate-y-1/2 w-0 h-0 border-t-[10px] border-b-[10px] border-r-[16px] border-transparent border-r-white" />
-          <p className="text-[22px] leading-relaxed whitespace-pre-line">{bubbleText}</p>
+          <div className="absolute left-[-14px] bottom-1/2 -translate-y-1/2 w-0 h-0
+            border-t-[10px] border-b-[10px] border-r-[16px]
+            border-transparent border-r-white" />
+
+          <p className="text-[22px] leading-relaxed whitespace-pre-line">
+            {bubbleText}
+          </p>
 
           {(showKeywords && currentIntent) || showIdleKeywords ? (
             <div className="mt-4 grid grid-cols-2 gap-3">
@@ -293,6 +293,7 @@ export default function Home() {
         </div>
       </div>
 
+      {/* 🚗 번호판 업로드 */}
       <div className="absolute bottom-12 flex flex-col items-center gap-2">
         <input
           ref={plateInputRef}

@@ -36,7 +36,6 @@ def normalize_plate(text: str) -> str:
 
 
 def extract_plate(image: np.ndarray) -> str | None:
-    print("[PLATE] Running OCR...")
     results = reader.readtext(image)
 
     for _, text, conf in results:
@@ -54,15 +53,13 @@ def extract_plate(image: np.ndarray) -> str | None:
 
 
 # =========================
-# DB 기반 입출차 판별 + 입차 INSERT
+# DB 기반 입출차 판별 + 정책 처리
 # =========================
-def resolve_direction_and_insert(plate: str):
-    print(f"[LOGIC] Resolve direction for plate={plate}")
-
+def resolve_direction_and_process(plate: str):
     conn = get_conn()
     cur = conn.cursor()
 
-    # 1️⃣ vehicle 조회
+    # 1️⃣ vehicle 조회 or 생성
     cur.execute("""
         SELECT id
         FROM vehicle
@@ -71,9 +68,7 @@ def resolve_direction_and_insert(plate: str):
     """, (plate,))
     vehicle = cur.fetchone()
 
-    # vehicle 없으면 생성
     if not vehicle:
-        print("[DB] Vehicle not found → creating new vehicle")
         cur.execute("""
             INSERT INTO vehicle (
                 plate_number,
@@ -99,12 +94,10 @@ def resolve_direction_and_insert(plate: str):
     """, (vehicle_id,))
     session = cur.fetchone()
 
-    # =========================
+    # ==================================================
     # ENTRY
-    # =========================
+    # ==================================================
     if not session:
-        print("[LOGIC] ENTRY 판단")
-
         cur.execute("""
             SELECT COUNT(*) AS count
             FROM parking_session
@@ -116,15 +109,14 @@ def resolve_direction_and_insert(plate: str):
         capacity = cur.fetchone()["capacity"]
 
         is_full = active_count >= capacity
-        print(f"[LOGIC] active={active_count}, capacity={capacity}, is_full={is_full}")
 
         if is_full:
             message = (
                 "현재 주차장이 만차입니다.\n"
                 "근처 이용 가능한 주차장을 안내해드릴게요."
             )
+            barrier_open = False
         else:
-            print("[DB] INSERT parking_session (ENTRY)")
             cur.execute("""
                 INSERT INTO parking_session (
                     vehicle_id,
@@ -137,51 +129,66 @@ def resolve_direction_and_insert(plate: str):
             conn.commit()
 
             message = "입차가 확인되었습니다.\n차단기가 열립니다."
+            barrier_open = True
 
         conn.close()
-
-        tts_url = synthesize(message)
-
         return {
             "direction": "ENTRY",
-            "is_full": is_full,
+            "barrier_open": barrier_open,
             "message": message,
-            "tts_url": tts_url,
-            "session": {
-                "exists": False,
-                "paid": False
-            }
+            "tts_url": synthesize(message),
+            "end_session": True,
         }
 
-    # =========================
+    # ==================================================
     # EXIT
-    # =========================
+    # ==================================================
     session_id = session["id"]
-    print(f"[LOGIC] EXIT 판단, session_id={session_id}")
 
     cur.execute("""
         SELECT id
         FROM payment
         WHERE parking_session_id = %s
-          AND status = 'PAID'
+          AND payment_status = 'PAID'
         LIMIT 1
     """, (session_id,))
     payment = cur.fetchone()
 
+    # ✅ 결제 완료 → 즉시 출차
+    if payment:
+        cur.execute("""
+            UPDATE parking_session
+            SET exit_time = now(),
+                status = 'EXITED'
+            WHERE id = %s
+        """, (session_id,))
+        conn.commit()
+        conn.close()
+
+        message = "결제가 확인되었습니다.\n안전하게 출차하세요."
+        return {
+            "direction": "EXIT",
+            "paid": True,
+            "barrier_open": True,
+            "message": message,
+            "tts_url": synthesize(message),
+            "end_session": True,
+        }
+
+    # ❌ 결제 미완료 → 상담 유도
     conn.close()
 
-    message = "출차 차량으로 확인되었습니다.\n문제가 있으시면 말씀해 주세요."
-    tts_url = synthesize(message)
-
+    message = (
+        "아직 결제가 확인되지 않았어요.\n"
+        "문제가 있다면 말씀해 주세요."
+    )
     return {
         "direction": "EXIT",
-        "is_full": False,
+        "paid": False,
+        "barrier_open": False,
         "message": message,
-        "tts_url": tts_url,
-        "session": {
-            "exists": True,
-            "paid": bool(payment)
-        }
+        "tts_url": synthesize(message),
+        "end_session": False,
     }
 
 
@@ -190,31 +197,20 @@ def resolve_direction_and_insert(plate: str):
 # =========================
 @router.post("/api/plate/recognize")
 async def recognize_plate(image: UploadFile = File(...)):
-    print("\n==============================")
-    print("[API] /api/plate/recognize called")
-
     contents = await image.read()
-    np_img = np.frombuffer(contents, np.uint8)
-    img = cv2.imdecode(np_img, cv2.IMREAD_COLOR)
+    img = cv2.imdecode(np.frombuffer(contents, np.uint8), cv2.IMREAD_COLOR)
 
     if img is None:
-        print("[API] ❌ Image decode failed")
         return {"success": False, "error": "INVALID_IMAGE"}
 
     plate = extract_plate(img)
-
     if not plate:
         return {"success": False, "error": "PLATE_NOT_FOUND"}
 
-    result = resolve_direction_and_insert(plate)
+    result = resolve_direction_and_process(plate)
 
-    response = {
+    return {
         "success": True,
         "plate": plate,
         **result
     }
-
-    print(f"[API] ✅ Response: {response}")
-    print("==============================\n")
-
-    return response

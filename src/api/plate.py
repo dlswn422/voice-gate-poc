@@ -144,13 +144,13 @@ def resolve_direction_and_process(plate: str):
                     "현재 주차장이 만차입니다.\n"
                     f"근처 {parking['place_name']} 주차장을 추천드려요.\n"
                     f"도보 약 {parking['distance']}미터 거리입니다.\n"
-                    "불편 사항이 있으면 말씀해 주세요."
+                    "혹시 문제가 있으시면 말씀해주세요."
                 )
             else:
                 message = (
                     "현재 주차장이 만차입니다.\n"
                     "근처 주차장을 찾지 못했어요.\n"
-                    "불편 사항이 있으면 말씀해 주세요."
+                    "다른 문제가 있으시면 말씀해주세요."
                 )
 
             return {
@@ -191,8 +191,7 @@ def resolve_direction_and_process(plate: str):
 
         message = (
             "입차가 확인되었습니다.\n"
-            "차단기가 열립니다.\n"
-            "문제가 있으면 말씀해 주세요."
+            "다른 문제가 있으시면 말씀해주세요."
         )
 
         return {
@@ -228,8 +227,7 @@ def resolve_direction_and_process(plate: str):
 
         message = (
             "출차가 확인되었습니다.\n"
-            "안전하게 출차하세요.\n"
-            "문제가 있으면 말씀해 주세요."
+            "다른 문제가 있으시면 말씀해주세요."
         )
 
         return {
@@ -244,7 +242,7 @@ def resolve_direction_and_process(plate: str):
     conn.close()
     message = (
         "아직 결제가 확인되지 않았어요.\n"
-        "불편하신 점을 말씀해 주세요."
+        "다른 문제가 있으시면 말씀해주세요."
     )
 
     return {

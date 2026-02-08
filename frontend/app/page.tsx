@@ -81,12 +81,33 @@ export default function Home() {
       try {
         const data = JSON.parse(event.data)
 
-        if (data.type === "assistant_state" && data.state === "THINKING") {
-          setStatus("thinking")
-          setBubbleText("잠시만요…\n확인 중이에요.")
+        /* =================================================
+           FIX 1️⃣ assistant_state 대칭 처리 (핵심 수정)
+           - THINKING만 처리하던 기존 버그 수정
+           - LISTENING / SPEAKING도 동일하게 반영
+        ================================================= */
+        if (data.type === "assistant_state") {
+          if (data.state === "THINKING") {
+            setStatus("thinking")
+            setBubbleText("잠시만요…\n확인 중이에요.")
+          }
+
+          if (data.state === "LISTENING") {
+            setStatus("listening")
+            // bubbleText는 유지 (서버가 새 메시지를 주지 않았기 때문)
+          }
+
+          if (data.state === "SPEAKING") {
+            setStatus("speaking")
+          }
+
           return
         }
 
+        /* ===============================
+           기존 assistant_message 로직
+           (변경 없음)
+        =============================== */
         if (data.type === "assistant_message") {
           const { text, tts_url, end_session, system_action } = data
 

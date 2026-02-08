@@ -4,6 +4,7 @@ import numpy as np
 import easyocr
 import re
 from datetime import datetime
+import requests
 
 from src.db.postgres import get_conn
 from src.speech.tts import synthesize
@@ -31,13 +32,42 @@ def normalize_plate(text: str) -> str:
 
 def extract_plate(image: np.ndarray) -> str | None:
     results = reader.readtext(image)
-    for _, text, conf in results:
+    for _, text, _ in results:
         cleaned = text.replace(" ", "")
         normalized = normalize_plate(cleaned)
         if PLATE_REGEX.match(normalized):
             print(f"[PLATE] ✅ Plate matched: {normalized}")
             return normalized
     return None
+
+
+# =========================
+# Kakao Local API
+# =========================
+KAKAO_REST_KEY = "ed8389b7bbe2ae8a2b8b3496e4919ecc"
+
+def search_nearby_parking(lat: float, lng: float):
+    url = "https://dapi.kakao.com/v2/local/search/keyword.json"
+    headers = {
+        "Authorization": f"KakaoAK {KAKAO_REST_KEY}"
+    }
+    params = {
+        "query": "주차장",
+        "x": lng,
+        "y": lat,
+        "radius": 500,
+        "size": 1,          # ✅ 1개만 조회
+        "sort": "distance"
+    }
+
+    try:
+        res = requests.get(url, headers=headers, params=params, timeout=3)
+        res.raise_for_status()
+        docs = res.json().get("documents", [])
+        return docs[0] if docs else None
+    except Exception as e:
+        print("[KAKAO] ❌ parking search failed:", e)
+        return None
 
 
 # =========================
@@ -48,9 +78,7 @@ def resolve_direction_and_process(plate: str):
     conn = get_conn()
     cur = conn.cursor()
 
-    # --------------------------------------------------
     # 1️⃣ vehicle 조회 or 생성
-    # --------------------------------------------------
     cur.execute("""
         SELECT id, vehicle_type
         FROM vehicle
@@ -62,18 +90,16 @@ def resolve_direction_and_process(plate: str):
     if not vehicle:
         cur.execute("""
             INSERT INTO vehicle (plate_number, vehicle_type, created_at)
-            VALUES (%s, %s, now())
+            VALUES (%s, 'NORMAL', now())
             RETURNING id, vehicle_type
-        """, (plate, "NORMAL"))
+        """, (plate,))
         vehicle = cur.fetchone()
         conn.commit()
 
     vehicle_id = vehicle["id"]
     vehicle_type = vehicle["vehicle_type"]
 
-    # --------------------------------------------------
     # 2️⃣ 활성 세션 조회
-    # --------------------------------------------------
     cur.execute("""
         SELECT id
         FROM parking_session
@@ -88,7 +114,6 @@ def resolve_direction_and_process(plate: str):
     # 🚗 ENTRY
     # ==================================================
     if not session:
-        # 만차 체크
         cur.execute("""
             SELECT COUNT(*) AS count
             FROM parking_session
@@ -96,22 +121,44 @@ def resolve_direction_and_process(plate: str):
         """)
         active_count = cur.fetchone()["count"]
 
-        cur.execute("SELECT capacity FROM parking_lot LIMIT 1")
-        capacity = cur.fetchone()["capacity"]
+        cur.execute("""
+            SELECT capacity, latitude, longitude
+            FROM parking_lot
+            LIMIT 1
+        """)
+        lot = cur.fetchone()
+        capacity = lot["capacity"]
+        lat = lot["latitude"]
+        lng = lot["longitude"]
 
         # 🚫 만차
         if active_count >= capacity:
             conn.close()
-            message = (
-                "현재 주차장이 만차입니다.\n"
-                "불편 사항이 있으면 말씀해 주세요."
-            )
+
+            parking = None
+            if lat and lng:
+                parking = search_nearby_parking(lat, lng)
+
+            if parking:
+                message = (
+                    "현재 주차장이 만차입니다.\n"
+                    f"근처 {parking['place_name']} 주차장을 추천드려요.\n"
+                    f"도보 약 {parking['distance']}미터 거리입니다.\n"
+                    "불편 사항이 있으면 말씀해 주세요."
+                )
+            else:
+                message = (
+                    "현재 주차장이 만차입니다.\n"
+                    "근처 주차장을 찾지 못했어요.\n"
+                    "불편 사항이 있으면 말씀해 주세요."
+                )
+
             return {
                 "direction": "ENTRY",
                 "barrier_open": False,
                 "message": message,
                 "tts_url": synthesize(message),
-                "end_session": False,  # 🎤 계속 음성 대기
+                "end_session": False,
             }
 
         # ✅ 입차 처리
@@ -147,6 +194,7 @@ def resolve_direction_and_process(plate: str):
             "차단기가 열립니다.\n"
             "문제가 있으면 말씀해 주세요."
         )
+
         return {
             "direction": "ENTRY",
             "barrier_open": True,
@@ -168,7 +216,6 @@ def resolve_direction_and_process(plate: str):
     """, (session_id,))
     payment = cur.fetchone()
 
-    # ✅ 출차 가능
     if payment and payment["payment_status"] in ("PAID", "FREE"):
         cur.execute("""
             UPDATE parking_session
@@ -184,6 +231,7 @@ def resolve_direction_and_process(plate: str):
             "안전하게 출차하세요.\n"
             "문제가 있으면 말씀해 주세요."
         )
+
         return {
             "direction": "EXIT",
             "paid": True,
@@ -193,12 +241,12 @@ def resolve_direction_and_process(plate: str):
             "end_session": False,
         }
 
-    # ❌ 결제 미완료
     conn.close()
     message = (
         "아직 결제가 확인되지 않았어요.\n"
         "불편하신 점을 말씀해 주세요."
     )
+
     return {
         "direction": "EXIT",
         "paid": False,

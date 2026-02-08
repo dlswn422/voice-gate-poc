@@ -15,8 +15,10 @@ from faster_whisper import WhisperModel
 
 import src.app_state as app_state
 from src.engine.app_engine import AppEngine
+
 from src.api.voice import router as voice_router
 from src.api.voice_ws import router as voice_ws_router  # ✅ WebSocket
+from src.api.plate import router as plate_router        # ✅ 번호판 OCR API (신규)
 
 
 # ==================================================
@@ -39,7 +41,6 @@ app.add_middleware(
 # ==================================================
 # Static (TTS mp3 서빙)
 # ==================================================
-# gTTS 결과물: static/tts/*.mp3
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
@@ -52,8 +53,7 @@ def startup():
 
     # 🔥 HTTP / WebSocket 공용 Whisper 모델
     app_state.whisper_model = WhisperModel(
-        #"large-v3",
-        "medium",
+        "medium",            # 기존 그대로
         device="cpu",
         compute_type="int8_float32",
     )
@@ -72,3 +72,6 @@ app.include_router(voice_router)
 
 # 2️⃣ WebSocket API (/ws/voice)
 app.include_router(voice_ws_router)
+
+# 3️⃣ 번호판 OCR API (/api/plate/recognize)
+app.include_router(plate_router)

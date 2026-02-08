@@ -33,7 +33,7 @@ const INTENT_UI_KEYWORDS: Record<Intent, string[]> = {
 
 export default function Home() {
   /* ===============================
-     상태
+     State
   =============================== */
   const [status, _setStatus] = useState<Status>("idle")
   const statusRef = useRef<Status>("idle")
@@ -43,14 +43,12 @@ export default function Home() {
   }
 
   const [bubbleText, setBubbleText] = useState(
-    "문의하실 내용이 있으시면\n저를 누르고 말씀해주세요."
+    "어떤 문의가 있으실까요?"
   )
 
   const [active, setActive] = useState(false)
   const [showKeywords, setShowKeywords] = useState(false)
   const [currentIntent, setCurrentIntent] = useState<Intent | null>(null)
-
-  // 🔔 관리실 팝업
   const [showAdminPopup, setShowAdminPopup] = useState(false)
 
   /* ===============================
@@ -59,6 +57,7 @@ export default function Home() {
   const wsRef = useRef<WebSocket | null>(null)
   const audioCtxRef = useRef<AudioContext | null>(null)
   const streamRef = useRef<MediaStream | null>(null)
+  const plateInputRef = useRef<HTMLInputElement | null>(null)
 
   const muteMicHard = () => {
     streamRef.current?.getAudioTracks().forEach(t => (t.enabled = false))
@@ -69,17 +68,15 @@ export default function Home() {
   }
 
   /* ===============================
-     음성 시작 (FIXED)
-  =============================== */
+     음성 시작 (문제 상황에서만)
+=============================== */
   const startVoice = async () => {
     if (active) return
 
     unmuteMicHard()
-    statusRef.current = "listening"
-
     setActive(true)
     setStatus("listening")
-    setBubbleText("말씀해 주세요.")
+    setBubbleText("어떤 문제가 있으신가요?")
     setShowKeywords(false)
     setCurrentIntent(null)
 
@@ -93,22 +90,14 @@ export default function Home() {
 
         if (data.type === "assistant_state" && data.state === "THINKING") {
           setStatus("thinking")
-          setBubbleText("잠시만요…\n생각 중이에요.")
+          setBubbleText("잠시만요…\n확인 중이에요.")
           setShowKeywords(false)
           return
         }
 
         if (data.type === "assistant_message") {
-          const {
-            text,
-            tts_url,
-            end_session,
-            one_turn,
-            intent,
-            system_action,
-          } = data
+          const { text, tts_url, end_session, one_turn, intent, system_action } = data
 
-          /* 🚨 관리실 호출 */
           if (system_action === "CALL_ADMIN") {
             muteMicHard()
             setShowAdminPopup(true)
@@ -119,11 +108,8 @@ export default function Home() {
               setShowAdminPopup(false)
               setActive(false)
               setStatus("idle")
-              setBubbleText(
-                "문의하실 내용이 있으시면\n저를 누르고 말씀해주세요."
-              )
+              setBubbleText("차량 번호판을 업로드해 주세요.")
             }, 1800)
-
             return
           }
 
@@ -157,9 +143,7 @@ export default function Home() {
           if (end_session) {
             setActive(false)
             setStatus("idle")
-            setBubbleText(
-              "문의하실 내용이 있으시면\n저를 누르고 말씀해주세요."
-            )
+            setBubbleText("차량 번호판을 업로드해 주세요.")
             setShowKeywords(false)
             setCurrentIntent(null)
           }
@@ -170,11 +154,7 @@ export default function Home() {
     }
 
     const stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
-      },
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
     })
     streamRef.current = stream
 
@@ -194,22 +174,78 @@ export default function Home() {
     }
   }
 
+  /* ===============================
+     번호판 업로드 (유일한 시작점)
+=============================== */
+  const handlePlateUpload = async (file: File) => {
+    if (active) return
+
+    setStatus("thinking")
+    setBubbleText("차량 번호판을 확인 중이에요…")
+
+    const formData = new FormData()
+    formData.append("image", file)
+
+    try {
+      const res = await fetch(`${API_BASE}/api/plate/recognize`, {
+        method: "POST",
+        body: formData,
+      })
+      const data = await res.json()
+
+      if (!data.success) {
+        setBubbleText("번호판을 인식하지 못했어요.\n다시 시도해 주세요.")
+        setStatus("idle")
+        return
+      }
+      
+      // ENTRY
+      if (data.direction === "ENTRY") {
+        setBubbleText(data.message)
+        setStatus("idle")
+
+        if (data.tts_url) {
+          const audio = new Audio(
+            data.tts_url.startsWith("http")
+              ? data.tts_url
+              : `${API_BASE}${data.tts_url}`
+          )
+          audio.play()
+        }
+      }
+
+      // EXIT
+      if (data.direction === "EXIT") {
+        setBubbleText("출차 차량으로 확인됐어요.\n문제가 있으시면 말씀해 주세요.")
+        startVoice()
+      }
+
+    } catch (e) {
+      console.error(e)
+      setBubbleText("시스템 오류가 발생했어요.")
+      setStatus("idle")
+    }
+  }
+
+  const onPlateFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+    handlePlateUpload(file)
+    e.target.value = ""
+  }
+
   const showIdleKeywords = status === "idle" && !active
 
   /* ===============================
      UI
-  =============================== */
+=============================== */
   return (
     <main className="min-h-screen bg-gradient-to-br from-emerald-50 via-sky-50 to-white flex items-center justify-center px-6 font-[Pretendard]">
-
-      {/* 🔔 관리실 팝업 */}
       {showAdminPopup && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm">
           <div className="bg-white rounded-2xl px-10 py-8 shadow-2xl text-center">
             <p className="text-2xl font-semibold">🔔 관리실에 연락했습니다</p>
-            <p className="mt-2 text-neutral-600">
-              직원이 곧 도와드릴 예정입니다.
-            </p>
+            <p className="mt-2 text-neutral-600">직원이 곧 도와드릴 예정입니다.</p>
           </div>
         </div>
       )}
@@ -222,29 +258,19 @@ export default function Home() {
       </header>
 
       <div className="relative flex items-center">
-        {/* 🤖 지미 */}
-        <div
-          onClick={startVoice}
-          className={`cursor-pointer ${status === "thinking" ? "animate-bounce" : ""}`}
-        >
+        <div className={`${status === "thinking" ? "animate-bounce" : ""}`}>
           <div className="w-56 h-40 rounded-[2.5rem] bg-white shadow-2xl flex items-center justify-center">
             <div className="w-44 h-28 rounded-2xl bg-gradient-to-br from-emerald-300 to-sky-400 flex items-center justify-center gap-6">
               <span className="w-4 h-4 bg-white rounded-full" />
               <span className="w-4 h-4 bg-white rounded-full" />
             </div>
           </div>
-          <p className="mt-4 text-center text-neutral-500">
-            지미 · 주차 안내 파트너
-          </p>
+          <p className="mt-4 text-center text-neutral-500">지미 · 주차 안내 파트너</p>
         </div>
 
-        {/* 💬 말풍선 */}
         <div className="relative ml-6 -translate-y-12 max-w-[520px] bg-white px-10 py-8 rounded-[2.2rem] shadow-xl">
           <div className="absolute left-[-14px] bottom-1/2 -translate-y-1/2 w-0 h-0 border-t-[10px] border-b-[10px] border-r-[16px] border-transparent border-r-white" />
-
-          <p className="text-[22px] leading-relaxed whitespace-pre-line">
-            {bubbleText}
-          </p>
+          <p className="text-[22px] leading-relaxed whitespace-pre-line">{bubbleText}</p>
 
           {(showKeywords && currentIntent) || showIdleKeywords ? (
             <div className="mt-4 grid grid-cols-2 gap-3">
@@ -255,9 +281,7 @@ export default function Home() {
                 <button
                   key={kw}
                   onClick={() =>
-                    wsRef.current?.send(
-                      JSON.stringify({ type: "ui_keyword", text: kw })
-                    )
+                    wsRef.current?.send(JSON.stringify({ type: "ui_keyword", text: kw }))
                   }
                   className="py-3 px-4 rounded-full border font-semibold hover:bg-neutral-100 transition"
                 >
@@ -267,6 +291,25 @@ export default function Home() {
             </div>
           ) : null}
         </div>
+      </div>
+
+      <div className="absolute bottom-12 flex flex-col items-center gap-2">
+        <input
+          ref={plateInputRef}
+          type="file"
+          accept="image/*"
+          hidden
+          onChange={onPlateFileChange}
+        />
+        <button
+          onClick={() => plateInputRef.current?.click()}
+          className="px-6 py-3 rounded-full bg-neutral-900 text-white font-semibold shadow-lg hover:bg-neutral-800 transition"
+        >
+          🚗 차량 번호판 업로드
+        </button>
+        <p className="text-xs text-neutral-400">
+          ※ 실제 환경에서는 차량 정차 시 자동 인식됩니다
+        </p>
       </div>
     </main>
   )

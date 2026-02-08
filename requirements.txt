@@ -130,5 +130,32 @@ python-dotenv
 # - DATABASE_URL, OLLAMA_BASE_URL 등 관리
 
 
+# ==================================================
+# Text-to-Speech (TTS)
+# ==================================================
+
 gtts
-# Google Translate TTS(API)
+# Google Translate TTS
+# - 간단한 TTS 출력용
+# - static/tts/*.mp3 생성
+
+
+# ==================================================
+# 🚗 License Plate Recognition (CPU ONLY, 신규 추가)
+# ==================================================
+
+easyocr
+# CPU 기반 OCR 라이브러리
+# - 한국어/영어 지원
+# - 번호판 문자열 추출에 사용
+# - GPU 없어도 정상 동작
+
+opencv-python
+# 이미지 처리
+# - 업로드 이미지 디코딩
+# - OCR 전처리 (resize / grayscale 등)
+
+pillow
+# 이미지 IO 보조 라이브러리
+# - FastAPI UploadFile 처리 보조
+

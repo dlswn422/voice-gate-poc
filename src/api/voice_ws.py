@@ -42,12 +42,15 @@ async def safe_close(ws: WebSocket):
         await ws.close()
 
 
+# ==================================================
+# 🎤 Voice WebSocket
+# ==================================================
 @router.websocket("/ws/voice")
 async def voice_ws(websocket: WebSocket):
     await websocket.accept()
     print("[WS] 🔌 Client connected")
 
-    # IO 상태 (엔진 상태와 완전히 분리)
+    # IO 상태 (엔진 상태와 분리)
     io_state = "LISTENING"   # LISTENING | SPEAKING
 
     pcm_buffer: list[np.ndarray] = []
@@ -65,7 +68,7 @@ async def voice_ws(websocket: WebSocket):
             message = await websocket.receive()
 
             # --------------------------------------------------
-            # 프론트 → TTS 종료
+            # 🔁 프론트 → TTS 종료 알림
             # --------------------------------------------------
             if "text" in message:
                 try:
@@ -83,7 +86,7 @@ async def voice_ws(websocket: WebSocket):
                     pass
 
             # --------------------------------------------------
-            # 오디오 프레임
+            # 🎧 오디오 프레임
             # --------------------------------------------------
             if "bytes" not in message:
                 continue
@@ -102,7 +105,7 @@ async def voice_ws(websocket: WebSocket):
             rms = float(np.sqrt(np.mean(pcm * pcm)))
 
             # --------------------------------------------------
-            # 🎤 발화 시작
+            # 🎤 발화 시작 감지
             # --------------------------------------------------
             if not collecting:
                 if rms > SILENCE_RMS_THRESHOLD:
@@ -121,7 +124,7 @@ async def voice_ws(websocket: WebSocket):
                 continue
 
             # --------------------------------------------------
-            # 발화 수집
+            # 🎙 발화 수집
             # --------------------------------------------------
             pcm_buffer.append(pcm)
 
@@ -132,7 +135,7 @@ async def voice_ws(websocket: WebSocket):
             speech_duration = now - speech_start_ts
 
             # --------------------------------------------------
-            # STT pre-run
+            # ⚡ STT pre-run (빠른 반응용)
             # --------------------------------------------------
             if prerun_task is None and silence_time >= PRERUN_SILENCE_SEC:
                 audio = np.concatenate(pcm_buffer).astype(np.float32)
@@ -199,7 +202,6 @@ async def voice_ws(websocket: WebSocket):
                     io_state = "SPEAKING"
                     tts_url = synthesize(reply_text)
 
-                    # ⭐ 핵심 수정: AppEngine 결과 그대로 전달
                     payload = dict(result)
                     payload["tts_url"] = tts_url
 

@@ -15,70 +15,110 @@ router = APIRouter()
 # ==================================================
 # 🎧 Outdoor Parking Lot Voice Tuning (FINAL - STABLE)
 # ==================================================
-# ⚠️ 기준 환경
-# - 실외 주차장
-# - 차량 엔진음 / 바람 / 주변 대화 존재
-# - 키오스크 마이크 (AGC / NS / EC 켜짐)
+# 🎯 기준 환경
+# - 실외 주차장 키오스크
+# - 차량 엔진음, 바람, 주변 대화 존재
+# - 마이크에 AGC / Noise Suppression / Echo Cancellation ON
 
+# --------------------------------------------------
 # ▶ 무음 판단 RMS 기준
-# - 0.003~0.004 : 실내
-# - 0.004~0.005 : 실외(권장)
-# - 0.006↑      : 작은 목소리 인식 실패 가능
+# --------------------------------------------------
+# - 값 ↓ : 작은 소리도 말로 인식 (소음 오탐 ↑)
+# - 값 ↑ : 소음엔 강해지나 작은 목소리 미인식 가능
+#
+# 실외 권장 범위: 0.004 ~ 0.005
 SILENCE_RMS_THRESHOLD = 0.0045
 
-# ▶ 발화 종료로 판단하는 침묵 시간 (초)
-# - 너무 짧으면 문장 중간 끊김
-# - 너무 길면 응답 느림
+
+# --------------------------------------------------
+# ▶ 발화 종료 판단 침묵 시간 (초)
+# --------------------------------------------------
+# - 너무 짧으면 말 도중 끊김
+# - 너무 길면 응답 체감 느림
 END_SILENCE_SEC = 0.25
 
+
+# --------------------------------------------------
 # ▶ 발화 중 잠깐 멈췄을 때 STT pre-run 시작 시점
-# - 체감 응답 속도 개선용
+# --------------------------------------------------
+# - Whisper를 미리 돌려 응답 속도 개선
+# - 너무 짧으면 쓸데없는 pre-run 증가
 PRERUN_SILENCE_SEC = 0.3
 
+
+# --------------------------------------------------
 # ▶ 최소 음성 길이 (초)
-# - 이보다 짧으면 의미 없는 소리로 판단
+# --------------------------------------------------
+# - 이보다 짧으면 의미 없는 소리로 간주
+# - "어", "음", 헛기침 제거 목적
 MIN_AUDIO_SEC = 0.5
 
-# ▶ STT pre-run 시 뒤쪽 잡음 컷 (초)
+
+# --------------------------------------------------
+# ▶ STT pre-run 시 뒤쪽 잡음 컷 길이
+# --------------------------------------------------
+# - 말 끝 잡음 제거용
 CUT_AUDIO_SEC = 0.2
 
+
+# ▶ 샘플레이트 (Whisper 기준)
 SAMPLE_RATE = 16000
 
-# ▶ 발화 시작으로 인정할 최소 연속 프레임 수
-# - 값이 클수록 소음에 강함, 대신 반응 느림
+
+# --------------------------------------------------
+# ▶ 발화 시작 인정 프레임 수
+# --------------------------------------------------
+# - 연속으로 이 프레임 이상 RMS 초과 시 발화 시작
+# - 값 ↑ : 소음에 강함 / 반응 느림
+# - 값 ↓ : 반응 빠름 / 오탐 가능
 MIN_SPEECH_FRAMES = 2
 
+
+# --------------------------------------------------
 # ▶ TTS 종료 직후 입력 무시 시간
+# --------------------------------------------------
 # - TTS 자기 음성 재인식 방지
-# - 너무 길면 사용자가 바로 말해도 안 잡힘
 IGNORE_INPUT_AFTER_TTS_SEC = 0.2
 
-# ▶ 최대 발화 허용 시간 (초)
-# - 너무 길면 강제 종료
+
+# --------------------------------------------------
+# ▶ 최대 발화 허용 시간
+# --------------------------------------------------
+# - 너무 길게 말하면 강제 종료
 MAX_SPEECH_SEC = 4.0
+
 
 # ▶ 발화 종료 직후 짧은 무시 구간
 POST_SPEECH_IGNORE_SEC = 0.25
 
-# ▶ 아무 말도 없을 때 자동 종료 시간
-NO_INPUT_TIMEOUT_SEC = 8.0
+
+# --------------------------------------------------
+# ▶ 무음 정책 (세션 자동 종료)
+# --------------------------------------------------
+# - 경고 메시지 출력 시점
+NO_INPUT_WARN_SEC = 5.0
+
+# - 실제 세션 종료 시점
+NO_INPUT_END_SEC = 9.0
 
 
 # ==================================================
-# 🔒 WS utils
+# 🔒 WebSocket 안전 유틸
 # ==================================================
 async def safe_send(ws: WebSocket, payload: dict):
+    """연결된 상태에서만 메시지 전송"""
     if ws.application_state == WebSocketState.CONNECTED:
         await ws.send_json(payload)
 
 
 async def safe_close(ws: WebSocket):
+    """연결된 상태에서만 소켓 종료"""
     if ws.application_state == WebSocketState.CONNECTED:
         await ws.close()
 
 
 # ==================================================
-# 🧠 의미 없는 발화 필터
+# 🧠 의미 없는 발화 필터 (2차 방어선)
 # ==================================================
 def is_meaningful_text(text: str) -> bool:
     """
@@ -99,15 +139,11 @@ def is_meaningful_text(text: str) -> bool:
         "어", "음", "아", "네", "예",
         "어어", "음음", "응", "어?", "음?"
     }
-
-    if t in meaningless:
-        return False
-
-    return True
+    return t not in meaningless
 
 
 # ==================================================
-# 🎤 Voice WebSocket
+# 🎤 Voice WebSocket 엔드포인트
 # ==================================================
 @router.websocket("/ws/voice")
 async def voice_ws(websocket: WebSocket):
@@ -116,7 +152,7 @@ async def voice_ws(websocket: WebSocket):
 
     # ▶ 서버 기준 IO 상태
     # LISTENING : 마이크 입력 허용
-    # THINKING  : STT / LLM 처리 중
+    # THINKING  : STT / AppEngine 처리 중
     # SPEAKING  : TTS 재생 중
     io_state = "LISTENING"
 
@@ -130,23 +166,44 @@ async def voice_ws(websocket: WebSocket):
     speech_frame_count = 0
     prerun_task: asyncio.Task | None = None
 
-    # ▶ 마지막 사용자 활동 시간
+    # ▶ 사용자 활동 타임스탬프 (무음 감지용)
     last_activity_ts = time.time()
+    no_input_warned = False
 
     try:
         while True:
+            now = time.time()
+
             # --------------------------------------------------
-            # 🕒 무응답 자동 종료
+            # 🕒 무음 경고 / 종료 처리
             # --------------------------------------------------
-            if io_state == "LISTENING":
-                if time.time() - last_activity_ts > NO_INPUT_TIMEOUT_SEC:
+            if io_state == "LISTENING" and not collecting:
+                idle = now - last_activity_ts
+
+                # ▶ 최종 종료
+                if idle >= NO_INPUT_END_SEC:
+                    print("[WS] ⛔ No input timeout → END")
+                    msg = "안내를 종료할게요."
                     await safe_send(websocket, {
                         "type": "assistant_message",
-                        "text": "응답이 없어 안내를 종료할게요.",
+                        "text": msg,
+                        "tts_url": synthesize(msg),
                         "end_session": True,
                     })
                     await safe_close(websocket)
                     break
+
+                # ▶ 1회 경고
+                if idle >= NO_INPUT_WARN_SEC and not no_input_warned:
+                    no_input_warned = True
+                    print("[WS] ⚠️ No input → WARNING")
+                    msg = "말씀이 없으시면 안내를 종료할게요."
+                    await safe_send(websocket, {
+                        "type": "assistant_message",
+                        "text": msg,
+                        "tts_url": synthesize(msg),
+                        "end_session": False,
+                    })
 
             message = await websocket.receive()
 
@@ -157,6 +214,7 @@ async def voice_ws(websocket: WebSocket):
                 try:
                     msg = json.loads(message["text"])
                     if msg.get("type") == "tts_end":
+                        print("[WS] 🔁 TTS ended → LISTENING")
                         io_state = "LISTENING"
                         collecting = False
                         pcm_buffer.clear()
@@ -169,15 +227,11 @@ async def voice_ws(websocket: WebSocket):
                     pass
 
             # --------------------------------------------------
-            # 🎧 오디오 프레임
+            # 🎧 오디오 프레임 수신
             # --------------------------------------------------
-            if "bytes" not in message:
+            if "bytes" not in message or io_state != "LISTENING":
                 continue
 
-            if io_state != "LISTENING":
-                continue
-
-            now = time.time()
             if now < ignore_until_ts:
                 continue
 
@@ -203,13 +257,13 @@ async def voice_ws(websocket: WebSocket):
                     speech_frame_count = 0
                     speech_start_ts = now
                     last_non_silence_ts = now
+                    print("[WS] 🎤 Speech started")
                 continue
 
             # --------------------------------------------------
             # 🎙 발화 수집
             # --------------------------------------------------
             pcm_buffer.append(pcm)
-
             if rms > SILENCE_RMS_THRESHOLD:
                 last_non_silence_ts = now
 
@@ -232,23 +286,27 @@ async def voice_ws(websocket: WebSocket):
                         app_state.whisper_model,
                     )
                 )
+                print("[WS] ⚡ STT pre-run")
 
             # --------------------------------------------------
-            # 🛑 발화 종료 판단
+            # 🛑 발화 종료
             # --------------------------------------------------
             if silence_time >= END_SILENCE_SEC or speech_duration >= MAX_SPEECH_SEC:
                 collecting = False
-                io_state = "THINKING"
-                ignore_until_ts = time.time() + POST_SPEECH_IGNORE_SEC
 
                 total_samples = sum(len(c) for c in pcm_buffer)
                 if total_samples / SAMPLE_RATE < MIN_AUDIO_SEC:
+                    print("[WS] ❌ Too short → ignored")
                     pcm_buffer.clear()
                     prerun_task = None
-                    io_state = "LISTENING"
                     last_activity_ts = time.time()
                     continue
 
+                print("[WS] 🛑 Speech ended → THINKING")
+                io_state = "THINKING"
+                ignore_until_ts = time.time() + POST_SPEECH_IGNORE_SEC
+
+                # ▶ THINKING 상태 프론트에 명시적으로 알림
                 await safe_send(websocket, {
                     "type": "assistant_state",
                     "state": "THINKING",
@@ -268,13 +326,18 @@ async def voice_ws(websocket: WebSocket):
                 pcm_buffer.clear()
                 prerun_task = None
 
+                # --------------------------------------------------
+                # ❌ 의미 없는 발화 → 완전 무시 (LISTENING 유지)
+                # --------------------------------------------------
                 if not is_meaningful_text(text):
+                    print("[WS] ❌ Meaningless speech ignored → LISTENING")
                     io_state = "LISTENING"
                     last_activity_ts = time.time()
                     continue
 
-                last_activity_ts = time.time()
                 print(f"[STT] {text}")
+                last_activity_ts = time.time()
+                no_input_warned = False
 
                 # --------------------------------------------------
                 # 🧠 AppEngine
@@ -287,13 +350,14 @@ async def voice_ws(websocket: WebSocket):
                 if reply_text:
                     io_state = "SPEAKING"
                     tts_url = synthesize(reply_text)
-
                     payload = dict(result)
                     payload["tts_url"] = tts_url
-
                     await safe_send(websocket, payload)
+                else:
+                    io_state = "LISTENING"
 
                 if end_session:
+                    print("[WS] 🛑 Session ended by engine")
                     await safe_close(websocket)
                     break
 

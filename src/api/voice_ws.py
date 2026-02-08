@@ -13,52 +13,55 @@ from src.speech.tts import synthesize
 router = APIRouter()
 
 # ==================================================
-# 🎧 Outdoor Parking Lot Voice Tuning (FINAL)
+# 🎧 Outdoor Parking Lot Voice Tuning (FINAL - STABLE)
 # ==================================================
-# ⚠️ 이 값들은 "실외 주차장 키오스크" 기준
-#     → 차량 소음 / 바람 / 사람 지나가는 소리 고려
+# ⚠️ 기준 환경
+# - 실외 주차장
+# - 차량 엔진음 / 바람 / 주변 대화 존재
+# - 키오스크 마이크 (AGC / NS / EC 켜짐)
 
 # ▶ 무음 판단 RMS 기준
-# - 너무 낮으면 바람, 엔진 소리도 발화로 인식
-# - 너무 높으면 작은 목소리 인식 못함
-SILENCE_RMS_THRESHOLD = 0.008  
+# - 0.003~0.004 : 실내
+# - 0.004~0.005 : 실외(권장)
+# - 0.006↑      : 작은 목소리 인식 실패 가능
+SILENCE_RMS_THRESHOLD = 0.0045
 
 # ▶ 발화 종료로 판단하는 침묵 시간 (초)
-# - 너무 길면 반응 느림
-# - 너무 짧으면 말 끊김
-END_SILENCE_SEC = 0.12  
+# - 너무 짧으면 문장 중간 끊김
+# - 너무 길면 응답 느림
+END_SILENCE_SEC = 0.25
 
-# ▶ 발화 중 잠깐 멈췄을 때 STT 미리 돌리는 시간
+# ▶ 발화 중 잠깐 멈췄을 때 STT pre-run 시작 시점
 # - 체감 응답 속도 개선용
-PRERUN_SILENCE_SEC = 0.25  
+PRERUN_SILENCE_SEC = 0.3
 
 # ▶ 최소 음성 길이 (초)
-# - 이보다 짧으면 "의미 없는 소리"로 간주
-MIN_AUDIO_SEC = 0.6  
+# - 이보다 짧으면 의미 없는 소리로 판단
+MIN_AUDIO_SEC = 0.5
 
-# ▶ STT pre-run 시 뒤쪽 잘라낼 오디오 길이
-# - 끝의 잡음 제거 목적
-CUT_AUDIO_SEC = 0.25  
+# ▶ STT pre-run 시 뒤쪽 잡음 컷 (초)
+CUT_AUDIO_SEC = 0.2
 
 SAMPLE_RATE = 16000
 
-# ▶ 발화 시작으로 인정하기 위한 연속 프레임 수
-# - 순간 소음 제거
-MIN_SPEECH_FRAMES = 4  
+# ▶ 발화 시작으로 인정할 최소 연속 프레임 수
+# - 값이 클수록 소음에 강함, 대신 반응 느림
+MIN_SPEECH_FRAMES = 2
 
-# ▶ TTS 끝난 직후 입력 무시 시간
-# - TTS 자기 목소리 재인식 방지
-IGNORE_INPUT_AFTER_TTS_SEC = 0.6  
+# ▶ TTS 종료 직후 입력 무시 시간
+# - TTS 자기 음성 재인식 방지
+# - 너무 길면 사용자가 바로 말해도 안 잡힘
+IGNORE_INPUT_AFTER_TTS_SEC = 0.2
 
 # ▶ 최대 발화 허용 시간 (초)
-# - 너무 길게 말하면 강제 종료
-MAX_SPEECH_SEC = 3.0  
+# - 너무 길면 강제 종료
+MAX_SPEECH_SEC = 4.0
 
-# ▶ 발화 종료 후 입력 무시 시간
-POST_SPEECH_IGNORE_SEC = 0.5  
+# ▶ 발화 종료 직후 짧은 무시 구간
+POST_SPEECH_IGNORE_SEC = 0.25
 
-# ▶ 아무 말도 안 할 경우 세션 종료 시간
-NO_INPUT_TIMEOUT_SEC = 8.0  
+# ▶ 아무 말도 없을 때 자동 종료 시간
+NO_INPUT_TIMEOUT_SEC = 8.0
 
 
 # ==================================================
@@ -79,19 +82,24 @@ async def safe_close(ws: WebSocket):
 # ==================================================
 def is_meaningful_text(text: str) -> bool:
     """
-    STT 결과가 실제 '의미 있는 발화'인지 판단
-    - 너무 짧은 말
-    - 감탄사 / 추임새 제거
+    STT 결과가 실제 의미 있는 발화인지 판단
+    - 너무 짧은 발화 제거
+    - 추임새 / 감탄사 제거
     """
     if not text:
         return False
 
     t = text.strip()
 
+    # 글자 수 기준
     if len(t) < 3:
         return False
 
-    meaningless = {"어", "음", "아", "네", "예", "어어", "음음"}
+    meaningless = {
+        "어", "음", "아", "네", "예",
+        "어어", "음음", "응", "어?", "음?"
+    }
+
     if t in meaningless:
         return False
 
@@ -107,7 +115,7 @@ async def voice_ws(websocket: WebSocket):
     print("[WS] 🔌 Client connected")
 
     # ▶ 서버 기준 IO 상태
-    # LISTENING : 마이크 허용
+    # LISTENING : 마이크 입력 허용
     # THINKING  : STT / LLM 처리 중
     # SPEAKING  : TTS 재생 중
     io_state = "LISTENING"
@@ -122,13 +130,13 @@ async def voice_ws(websocket: WebSocket):
     speech_frame_count = 0
     prerun_task: asyncio.Task | None = None
 
-    # ▶ 마지막 사용자 활동 시간 (무응답 종료용)
+    # ▶ 마지막 사용자 활동 시간
     last_activity_ts = time.time()
 
     try:
         while True:
             # --------------------------------------------------
-            # 🕒 무응답 타임아웃 처리
+            # 🕒 무응답 자동 종료
             # --------------------------------------------------
             if io_state == "LISTENING":
                 if time.time() - last_activity_ts > NO_INPUT_TIMEOUT_SEC:
@@ -161,7 +169,7 @@ async def voice_ws(websocket: WebSocket):
                     pass
 
             # --------------------------------------------------
-            # 🎧 오디오 프레임 수신
+            # 🎧 오디오 프레임
             # --------------------------------------------------
             if "bytes" not in message:
                 continue
@@ -226,7 +234,7 @@ async def voice_ws(websocket: WebSocket):
                 )
 
             # --------------------------------------------------
-            # 🛑 발화 종료
+            # 🛑 발화 종료 판단
             # --------------------------------------------------
             if silence_time >= END_SILENCE_SEC or speech_duration >= MAX_SPEECH_SEC:
                 collecting = False

@@ -42,10 +42,8 @@ export default function Home() {
     _setStatus(s)
   }
 
-  const [bubbleText, setBubbleText] = useState("어떤 문의가 있으실까요?")
+  const [bubbleText, setBubbleText] = useState("어떤 문의가 있으신가요?")
   const [active, setActive] = useState(false)
-  const [showKeywords, setShowKeywords] = useState(false)
-  const [currentIntent, setCurrentIntent] = useState<Intent | null>(null)
   const [showAdminPopup, setShowAdminPopup] = useState(false)
 
   /* ===============================
@@ -74,8 +72,6 @@ export default function Home() {
 
     setActive(true)
     setStatus("listening")
-    setShowKeywords(false)
-    setCurrentIntent(null)
 
     const ws = new WebSocket(WS_BASE)
     ws.binaryType = "arraybuffer"
@@ -92,7 +88,7 @@ export default function Home() {
         }
 
         if (data.type === "assistant_message") {
-          const { text, tts_url, end_session, one_turn, intent, system_action } = data
+          const { text, tts_url, end_session, system_action } = data
 
           if (system_action === "CALL_ADMIN") {
             muteMicHard()
@@ -102,20 +98,12 @@ export default function Home() {
               setShowAdminPopup(false)
               setActive(false)
               setStatus("idle")
-              setBubbleText("차량 번호판을 업로드해 주세요.")
+              setBubbleText("어떤 문의가 있으신가요?")
             }, 1800)
             return
           }
 
           if (text) setBubbleText(text)
-
-          if (one_turn && intent) {
-            setShowKeywords(true)
-            setCurrentIntent(intent)
-          } else {
-            setShowKeywords(false)
-            setCurrentIntent(null)
-          }
 
           if (tts_url) {
             muteMicHard()
@@ -137,9 +125,7 @@ export default function Home() {
           if (end_session) {
             setActive(false)
             setStatus("idle")
-            setBubbleText("차량 번호판을 업로드해 주세요.")
-            setShowKeywords(false)
-            setCurrentIntent(null)
+            setBubbleText("어떤 문의가 있으신가요?")
           }
         }
       } catch (e) {
@@ -192,24 +178,15 @@ export default function Home() {
       }
 
       setBubbleText(data.message)
-      setStatus("idle")
+      setStatus("speaking")
 
-      if (data.tts_url) {
-        muteMicHard()
-        const audio = new Audio(`${API_BASE}${data.tts_url}`)
-        audio.onended = () => {
-          unmuteMicHard()
-          startVoice()   // 🔥 안내 후 바로 음성 대기
-        }
-        audio.play()
-      } else {
+      const audio = new Audio(`${API_BASE}${data.tts_url}`)
+      muteMicHard()
+      audio.onended = () => {
+        unmuteMicHard()
         startVoice()
       }
-
-      if (data.allow_voice) {
-        setShowKeywords(true)
-        setCurrentIntent(data.direction)
-      }
+      audio.play()
 
     } catch (e) {
       console.error(e)
@@ -224,8 +201,6 @@ export default function Home() {
     handlePlateUpload(file)
     e.target.value = ""
   }
-
-  const showIdleKeywords = status === "idle" && !active
 
   /* ===============================
      UI
@@ -269,24 +244,19 @@ export default function Home() {
             {bubbleText}
           </p>
 
-          {(showKeywords && currentIntent) || showIdleKeywords ? (
-            <div className="mt-4 grid grid-cols-2 gap-3">
-              {(showKeywords && currentIntent
-                ? INTENT_UI_KEYWORDS[currentIntent]
-                : INTENT_UI_KEYWORDS.NONE
-              ).map((kw) => (
-                <button
-                  key={kw}
-                  onClick={() =>
-                    wsRef.current?.send(JSON.stringify({ type: "ui_keyword", text: kw }))
-                  }
-                  className="py-3 px-4 rounded-full border font-semibold hover:bg-neutral-100 transition"
-                >
-                  {kw}
-                </button>
-              ))}
-            </div>
-          ) : null}
+          <div className="mt-4 grid grid-cols-2 gap-3">
+            {INTENT_UI_KEYWORDS.NONE.map((kw) => (
+              <button
+                key={kw}
+                onClick={() =>
+                  wsRef.current?.send(JSON.stringify({ type: "ui_keyword", text: kw }))
+                }
+                className="py-3 px-4 rounded-full border font-semibold hover:bg-neutral-100 transition"
+              >
+                {kw}
+              </button>
+            ))}
+          </div>
         </div>
       </div>
 

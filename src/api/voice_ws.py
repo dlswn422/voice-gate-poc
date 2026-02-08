@@ -129,6 +129,12 @@ async def voice_ws(websocket: WebSocket):
     last_activity_ts = time.time()
     no_input_warned = False
 
+    # --------------------------------------------------
+    # ADD ▶ 의미 없는 발화 연속 카운트
+    # --------------------------------------------------
+    meaningless_count = 0
+    MAX_MEANINGLESS_COUNT = 3  # 의미 없는 발화 허용 횟수 (튜닝 포인트)
+
     try:
         while True:
             now = time.time()
@@ -180,7 +186,6 @@ async def voice_ws(websocket: WebSocket):
                         ignore_until_ts = time.time() + IGNORE_INPUT_AFTER_TTS_SEC
                         last_activity_ts = time.time()
 
-                        # FIX: 프론트 상태 동기화
                         await safe_send(websocket, {
                             "type": "assistant_state",
                             "state": "LISTENING",
@@ -264,7 +269,6 @@ async def voice_ws(websocket: WebSocket):
                     prerun_task = None
                     last_activity_ts = time.time()
 
-                    # FIX: 상태 복구 알림
                     await safe_send(websocket, {
                         "type": "assistant_state",
                         "state": "LISTENING",
@@ -295,19 +299,36 @@ async def voice_ws(websocket: WebSocket):
                 prerun_task = None
 
                 # --------------------------------------------------
-                # ❌ 의미 없는 발화 → 완전 무시
+                # ❌ 의미 없는 발화 처리
                 # --------------------------------------------------
                 if not is_meaningful_text(text):
-                    print("[WS] ❌ Meaningless speech ignored → LISTENING")
-                    io_state = "LISTENING"
+                    meaningless_count += 1
                     last_activity_ts = time.time()
+                    print(f"[WS] ❌ Meaningless speech count = {meaningless_count}")
 
-                    # FIX: 프론트 상태 복구 알림
+                    if meaningless_count >= MAX_MEANINGLESS_COUNT:
+                        msg = "음성이 잘 인식되지 않아 안내를 종료할게요."
+                        await safe_send(websocket, {
+                            "type": "assistant_message",
+                            "text": msg,
+                            "tts_url": synthesize(msg),
+                            "end_session": True,
+                        })
+                        await safe_close(websocket)
+                        break
+
+                    io_state = "LISTENING"
                     await safe_send(websocket, {
                         "type": "assistant_state",
                         "state": "LISTENING",
                     })
                     continue
+
+                # --------------------------------------------------
+                # ✅ 의미 있는 발화 → 카운터 리셋
+                # --------------------------------------------------
+                meaningless_count = 0
+                print("[WS] ✅ Meaningful speech → reset meaningless_count")
 
                 print(f"[STT] {text}")
                 last_activity_ts = time.time()

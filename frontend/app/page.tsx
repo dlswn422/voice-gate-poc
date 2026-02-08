@@ -46,6 +46,9 @@ export default function Home() {
   const [active, setActive] = useState(false)
   const [showAdminPopup, setShowAdminPopup] = useState(false)
 
+  // ✅ FIX: 현재 의도 상태
+  const [intent, setIntent] = useState<Intent>("NONE")
+
   /* ===============================
      Refs
   =============================== */
@@ -72,6 +75,7 @@ export default function Home() {
 
     setActive(true)
     setStatus("listening")
+    setIntent("NONE") // ✅ 세션 시작 시 초기화
 
     const ws = new WebSocket(WS_BASE)
     ws.binaryType = "arraybuffer"
@@ -81,11 +85,9 @@ export default function Home() {
       try {
         const data = JSON.parse(event.data)
 
-        /* =================================================
-           FIX 1️⃣ assistant_state 대칭 처리 (핵심 수정)
-           - THINKING만 처리하던 기존 버그 수정
-           - LISTENING / SPEAKING도 동일하게 반영
-        ================================================= */
+        /* ===============================
+           assistant_state 처리
+        =============================== */
         if (data.type === "assistant_state") {
           if (data.state === "THINKING") {
             setStatus("thinking")
@@ -94,22 +96,30 @@ export default function Home() {
 
           if (data.state === "LISTENING") {
             setStatus("listening")
-            // bubbleText는 유지 (서버가 새 메시지를 주지 않았기 때문)
           }
 
           if (data.state === "SPEAKING") {
             setStatus("speaking")
           }
-
           return
         }
 
         /* ===============================
-           기존 assistant_message 로직
-           (변경 없음)
+           assistant_message 처리
         =============================== */
         if (data.type === "assistant_message") {
-          const { text, tts_url, end_session, system_action } = data
+          const {
+            text,
+            tts_url,
+            end_session,
+            system_action,
+            intent: serverIntent, // ✅ FIX: 서버 intent 수신
+          } = data
+
+          // ✅ FIX: intent 반영
+          if (serverIntent) {
+            setIntent(serverIntent)
+          }
 
           if (system_action === "CALL_ADMIN") {
             muteMicHard()
@@ -119,6 +129,7 @@ export default function Home() {
               setShowAdminPopup(false)
               setActive(false)
               setStatus("idle")
+              setIntent("NONE")
               setBubbleText("어떤 문의가 있으신가요?")
             }, 1800)
             return
@@ -146,6 +157,7 @@ export default function Home() {
           if (end_session) {
             setActive(false)
             setStatus("idle")
+            setIntent("NONE") // ✅ FIX: 종료 시 초기화
             setBubbleText("어떤 문의가 있으신가요?")
           }
         }
@@ -265,8 +277,9 @@ export default function Home() {
             {bubbleText}
           </p>
 
+          {/* ✅ FIX: intent 기반 키워드 전환 */}
           <div className="mt-4 grid grid-cols-2 gap-3">
-            {INTENT_UI_KEYWORDS.NONE.map((kw) => (
+            {INTENT_UI_KEYWORDS[intent].map((kw) => (
               <button
                 key={kw}
                 onClick={() =>

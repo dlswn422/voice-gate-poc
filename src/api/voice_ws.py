@@ -50,8 +50,8 @@ async def voice_ws(websocket: WebSocket):
     await websocket.accept()
     print("[WS] 🔌 Client connected")
 
-    # IO 상태 (엔진 상태와 분리)
-    io_state = "LISTENING"   # LISTENING | SPEAKING
+    # 서버 기준 IO 상태
+    io_state = "LISTENING"   # LISTENING | THINKING | SPEAKING
 
     pcm_buffer: list[np.ndarray] = []
     collecting = False
@@ -68,7 +68,7 @@ async def voice_ws(websocket: WebSocket):
             message = await websocket.receive()
 
             # --------------------------------------------------
-            # 🔁 프론트 → TTS 종료 알림
+            # 🔁 프론트 → TTS 종료
             # --------------------------------------------------
             if "text" in message:
                 try:
@@ -91,7 +91,8 @@ async def voice_ws(websocket: WebSocket):
             if "bytes" not in message:
                 continue
 
-            if io_state == "SPEAKING":
+            # 🔒 서버 기준 차단
+            if io_state != "LISTENING":
                 continue
 
             now = time.time()
@@ -135,7 +136,7 @@ async def voice_ws(websocket: WebSocket):
             speech_duration = now - speech_start_ts
 
             # --------------------------------------------------
-            # ⚡ STT pre-run (빠른 반응용)
+            # ⚡ STT pre-run
             # --------------------------------------------------
             if prerun_task is None and silence_time >= PRERUN_SILENCE_SEC:
                 audio = np.concatenate(pcm_buffer).astype(np.float32)
@@ -157,13 +158,15 @@ async def voice_ws(websocket: WebSocket):
             # --------------------------------------------------
             if silence_time >= END_SILENCE_SEC or speech_duration >= MAX_SPEECH_SEC:
                 collecting = False
+                io_state = "THINKING"
                 ignore_until_ts = time.time() + POST_SPEECH_IGNORE_SEC
-                print("[WS] 🛑 Speech ended")
+                print("[WS] 🛑 Speech ended → THINKING")
 
                 total_samples = sum(len(c) for c in pcm_buffer)
                 if total_samples / SAMPLE_RATE < MIN_AUDIO_SEC:
                     pcm_buffer.clear()
                     prerun_task = None
+                    io_state = "LISTENING"
                     continue
 
                 await safe_send(websocket, {
@@ -186,12 +189,13 @@ async def voice_ws(websocket: WebSocket):
                 prerun_task = None
 
                 if not text:
+                    io_state = "LISTENING"
                     continue
 
                 print(f"[STT] {text}")
 
                 # ==================================================
-                # 🧠 AppEngine (단일 진입점)
+                # 🧠 AppEngine
                 # ==================================================
                 result = app_state.app_engine.handle_text(text)
 

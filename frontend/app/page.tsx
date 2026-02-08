@@ -23,7 +23,7 @@ const API_BASE = "http://127.0.0.1:8000"
 
 const INTENT_UI_KEYWORDS: Record<Intent, string[]> = {
   EXIT: ["차단기 안 열림", "출차 안 됨", "차량 인식 안 됨", "출구에서 멈춤", "기타", "관리실 호출"],
-  ENTRY: ["입차 안 됨", "차단기 안 열림", "차량 인식 안 됨", "만차로 표시됨", "기타", "관리실 호출"],
+  ENTRY: ["입차 안 됨", "차단기 안 열림", "차량 인식 안 됨", "만차로 표시됨", "방문자 등록", "관리실 호출"],
   PAYMENT: ["결제 안 됨", "카드 오류", "요금 이상", "결제 방법 문의", "기타", "관리실 호출"],
   REGISTRATION: ["차량 등록", "방문자 등록", "등록 방법 문의", "등록했는데 안 됨", "기타", "관리실 호출"],
   TIME_PRICE: ["주차 시간 문의", "요금 문의", "할인 적용 문의", "요금 기준", "기타", "관리실 호출"],
@@ -52,10 +52,12 @@ export default function Home() {
      Refs
   =============================== */
   const wsRef = useRef<WebSocket | null>(null)
-  const audioCtxRef = useRef<AudioContext | null>(null)
   const streamRef = useRef<MediaStream | null>(null)
   const plateInputRef = useRef<HTMLInputElement | null>(null)
 
+  /* ===============================
+     Mic control
+=============================== */
   const muteMicHard = () => {
     streamRef.current?.getAudioTracks().forEach(t => (t.enabled = false))
   }
@@ -65,15 +67,13 @@ export default function Home() {
   }
 
   /* ===============================
-     음성 상담 (출차 문제만)
+     Voice WS Start
 =============================== */
   const startVoice = async () => {
     if (active) return
 
-    unmuteMicHard()
     setActive(true)
     setStatus("listening")
-    setBubbleText("어떤 문제가 있으신가요?")
     setShowKeywords(false)
     setCurrentIntent(null)
 
@@ -153,8 +153,6 @@ export default function Home() {
     streamRef.current = stream
 
     const audioCtx = new AudioContext({ sampleRate: 16000 })
-    audioCtxRef.current = audioCtx
-
     const source = audioCtx.createMediaStreamSource(stream)
     const processor = audioCtx.createScriptProcessor(4096, 1, 1)
 
@@ -169,7 +167,7 @@ export default function Home() {
   }
 
   /* ===============================
-     번호판 업로드
+     Plate Upload
 =============================== */
   const handlePlateUpload = async (file: File) => {
     if (active) return
@@ -197,17 +195,20 @@ export default function Home() {
       setStatus("idle")
 
       if (data.tts_url) {
-        const audio = new Audio(
-          data.tts_url.startsWith("http")
-            ? data.tts_url
-            : `${API_BASE}${data.tts_url}`
-        )
+        muteMicHard()
+        const audio = new Audio(`${API_BASE}${data.tts_url}`)
+        audio.onended = () => {
+          unmuteMicHard()
+          startVoice()   // 🔥 안내 후 바로 음성 대기
+        }
         audio.play()
+      } else {
+        startVoice()
       }
 
-      // 🔥 출차 + 결제 안됨 → 음성 상담
-      if (data.direction === "EXIT" && data.paid === false) {
-        startVoice()
+      if (data.allow_voice) {
+        setShowKeywords(true)
+        setCurrentIntent(data.direction)
       }
 
     } catch (e) {
@@ -232,7 +233,6 @@ export default function Home() {
   return (
     <main className="min-h-screen bg-gradient-to-br from-emerald-50 via-sky-50 to-white flex items-center justify-center px-6 font-[Pretendard]">
 
-      {/* 🔔 관리실 팝업 */}
       {showAdminPopup && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm">
           <div className="bg-white rounded-2xl px-10 py-8 shadow-2xl text-center">
@@ -242,7 +242,6 @@ export default function Home() {
         </div>
       )}
 
-      {/* 🔝 PARKMATE 헤더 */}
       <header className="absolute top-8 text-center">
         <h1 className="text-4xl font-semibold tracking-[0.35em]">PARKMATE</h1>
         <p className="mt-1 text-xs tracking-[0.35em] text-neutral-400 uppercase">
@@ -251,7 +250,6 @@ export default function Home() {
       </header>
 
       <div className="relative flex items-center">
-        {/* 🤖 지미 */}
         <div className={`${status === "thinking" ? "animate-bounce" : ""}`}>
           <div className="w-56 h-40 rounded-[2.5rem] bg-white shadow-2xl flex items-center justify-center">
             <div className="w-44 h-28 rounded-2xl bg-gradient-to-br from-emerald-300 to-sky-400 flex items-center justify-center gap-6">
@@ -262,7 +260,6 @@ export default function Home() {
           <p className="mt-4 text-center text-neutral-500">지미 · 주차 안내 파트너</p>
         </div>
 
-        {/* 💬 말풍선 */}
         <div className="relative ml-6 -translate-y-12 max-w-[520px] bg-white px-10 py-8 rounded-[2.2rem] shadow-xl">
           <div className="absolute left-[-14px] bottom-1/2 -translate-y-1/2 w-0 h-0
             border-t-[10px] border-b-[10px] border-r-[16px]
@@ -293,7 +290,6 @@ export default function Home() {
         </div>
       </div>
 
-      {/* 🚗 번호판 업로드 */}
       <div className="absolute bottom-12 flex flex-col items-center gap-2">
         <input
           ref={plateInputRef}

@@ -8,16 +8,17 @@ import requests
 import uuid
 import os
 
+from psycopg2.extras import RealDictCursor
+
 from src.db.postgres import get_conn
 from src.speech.tts import synthesize
-from src.storage import upload_image   # ✅ 정상 사용
+from src.storage import upload_image
 
 router = APIRouter()
 
 # =========================
 # OCR 설정 (CPU ONLY)
 # =========================
-print("[PLATE] Initializing EasyOCR (CPU)")
 reader = easyocr.Reader(["ko", "en"], gpu=False)
 
 PLATE_REGEX = re.compile(r"\d{2,3}[가-힣]\d{4}")
@@ -25,6 +26,12 @@ PLATE_REGEX = re.compile(r"\d{2,3}[가-힣]\d{4}")
 COMMON_FIX = {
     "히": "허", "기": "가", "리": "라", "미": "마",
     "비": "바", "시": "사", "지": "자", "오": "호",
+}
+
+VEHICLE_TYPE_LABEL = {
+    "NORMAL": "일반 차량",
+    "VISITOR": "방문 차량",
+    "MEMBER": "정기권 차량",
 }
 
 def normalize_plate(text: str) -> str:
@@ -41,9 +48,7 @@ def detect_plate_region(img: np.ndarray) -> np.ndarray | None:
     blur = cv2.bilateralFilter(gray, 11, 17, 17)
     edges = cv2.Canny(blur, 30, 200)
 
-    contours, _ = cv2.findContours(
-        edges, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE
-    )
+    contours, _ = cv2.findContours(edges, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
 
     candidates = []
     for c in contours:
@@ -77,45 +82,16 @@ def extract_plate(image: np.ndarray) -> tuple[str | None, float]:
 
 
 # =========================
-# Kakao Local API (유지)
-# =========================
-KAKAO_REST_KEY = os.environ.get(
-    "KAKAO_REST_KEY",
-    "ed8389b7bbe2ae8a2b8b3496e4919ecc"
-)
-
-def search_nearby_parking(lat: float, lng: float):
-    url = "https://dapi.kakao.com/v2/local/search/keyword.json"
-    headers = {"Authorization": f"KakaoAK {KAKAO_REST_KEY}"}
-    params = {
-        "query": "주차장",
-        "x": lng,
-        "y": lat,
-        "radius": 500,
-        "size": 1,
-        "sort": "distance"
-    }
-
-    try:
-        res = requests.get(url, headers=headers, params=params, timeout=3)
-        res.raise_for_status()
-        docs = res.json().get("documents", [])
-        return docs[0] if docs else None
-    except Exception as e:
-        print("[KAKAO] ❌ parking search failed:", e)
-        return None
-
-
-# =========================
-# 입출차 + 결제 처리 (DB 스키마 기준)
+# 입출차 처리
 # =========================
 def resolve_direction_and_process(
     plate: str,
-    confidence: float,
     image_url: str,
 ):
+    now = datetime.utcnow()
+
     conn = get_conn()
-    cur = conn.cursor()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
 
     # 1️⃣ vehicle 조회 or 생성
     cur.execute("""
@@ -140,7 +116,7 @@ def resolve_direction_and_process(
 
     # 2️⃣ 활성 세션 조회
     cur.execute("""
-        SELECT id
+        SELECT id, entry_time, entry_image_url
         FROM parking_session
         WHERE vehicle_id = %s
           AND exit_time IS NULL
@@ -159,13 +135,13 @@ def resolve_direction_and_process(
                 entry_time,
                 status,
                 entry_image_url,
-                entry_image_captured_at,
                 created_at
             )
-            VALUES (%s, now(), 'PARKED', %s, now(), now())
-            RETURNING id
+            VALUES (%s, now(), 'PARKED', %s, now())
+            RETURNING id, entry_time
         """, (vehicle_id, image_url))
-        session_id = cur.fetchone()["id"]
+        new_session = cur.fetchone()
+        session_id = new_session["id"]
 
         payment_status = "FREE" if vehicle_type != "NORMAL" else "UNPAID"
 
@@ -177,24 +153,27 @@ def resolve_direction_and_process(
                 created_at
             )
             VALUES (%s, 0, %s, now())
-            RETURNING id, payment_status
         """, (session_id, payment_status))
-        payment = cur.fetchone()
 
         conn.commit()
         conn.close()
 
-        message = "입차가 확인되었습니다.\n다른 문제가 있으시면 말씀해주세요."
+        message = "입차가 확인되었습니다."
 
         return {
             "direction": "ENTRY",
             "parking_session_id": session_id,
-            "payment_id": payment["id"],
-            "payment_status": payment["payment_status"],
             "barrier_open": True,
+
+            "card": {
+                "plate": plate,
+                "vehicle_type": vehicle_type,
+                "vehicle_type_label": VEHICLE_TYPE_LABEL.get(vehicle_type),
+                "entry_image_url": image_url,
+            },
+
             "message": message,
             "tts_url": synthesize(message),
-            "end_session": False,
         }
 
     # =========================
@@ -203,46 +182,79 @@ def resolve_direction_and_process(
     session_id = session["id"]
 
     cur.execute("""
-        SELECT id, payment_status
+        SELECT payment_status
         FROM payment
         WHERE parking_session_id = %s
         LIMIT 1
     """, (session_id,))
     payment = cur.fetchone()
+    payment_status = payment["payment_status"]
 
-    if payment["payment_status"] not in ("PAID", "FREE"):
+    exit_time = now.isoformat()
+
+    if payment_status not in ("PAID", "FREE"):
         conn.close()
-        message = "아직 결제가 완료되지 않았어요.\n결제를 진행해주세요."
+        message = "결제가 필요합니다."
+
         return {
             "direction": "EXIT",
+            "parking_session_id": session_id,
             "can_pay": True,
             "barrier_open": False,
+
+            "card": {
+                "plate": plate,
+                "vehicle_type": vehicle_type,
+                "vehicle_type_label": VEHICLE_TYPE_LABEL.get(vehicle_type),
+                "entry_image_url": session["entry_image_url"],
+                "exit_image_url": image_url,
+                "payment_status": payment_status,
+            },
+
+            "time_info": {
+                "entry_time": session["entry_time"].isoformat(),
+                "exit_time": exit_time,
+            },
+
             "message": message,
             "tts_url": synthesize(message),
-            "end_session": False,
         }
 
+    # 결제 완료 출차
     cur.execute("""
         UPDATE parking_session
         SET exit_time = now(),
             status = 'EXITED',
-            exit_image_url = %s,
-            exit_image_captured_at = now()
+            exit_image_url = %s
         WHERE id = %s
     """, (image_url, session_id))
 
     conn.commit()
     conn.close()
 
-    message = "출차가 확인되었습니다.\n안전 운행하세요."
+    message = "출차가 확인되었습니다."
 
     return {
         "direction": "EXIT",
         "parking_session_id": session_id,
         "barrier_open": True,
+
+        "card": {
+            "plate": plate,
+            "vehicle_type": vehicle_type,
+            "vehicle_type_label": VEHICLE_TYPE_LABEL.get(vehicle_type),
+            "entry_image_url": session["entry_image_url"],
+            "exit_image_url": image_url,
+            "payment_status": payment_status,
+        },
+
+        "time_info": {
+            "entry_time": session["entry_time"].isoformat(),
+            "exit_time": exit_time,
+        },
+
         "message": message,
         "tts_url": synthesize(message),
-        "end_session": False,
     }
 
 
@@ -250,39 +262,30 @@ def resolve_direction_and_process(
 # API Endpoint
 # =========================
 @router.post("/api/plate/recognize")
-async def recognize_plate(
-    image: UploadFile = File(...)
-):
+async def recognize_plate(image: UploadFile = File(...)):
     contents = await image.read()
     img = cv2.imdecode(np.frombuffer(contents, np.uint8), cv2.IMREAD_COLOR)
 
     if img is None:
         return {"success": False, "error": "INVALID_IMAGE"}
 
-    # 🔥 이미지 업로드 (고정 경로)
     image_key = f"parking/raw/{uuid.uuid4()}.jpg"
     image_url = upload_image(contents, image_key)
 
     plate_img = detect_plate_region(img)
     if plate_img is None:
-        return {
-            "success": False,
-            "error": "PLATE_NOT_FOUND",
-            "image_url": image_url
-        }
+        return {"success": False, "error": "PLATE_NOT_FOUND"}
 
     plate, confidence = extract_plate(plate_img)
-    if not plate or confidence < 0.6:
+    if not plate or confidence < 0.45:
         return {
             "success": False,
             "error": "LOW_CONFIDENCE",
             "confidence": confidence,
-            "image_url": image_url
         }
 
     result = resolve_direction_and_process(
         plate=plate,
-        confidence=confidence,
         image_url=image_url,
     )
 
@@ -290,6 +293,5 @@ async def recognize_plate(
         "success": True,
         "plate": plate,
         "confidence": confidence,
-        "image_url": image_url,
-        **result
+        **result,
     }

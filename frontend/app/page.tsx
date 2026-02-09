@@ -23,6 +23,16 @@ type PaymentFailReason =
   | "USER_CANCEL"
   | "ETC"
 
+type PlateCard = {
+  plate: string
+  vehicleTypeLabel: string
+  entryImageUrl?: string
+  exitImageUrl?: string
+  entryTime?: string
+  exitTime?: string
+  paymentStatus?: string
+}
+
 /* ===============================
    Constants
 =============================== */
@@ -73,7 +83,7 @@ export default function Home() {
   const wsRef = useRef<WebSocket | null>(null)
   const streamRef = useRef<MediaStream | null>(null)
   const plateInputRef = useRef<HTMLInputElement | null>(null)
-
+  const [plateCard, setPlateCard] = useState<PlateCard | null>(null)
   /* ===============================
      Mic control
   =============================== */
@@ -135,6 +145,7 @@ export default function Home() {
           setActive(false)
           setStatus("idle")
           setIntent("NONE")
+          setPlateCard(null)
           setBubbleText("어떤 문의가 있으신가요?")
         }
       }
@@ -188,6 +199,17 @@ export default function Home() {
       setStatus("idle")
       return
     }
+
+    /* 카드 정보 세팅 */
+    setPlateCard({
+      plate: data.plate,
+      vehicleTypeLabel: data.card?.vehicle_type_label,
+      entryImageUrl: data.card?.entry_image_url,
+      exitImageUrl: data.card?.exit_image_url,
+      entryTime: data.time_info?.entry_time,
+      exitTime: data.time_info?.exit_time,
+      paymentStatus: data.card?.payment_status,
+    })
 
     setDirection(data.direction)
     setParkingSessionId(data.parking_session_id ?? null)
@@ -265,7 +287,6 @@ export default function Home() {
   =============================== */
   return (
     <main className="min-h-screen bg-gradient-to-br from-emerald-50 via-sky-50 to-white flex items-center justify-center px-6 font-[Pretendard]">
-
       {/* 상단 헤더 */}
       <header className="absolute top-8 text-center">
         <h1 className="text-4xl font-semibold tracking-[0.35em]">PARKMATE</h1>
@@ -274,8 +295,9 @@ export default function Home() {
         </p>
       </header>
 
-      {/* 지미 + 말풍선 */}
+      {/* 지미 + 말풍선 + 카드 */}
       <div className="relative flex items-center">
+        {/* 지미 */}
         <div className={`${status === "thinking" ? "animate-bounce" : ""}`}>
           <div className="w-56 h-40 rounded-[2.5rem] bg-white shadow-2xl flex items-center justify-center">
             <div className="w-44 h-28 rounded-2xl bg-gradient-to-br from-emerald-300 to-sky-400 flex items-center justify-center gap-6">
@@ -283,13 +305,19 @@ export default function Home() {
               <span className="w-4 h-4 bg-white rounded-full" />
             </div>
           </div>
-          <p className="mt-4 text-center text-neutral-500">지미 · 주차 안내 파트너</p>
+          <p className="mt-4 text-center text-neutral-500">
+            지미 · 주차 안내 파트너
+          </p>
         </div>
 
+        {/* 말풍선 */}
         <div className="relative ml-6 -translate-y-12 max-w-[520px] bg-white px-10 py-8 rounded-[2.2rem] shadow-xl">
-          <div className="absolute left-[-14px] bottom-1/2 -translate-y-1/2 w-0 h-0
+          {/* 말풍선 꼬리 */}
+          <div
+            className="absolute left-[-14px] bottom-1/2 -translate-y-1/2 w-0 h-0
             border-t-[10px] border-b-[10px] border-r-[16px]
-            border-transparent border-r-white" />
+            border-transparent border-r-white"
+          />
 
           <p className="text-[22px] leading-relaxed whitespace-pre-line">
             {bubbleText}
@@ -305,6 +333,56 @@ export default function Home() {
               </button>
             ))}
           </div>
+
+          {/* 🔥 지미가 알려주는 차량 카드 */}
+          {plateCard && (
+            <div className="relative mt-6 w-[360px] bg-white rounded-3xl shadow-2xl overflow-hidden">
+              {/* 카드 꼬리 */}
+              <div
+                className="absolute -top-3 left-10 w-0 h-0
+                border-l-[10px] border-r-[10px] border-b-[14px]
+                border-transparent border-b-white"
+              />
+
+              <img
+                src={
+                  (direction === "ENTRY"
+                    ? plateCard.entryImageUrl
+                    : plateCard.exitImageUrl) || "/placeholder.jpg"
+                }
+                className="w-full h-44 object-cover"
+              />
+
+              <div className="p-5 space-y-2">
+                <p className="text-xl font-bold tracking-wider">
+                  {plateCard.plate}
+                </p>
+
+                <span className="inline-block px-3 py-1 rounded-full text-sm font-semibold bg-emerald-100 text-emerald-700">
+                  {plateCard.vehicleTypeLabel}
+                </span>
+
+                {direction === "EXIT" && (
+                  <div className="mt-2 text-sm text-neutral-600 space-y-1">
+                    <p>
+                      입차{" "}
+                      {plateCard.entryTime &&
+                        new Date(plateCard.entryTime).toLocaleTimeString()}
+                    </p>
+                    <p>
+                      출차{" "}
+                      {plateCard.exitTime &&
+                        new Date(plateCard.exitTime).toLocaleTimeString()}
+                    </p>
+                    <p className="font-semibold">
+                      결제{" "}
+                      {plateCard.paymentStatus === "FREE" ? "완료" : "미결제"}
+                    </p>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
         </div>
       </div>
 
@@ -330,6 +408,7 @@ export default function Home() {
           >
             🚗 차량 번호판 업로드
           </button>
+
           {direction === "EXIT" && (
             <button
               onClick={() => setShowPaymentPopup(true)}

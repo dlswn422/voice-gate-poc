@@ -3,9 +3,9 @@ from pydantic import BaseModel
 from typing import Optional, Literal
 
 from src.db.postgres import get_conn
+from src.speech.tts import synthesize
 
 router = APIRouter()
-
 
 # ==================================================
 # Request Schema
@@ -22,6 +22,19 @@ class DemoPaymentRequest(BaseModel):
             "ETC",
         ]
     ] = None
+
+
+# ==================================================
+# TTS Message Map
+# ==================================================
+PAYMENT_TTS = {
+    "SUCCESS": "결제가 완료되었습니다.\n출차를 진행해주세요.",
+    "LIMIT_EXCEEDED": "결제 한도를 초과했습니다.\n다른 결제 수단을 이용해주세요.",
+    "NETWORK_ERROR": "결제 중 네트워크 오류가 발생했습니다.\n잠시 후 다시 시도해주세요.",
+    "INSUFFICIENT_FUNDS": "잔액이 부족합니다.\n다른 결제 수단을 이용해주세요.",
+    "USER_CANCEL": "결제가 취소되었습니다.",
+    "ETC": "결제에 실패했습니다.\n관리자에게 문의해주세요.",
+}
 
 
 # ==================================================
@@ -50,21 +63,18 @@ def demo_payment(req: DemoPaymentRequest):
         if not session:
             raise HTTPException(
                 status_code=404,
-                detail="PARKING_SESSION_NOT_FOUND"
+                detail="PARKING_SESSION_NOT_FOUND",
             )
 
-        # --------------------------------------------------
-        # 2️⃣ 출차 상태가 아닌 경우 → 결제 차단
-        # exit_time IS NULL = 아직 출차 전
-        # --------------------------------------------------
+        # 출차 이후 결제 차단
         if session["exit_time"] is not None:
             raise HTTPException(
                 status_code=409,
-                detail="PAYMENT_NOT_ALLOWED_AFTER_EXIT"
+                detail="PAYMENT_NOT_ALLOWED_AFTER_EXIT",
             )
 
         # --------------------------------------------------
-        # 3️⃣ payment 조회
+        # 2️⃣ payment 조회
         # --------------------------------------------------
         cur.execute(
             """
@@ -80,26 +90,23 @@ def demo_payment(req: DemoPaymentRequest):
         if not payment:
             raise HTTPException(
                 status_code=404,
-                detail="PAYMENT_NOT_FOUND"
+                detail="PAYMENT_NOT_FOUND",
             )
 
         payment_id = payment["id"]
         payment_status = payment["payment_status"]
 
-        # --------------------------------------------------
-        # 4️⃣ 이미 결제 완료된 경우 → 차단
-        # --------------------------------------------------
+        # 이미 결제 완료
         if payment_status in ("PAID", "FREE"):
             raise HTTPException(
                 status_code=409,
-                detail="PAYMENT_ALREADY_COMPLETED"
+                detail="PAYMENT_ALREADY_COMPLETED",
             )
 
         # --------------------------------------------------
-        # 5️⃣ SUCCESS 처리
+        # ✅ SUCCESS
         # --------------------------------------------------
         if req.result == "SUCCESS":
-            # payment 상태 업데이트
             cur.execute(
                 """
                 UPDATE payment
@@ -109,7 +116,6 @@ def demo_payment(req: DemoPaymentRequest):
                 (payment_id,),
             )
 
-            # payment_log 기록
             cur.execute(
                 """
                 INSERT INTO payment_log (
@@ -125,19 +131,23 @@ def demo_payment(req: DemoPaymentRequest):
 
             conn.commit()
 
+            message = PAYMENT_TTS["SUCCESS"]
+
             return {
                 "success": True,
                 "result": "SUCCESS",
+                "message": message,
+                "tts_url": synthesize(message),
             }
 
         # --------------------------------------------------
-        # 6️⃣ FAIL 처리
+        # ❌ FAIL
         # --------------------------------------------------
         if req.result == "FAIL":
             if not req.reason:
                 raise HTTPException(
                     status_code=400,
-                    detail="FAIL_REASON_REQUIRED"
+                    detail="FAIL_REASON_REQUIRED",
                 )
 
             cur.execute(
@@ -155,10 +165,17 @@ def demo_payment(req: DemoPaymentRequest):
 
             conn.commit()
 
+            message = PAYMENT_TTS.get(
+                req.reason,
+                "결제에 실패했습니다.\n다시 시도해주세요."
+            )
+
             return {
                 "success": True,
                 "result": "FAIL",
                 "reason": req.reason,
+                "message": message,
+                "tts_url": synthesize(message),
             }
 
     except HTTPException:
@@ -170,7 +187,7 @@ def demo_payment(req: DemoPaymentRequest):
         print("[PAYMENT DEMO ERROR]", e)
         raise HTTPException(
             status_code=500,
-            detail="INTERNAL_ERROR"
+            detail="INTERNAL_ERROR",
         )
 
     finally:

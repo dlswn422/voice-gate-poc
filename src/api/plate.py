@@ -255,7 +255,7 @@ def resolve_direction_and_process(plate: str):
     conn.close()
     message = (
         "아직 결제가 완료되지 않았어요.\n"
-        "결제 후 출차하실 수 있어요."
+        "결제를 진행해주세요."
     )
 
     return {

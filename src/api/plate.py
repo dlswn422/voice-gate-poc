@@ -155,6 +155,7 @@ def resolve_direction_and_process(plate: str):
 
             return {
                 "direction": "ENTRY",
+                "can_pay": False,
                 "barrier_open": False,
                 "message": message,
                 "tts_url": synthesize(message),
@@ -184,7 +185,9 @@ def resolve_direction_and_process(plate: str):
                 created_at
             )
             VALUES (%s, %s, %s, now())
+            RETURNING id, payment_status
         """, (session_id, 0, payment_status))
+        payment = cur.fetchone()
 
         conn.commit()
         conn.close()
@@ -196,6 +199,10 @@ def resolve_direction_and_process(plate: str):
 
         return {
             "direction": "ENTRY",
+            "parking_session_id": session_id,
+            "payment_id": payment["id"],
+            "payment_status": payment["payment_status"],
+            "can_pay": False,   # 입차 시 결제 불가
             "barrier_open": True,
             "message": message,
             "tts_url": synthesize(message),
@@ -208,13 +215,14 @@ def resolve_direction_and_process(plate: str):
     session_id = session["id"]
 
     cur.execute("""
-        SELECT payment_status
+        SELECT id, payment_status
         FROM payment
         WHERE parking_session_id = %s
         LIMIT 1
     """, (session_id,))
     payment = cur.fetchone()
 
+    # ✅ 이미 결제 완료 → 출차 허용
     if payment and payment["payment_status"] in ("PAID", "FREE"):
         cur.execute("""
             UPDATE parking_session
@@ -232,6 +240,10 @@ def resolve_direction_and_process(plate: str):
 
         return {
             "direction": "EXIT",
+            "parking_session_id": session_id,
+            "payment_id": payment["id"],
+            "payment_status": payment["payment_status"],
+            "can_pay": False,   # ✅ 이미 결제됨
             "paid": True,
             "barrier_open": True,
             "message": message,
@@ -239,14 +251,19 @@ def resolve_direction_and_process(plate: str):
             "end_session": False,
         }
 
+    # ❗ 결제 안 된 출차 시도
     conn.close()
     message = (
         "아직 결제가 완료되지 않았어요.\n"
-        "혹시 다른 문제가 있으신가요?"
+        "결제 후 출차하실 수 있어요."
     )
 
     return {
         "direction": "EXIT",
+        "parking_session_id": session_id,
+        "payment_id": payment["id"],
+        "payment_status": payment["payment_status"],
+        "can_pay": True,    # ✅ 여기서만 결제 가능
         "paid": False,
         "barrier_open": False,
         "message": message,

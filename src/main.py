@@ -19,7 +19,7 @@ from src.engine.app_engine import AppEngine
 from src.api.voice import router as voice_router
 from src.api.voice_ws import router as voice_ws_router  # ✅ WebSocket
 from src.api.plate import router as plate_router        # ✅ 번호판 OCR API (신규)
-
+from src.api.payment import router as payment_router
 
 # ==================================================
 # FastAPI App
@@ -67,11 +67,14 @@ def startup():
 # ==================================================
 # Routers
 # ==================================================
-# 1️⃣ 기존 HTTP API (/voice)
+# 기존 HTTP API (/voice)
 app.include_router(voice_router)
 
-# 2️⃣ WebSocket API (/ws/voice)
+# WebSocket API (/ws/voice)
 app.include_router(voice_ws_router)
 
-# 3️⃣ 번호판 OCR API (/api/plate/recognize)
+# 번호판 OCR API (/api/plate/recognize)
 app.include_router(plate_router)
+
+# 결재하기
+app.include_router(payment_router)

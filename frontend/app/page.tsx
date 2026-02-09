@@ -15,6 +15,14 @@ type Intent =
   | "FACILITY"
   | "NONE"
 
+type PaymentResult = "SUCCESS" | "FAIL"
+type PaymentFailReason =
+  | "LIMIT_EXCEEDED"
+  | "NETWORK_ERROR"
+  | "INSUFFICIENT_FUNDS"
+  | "USER_CANCEL"
+  | "ETC"
+
 /* ===============================
    Constants
 =============================== */
@@ -35,6 +43,7 @@ export default function Home() {
   /* ===============================
      State
   =============================== */
+  const [direction, setDirection] = useState<"ENTRY" | "EXIT" | null>(null)
   const [status, _setStatus] = useState<Status>("idle")
   const statusRef = useRef<Status>("idle")
   const setStatus = (s: Status) => {
@@ -45,9 +54,18 @@ export default function Home() {
   const [bubbleText, setBubbleText] = useState("어떤 문의가 있으신가요?")
   const [active, setActive] = useState(false)
   const [showAdminPopup, setShowAdminPopup] = useState(false)
-
-  // ✅ FIX: 현재 의도 상태
   const [intent, setIntent] = useState<Intent>("NONE")
+
+  const [showPaymentPopup, setShowPaymentPopup] = useState(false)
+  const [paymentResult, setPaymentResult] = useState<PaymentResult | null>(null)
+  const [paymentReason, setPaymentReason] = useState<PaymentFailReason | null>(null)
+
+  // ✅ 추가된 상태
+  const [paymentSubmitting, setPaymentSubmitting] = useState(false)
+  const [paymentFeedback, setPaymentFeedback] = useState<PaymentResult | null>(null)
+
+  // ✅ 핵심: 현재 주차 세션 ID
+  const [parkingSessionId, setParkingSessionId] = useState<string | null>(null)
 
   /* ===============================
      Refs
@@ -58,7 +76,7 @@ export default function Home() {
 
   /* ===============================
      Mic control
-=============================== */
+  =============================== */
   const muteMicHard = () => {
     streamRef.current?.getAudioTracks().forEach(t => (t.enabled = false))
   }
@@ -69,13 +87,13 @@ export default function Home() {
 
   /* ===============================
      Voice WS Start
-=============================== */
+  =============================== */
   const startVoice = async () => {
     if (active) return
 
     setActive(true)
     setStatus("listening")
-    setIntent("NONE") // ✅ 세션 시작 시 초기화
+    setIntent("NONE")
 
     const ws = new WebSocket(WS_BASE)
     ws.binaryType = "arraybuffer"
@@ -85,41 +103,20 @@ export default function Home() {
       try {
         const data = JSON.parse(event.data)
 
-        /* ===============================
-           assistant_state 처리
-        =============================== */
         if (data.type === "assistant_state") {
           if (data.state === "THINKING") {
             setStatus("thinking")
             setBubbleText("잠시만요…\n확인 중이에요.")
           }
-
-          if (data.state === "LISTENING") {
-            setStatus("listening")
-          }
-
-          if (data.state === "SPEAKING") {
-            setStatus("speaking")
-          }
+          if (data.state === "LISTENING") setStatus("listening")
+          if (data.state === "SPEAKING") setStatus("speaking")
           return
         }
 
-        /* ===============================
-           assistant_message 처리
-        =============================== */
         if (data.type === "assistant_message") {
-          const {
-            text,
-            tts_url,
-            end_session,
-            system_action,
-            intent: serverIntent, // ✅ FIX: 서버 intent 수신
-          } = data
+          const { text, tts_url, end_session, system_action, intent: serverIntent } = data
 
-          // ✅ FIX: intent 반영
-          if (serverIntent) {
-            setIntent(serverIntent)
-          }
+          if (serverIntent) setIntent(serverIntent)
 
           if (system_action === "CALL_ADMIN") {
             muteMicHard()
@@ -157,7 +154,7 @@ export default function Home() {
           if (end_session) {
             setActive(false)
             setStatus("idle")
-            setIntent("NONE") // ✅ FIX: 종료 시 초기화
+            setIntent("NONE")
             setBubbleText("어떤 문의가 있으신가요?")
           }
         }
@@ -187,7 +184,7 @@ export default function Home() {
 
   /* ===============================
      Plate Upload
-=============================== */
+  =============================== */
   const handlePlateUpload = async (file: File) => {
     if (active) return
 
@@ -209,6 +206,11 @@ export default function Home() {
         setStatus("idle")
         return
       }
+      /* 입출차 구분 */
+      setDirection(data.direction)
+      setParkingSessionId(data.parking_session_id ?? null)
+
+      setParkingSessionId(data.parking_session_id ?? null)
 
       setBubbleText(data.message)
       setStatus("speaking")
@@ -220,7 +222,6 @@ export default function Home() {
         startVoice()
       }
       audio.play()
-
     } catch (e) {
       console.error(e)
       setBubbleText("시스템 오류가 발생했어요.")
@@ -228,28 +229,45 @@ export default function Home() {
     }
   }
 
-  const onPlateFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0]
-    if (!file) return
-    handlePlateUpload(file)
-    e.target.value = ""
+  /* ===============================
+     Payment
+  =============================== */
+  const confirmPayment = async () => {
+    if (!paymentResult || !parkingSessionId) return
+
+    setPaymentSubmitting(true)
+    setPaymentFeedback(null)
+
+    try {
+      const res = await fetch(`${API_BASE}/api/payment/demo`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          parking_session_id: parkingSessionId,
+          result: paymentResult,
+          reason: paymentResult === "FAIL" ? paymentReason : null,
+        }),
+      })
+
+      if (res.ok) {
+        setPaymentFeedback(paymentResult)
+      } else {
+        setPaymentFeedback("FAIL")
+      }
+    } catch {
+      setPaymentFeedback("FAIL")
+    } finally {
+      setPaymentSubmitting(false)
+    }
   }
 
   /* ===============================
      UI
-=============================== */
+  =============================== */
   return (
     <main className="min-h-screen bg-gradient-to-br from-emerald-50 via-sky-50 to-white flex items-center justify-center px-6 font-[Pretendard]">
 
-      {showAdminPopup && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm">
-          <div className="bg-white rounded-2xl px-10 py-8 shadow-2xl text-center">
-            <p className="text-2xl font-semibold">🔔 관리실에 연락했습니다</p>
-            <p className="mt-2 text-neutral-600">직원이 곧 도와드릴 예정입니다.</p>
-          </div>
-        </div>
-      )}
-
+      {/* 상단 헤더 */}
       <header className="absolute top-8 text-center">
         <h1 className="text-4xl font-semibold tracking-[0.35em]">PARKMATE</h1>
         <p className="mt-1 text-xs tracking-[0.35em] text-neutral-400 uppercase">
@@ -257,6 +275,7 @@ export default function Home() {
         </p>
       </header>
 
+      {/* 지미 + 말풍선 */}
       <div className="relative flex items-center">
         <div className={`${status === "thinking" ? "animate-bounce" : ""}`}>
           <div className="w-56 h-40 rounded-[2.5rem] bg-white shadow-2xl flex items-center justify-center">
@@ -277,14 +296,10 @@ export default function Home() {
             {bubbleText}
           </p>
 
-          {/* ✅ FIX: intent 기반 키워드 전환 */}
           <div className="mt-4 grid grid-cols-2 gap-3">
             {INTENT_UI_KEYWORDS[intent].map((kw) => (
               <button
                 key={kw}
-                onClick={() =>
-                  wsRef.current?.send(JSON.stringify({ type: "ui_keyword", text: kw }))
-                }
                 className="py-3 px-4 rounded-full border font-semibold hover:bg-neutral-100 transition"
               >
                 {kw}
@@ -294,24 +309,146 @@ export default function Home() {
         </div>
       </div>
 
+      {/* 하단 버튼 */}
       <div className="absolute bottom-12 flex flex-col items-center gap-2">
         <input
           ref={plateInputRef}
           type="file"
           accept="image/*"
           hidden
-          onChange={onPlateFileChange}
+          onChange={(e) => {
+            const file = e.target.files?.[0]
+            if (!file) return
+            handlePlateUpload(file)
+            e.target.value = ""
+          }}
         />
-        <button
-          onClick={() => plateInputRef.current?.click()}
-          className="px-6 py-3 rounded-full bg-neutral-900 text-white font-semibold shadow-lg hover:bg-neutral-800 transition"
-        >
-          🚗 차량 번호판 업로드
-        </button>
+
+        <div className="flex items-center gap-4">
+          <button
+            onClick={() => plateInputRef.current?.click()}
+            className="px-6 py-3 rounded-full bg-neutral-900 text-white font-semibold shadow-lg hover:bg-neutral-800 transition"
+          >
+            🚗 차량 번호판 업로드
+          </button>
+          {direction === "EXIT" && (
+            <button
+              onClick={() => setShowPaymentPopup(true)}
+              className="px-6 py-3 rounded-full bg-emerald-600 text-white font-semibold shadow-lg hover:bg-emerald-700 transition"
+            >
+              💳 결제하기
+            </button>
+          )}
+        </div>
+
         <p className="text-xs text-neutral-400">
-          ※ 실제 환경에서는 차량 정차 시 자동 인식됩니다
+          ※ 현재는 데모 환경으로, 차량 번호판 업로드 방식으로 입·출차를 확인합니다
         </p>
       </div>
+
+      {/* ===============================
+         결제 팝업 (UI 개선, 나머지 전부 동일)
+      =============================== */}
+      {showPaymentPopup && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm">
+          <div className="bg-white rounded-2xl px-10 py-8 shadow-2xl w-[420px]">
+            <p className="text-xl font-semibold text-center">💳 결제 처리</p>
+
+            {/* 결과 선택 */}
+            <div className="mt-6 grid grid-cols-2 gap-4">
+              <button
+                onClick={() => {
+                  setPaymentResult("SUCCESS")
+                  setPaymentReason(null)
+                }}
+                className={`p-4 rounded-xl border text-center font-semibold transition
+                  ${paymentResult === "SUCCESS"
+                    ? "bg-emerald-600 text-white border-emerald-600"
+                    : "hover:bg-neutral-100"
+                  }`}
+              >
+                ✅ 결제 성공
+              </button>
+
+              <button
+                onClick={() => setPaymentResult("FAIL")}
+                className={`p-4 rounded-xl border text-center font-semibold transition
+                  ${paymentResult === "FAIL"
+                    ? "bg-rose-500 text-white border-rose-500"
+                    : "hover:bg-neutral-100"
+                  }`}
+              >
+                ❌ 결제 실패
+              </button>
+            </div>
+
+            {/* 실패 사유 */}
+            {paymentResult === "FAIL" && (
+              <div className="mt-6">
+                <p className="mb-2 text-sm text-neutral-500">실패 사유 선택</p>
+                <div className="grid grid-cols-2 gap-2">
+                  {[
+                    ["LIMIT_EXCEEDED", "한도 초과"],
+                    ["INSUFFICIENT_FUNDS", "잔액 부족"],
+                    ["NETWORK_ERROR", "통신 오류"],
+                    ["USER_CANCEL", "사용자 취소"],
+                    ["ETC", "기타"],
+                  ].map(([code, label]) => (
+                    <button
+                      key={code}
+                      onClick={() => setPaymentReason(code as PaymentFailReason)}
+                      className={`px-3 py-2 rounded-lg border text-sm transition
+                        ${paymentReason === code
+                          ? "bg-neutral-900 text-white border-neutral-900"
+                          : "hover:bg-neutral-100"
+                        }`}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* 경고 문구 */}
+            {(!paymentResult || (paymentResult === "FAIL" && !paymentReason)) && (
+              <p className="mt-4 text-sm text-rose-500 text-center">
+                결제 결과와 필요한 정보를 모두 선택해 주세요.
+              </p>
+            )}
+            {/* 결제 결과 피드백 */}
+            {paymentFeedback && (
+              <div
+                className={`mt-4 p-3 rounded-xl text-center font-semibold
+                  ${paymentFeedback === "SUCCESS"
+                    ? "bg-emerald-100 text-emerald-700"
+                    : "bg-rose-100 text-rose-700"
+                  }`}
+              >
+                {paymentFeedback === "SUCCESS"
+                  ? "결제가 성공적으로 완료되었습니다."
+                  : "결제에 실패했습니다. 다시 시도해 주세요."}
+              </div>
+            )}
+            <div className="mt-6 flex justify-between">
+              <button
+                onClick={() => setShowPaymentPopup(false)}
+                className="px-4 py-2 rounded-full border"
+              >
+                취소
+              </button>
+              <button
+                onClick={confirmPayment}
+                disabled={!paymentResult || (paymentResult === "FAIL" && !paymentReason)}
+                className="px-4 py-2 rounded-full bg-emerald-600 text-white disabled:opacity-40"
+              >
+                확인
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
     </main>
   )
 }

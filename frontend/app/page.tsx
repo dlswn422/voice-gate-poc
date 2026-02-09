@@ -99,7 +99,7 @@ export default function Home() {
      Voice WS Start
   =============================== */
   const startVoice = async () => {
-    if (active || voiceLocked) return
+    if (active || voiceLocked || showPaymentPopup) return
 
     setActive(true)
     setStatus("listening")
@@ -411,8 +411,21 @@ export default function Home() {
 
           {direction === "EXIT" && (
             <button
-              onClick={() => setShowPaymentPopup(true)}
-              className="px-6 py-3 rounded-full bg-emerald-600 text-white font-semibold shadow-lg hover:bg-emerald-700 transition"
+              onClick={() => {
+                setShowPaymentPopup(true)
+
+                // 🔒 음성 완전 차단
+                setVoiceLocked(true)
+                muteMicHard()
+
+                // 🔌 WebSocket 중단
+                wsRef.current?.close()
+                wsRef.current = null
+
+                setActive(false)
+                setStatus("idle")
+              }}
+              className="px-6 py-3 rounded-full bg-emerald-600 text-white font-semibold"
             >
               💳 결제하기
             </button>

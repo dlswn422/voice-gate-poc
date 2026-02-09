@@ -3,7 +3,7 @@ from pydantic import BaseModel
 from typing import Optional, Literal
 
 from src.db.postgres import get_conn
-from src.speech.tts import synthesize
+import src.app_state as app_state
 
 router = APIRouter()
 
@@ -25,20 +25,7 @@ class DemoPaymentRequest(BaseModel):
 
 
 # ==================================================
-# TTS Message Map
-# ==================================================
-PAYMENT_TTS = {
-    "SUCCESS": "결제가 완료되었습니다.\n출차를 진행해주세요.",
-    "LIMIT_EXCEEDED": "결제 한도를 초과했습니다.\n다른 결제 수단을 이용해주세요.",
-    "NETWORK_ERROR": "결제 중 네트워크 오류가 발생했습니다.\n잠시 후 다시 시도해주세요.",
-    "INSUFFICIENT_FUNDS": "잔액이 부족합니다.\n다른 결제 수단을 이용해주세요.",
-    "USER_CANCEL": "결제가 취소되었습니다.",
-    "ETC": "결제에 실패했습니다.\n관리자에게 문의해주세요.",
-}
-
-
-# ==================================================
-# Demo Payment API
+# Demo Payment API (FINAL)
 # ==================================================
 @router.post("/api/payment/demo")
 def demo_payment(req: DemoPaymentRequest):
@@ -66,7 +53,6 @@ def demo_payment(req: DemoPaymentRequest):
                 detail="PARKING_SESSION_NOT_FOUND",
             )
 
-        # 출차 이후 결제 차단
         if session["exit_time"] is not None:
             raise HTTPException(
                 status_code=409,
@@ -96,7 +82,6 @@ def demo_payment(req: DemoPaymentRequest):
         payment_id = payment["id"]
         payment_status = payment["payment_status"]
 
-        # 이미 결제 완료
         if payment_status in ("PAID", "FREE"):
             raise HTTPException(
                 status_code=409,
@@ -131,13 +116,16 @@ def demo_payment(req: DemoPaymentRequest):
 
             conn.commit()
 
-            message = PAYMENT_TTS["SUCCESS"]
+            # 🔔 중앙 세션 엔진에 이벤트 전달
+            engine_result = app_state.session_engine.handle_event({
+                "type": "PAYMENT_RESULT",
+                "result": "SUCCESS",
+            })
 
             return {
                 "success": True,
                 "result": "SUCCESS",
-                "message": message,
-                "tts_url": synthesize(message),
+                **engine_result,
             }
 
         # --------------------------------------------------
@@ -165,17 +153,17 @@ def demo_payment(req: DemoPaymentRequest):
 
             conn.commit()
 
-            message = PAYMENT_TTS.get(
-                req.reason,
-                "결제에 실패했습니다.\n다시 시도해주세요."
-            )
+            engine_result = app_state.session_engine.handle_event({
+                "type": "PAYMENT_RESULT",
+                "result": "FAIL",
+                "reason": req.reason,
+            })
 
             return {
                 "success": True,
                 "result": "FAIL",
                 "reason": req.reason,
-                "message": message,
-                "tts_url": synthesize(message),
+                **engine_result,
             }
 
     except HTTPException:

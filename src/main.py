@@ -2,7 +2,7 @@ from dotenv import load_dotenv
 from pathlib import Path
 
 # ==================================================
-# .env 명시적 로드 (중요)
+# .env 명시적 로드
 # ==================================================
 env_path = Path(__file__).resolve().parent / ".env"
 load_dotenv(env_path)
@@ -15,10 +15,12 @@ from faster_whisper import WhisperModel
 
 import src.app_state as app_state
 from src.engine.app_engine import AppEngine
+from src.parking.session_engine import ParkingSessionEngine
 
+# ✅ Routers
 from src.api.voice import router as voice_router
-from src.api.voice_ws import router as voice_ws_router  # ✅ WebSocket
-from src.api.plate import router as plate_router        # ✅ 번호판 OCR API (신규)
+from src.api.voice_session_ws import router as voice_ws_router   # ⭐ 변경
+from src.api.plate import router as plate_router
 from src.api.payment import router as payment_router
 
 # ==================================================
@@ -26,9 +28,8 @@ from src.api.payment import router as payment_router
 # ==================================================
 app = FastAPI(title="ParkAssist Voice API")
 
-
 # ==================================================
-# CORS 설정
+# CORS
 # ==================================================
 app.add_middleware(
     CORSMiddleware,
@@ -37,12 +38,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 # ==================================================
 # Static (TTS mp3 서빙)
 # ==================================================
-app.mount("/static", StaticFiles(directory="static"), name="static")
-
+app.mount(
+    "/static",
+    StaticFiles(directory="static"),
+    name="static",
+)
 
 # ==================================================
 # Startup: 모델 / 엔진 메모리 상주
@@ -51,9 +54,9 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 def startup():
     print("[Startup] Loading Whisper model...")
 
-    # 🔥 HTTP / WebSocket 공용 Whisper 모델
+    # 🔥 Whisper (HTTP + WebSocket 공용)
     app_state.whisper_model = WhisperModel(
-        "medium",            # 기존 그대로
+        "medium",
         device="cpu",
         compute_type="int8_float32",
     )
@@ -61,20 +64,15 @@ def startup():
     print("[Startup] Initializing AppEngine...")
     app_state.app_engine = AppEngine()
 
-    print("[Startup] ✅ Service ready")
+    print("[Startup] Initializing ParkingSessionEngine...")
+    app_state.session_engine = ParkingSessionEngine()
 
+    print("[Startup] ✅ Service ready")
 
 # ==================================================
 # Routers
 # ==================================================
-# 기존 HTTP API (/voice)
-app.include_router(voice_router)
-
-# WebSocket API (/ws/voice)
-app.include_router(voice_ws_router)
-
-# 번호판 OCR API (/api/plate/recognize)
-app.include_router(plate_router)
-
-# 결재하기
-app.include_router(payment_router)
+app.include_router(voice_router)       # HTTP voice API
+app.include_router(voice_ws_router)    # WebSocket voice
+app.include_router(plate_router)       # OCR
+app.include_router(payment_router)     # Payment

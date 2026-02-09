@@ -4,15 +4,13 @@ import numpy as np
 import easyocr
 import re
 from datetime import datetime
-import requests
 import uuid
-import os
 
 from psycopg2.extras import RealDictCursor
 
 from src.db.postgres import get_conn
-from src.speech.tts import synthesize
 from src.storage import upload_image
+import src.app_state as app_state
 
 router = APIRouter()
 
@@ -33,6 +31,7 @@ VEHICLE_TYPE_LABEL = {
     "VISITOR": "방문 차량",
     "MEMBER": "정기권 차량",
 }
+
 
 def normalize_plate(text: str) -> str:
     for wrong, right in COMMON_FIX.items():
@@ -61,7 +60,7 @@ def detect_plate_region(img: np.ndarray) -> np.ndarray | None:
         return None
 
     x, y, w, h = max(candidates, key=lambda b: b[2] * b[3])
-    return img[y:y+h, x:x+w]
+    return img[y:y + h, x:x + w]
 
 
 # =========================
@@ -82,7 +81,7 @@ def extract_plate(image: np.ndarray) -> tuple[str | None, float]:
 
 
 # =========================
-# 입출차 처리
+# 입출차 처리 (DB 전용)
 # =========================
 def resolve_direction_and_process(
     plate: str,
@@ -94,20 +93,26 @@ def resolve_direction_and_process(
     cur = conn.cursor(cursor_factory=RealDictCursor)
 
     # 1️⃣ vehicle 조회 or 생성
-    cur.execute("""
+    cur.execute(
+        """
         SELECT id, vehicle_type
         FROM vehicle
         WHERE plate_number = %s
         LIMIT 1
-    """, (plate,))
+        """,
+        (plate,),
+    )
     vehicle = cur.fetchone()
 
     if not vehicle:
-        cur.execute("""
+        cur.execute(
+            """
             INSERT INTO vehicle (plate_number, vehicle_type, created_at)
             VALUES (%s, 'NORMAL', now())
             RETURNING id, vehicle_type
-        """, (plate,))
+            """,
+            (plate,),
+        )
         vehicle = cur.fetchone()
         conn.commit()
 
@@ -115,21 +120,25 @@ def resolve_direction_and_process(
     vehicle_type = vehicle["vehicle_type"]
 
     # 2️⃣ 활성 세션 조회
-    cur.execute("""
+    cur.execute(
+        """
         SELECT id, entry_time, entry_image_url
         FROM parking_session
         WHERE vehicle_id = %s
           AND exit_time IS NULL
         ORDER BY entry_time DESC
         LIMIT 1
-    """, (vehicle_id,))
+        """,
+        (vehicle_id,),
+    )
     session = cur.fetchone()
 
     # =========================
     # ENTRY
     # =========================
     if not session:
-        cur.execute("""
+        cur.execute(
+            """
             INSERT INTO parking_session (
                 vehicle_id,
                 entry_time,
@@ -139,13 +148,16 @@ def resolve_direction_and_process(
             )
             VALUES (%s, now(), 'PARKED', %s, now())
             RETURNING id, entry_time
-        """, (vehicle_id, image_url))
+            """,
+            (vehicle_id, image_url),
+        )
         new_session = cur.fetchone()
         session_id = new_session["id"]
 
         payment_status = "FREE" if vehicle_type != "NORMAL" else "UNPAID"
 
-        cur.execute("""
+        cur.execute(
+            """
             INSERT INTO payment (
                 parking_session_id,
                 amount,
@@ -153,27 +165,23 @@ def resolve_direction_and_process(
                 created_at
             )
             VALUES (%s, 0, %s, now())
-        """, (session_id, payment_status))
+            """,
+            (session_id, payment_status),
+        )
 
         conn.commit()
         conn.close()
 
-        message = "입차가 확인되었습니다."
-
         return {
             "direction": "ENTRY",
             "parking_session_id": session_id,
-            "barrier_open": True,
-
             "card": {
                 "plate": plate,
                 "vehicle_type": vehicle_type,
                 "vehicle_type_label": VEHICLE_TYPE_LABEL.get(vehicle_type),
                 "entry_image_url": image_url,
             },
-
-            "message": message,
-            "tts_url": synthesize(message),
+            "payment_status": payment_status,
         }
 
     # =========================
@@ -181,27 +189,26 @@ def resolve_direction_and_process(
     # =========================
     session_id = session["id"]
 
-    cur.execute("""
+    cur.execute(
+        """
         SELECT payment_status
         FROM payment
         WHERE parking_session_id = %s
         LIMIT 1
-    """, (session_id,))
+        """,
+        (session_id,),
+    )
     payment = cur.fetchone()
     payment_status = payment["payment_status"]
 
     exit_time = now.isoformat()
 
+    # 미결제 → 출차 불가
     if payment_status not in ("PAID", "FREE"):
         conn.close()
-        message = "결제가 필요합니다."
-
         return {
             "direction": "EXIT",
             "parking_session_id": session_id,
-            "can_pay": True,
-            "barrier_open": False,
-
             "card": {
                 "plate": plate,
                 "vehicle_type": vehicle_type,
@@ -210,35 +217,31 @@ def resolve_direction_and_process(
                 "exit_image_url": image_url,
                 "payment_status": payment_status,
             },
-
             "time_info": {
                 "entry_time": session["entry_time"].isoformat(),
                 "exit_time": exit_time,
             },
-
-            "message": message,
-            "tts_url": synthesize(message),
+            "payment_status": payment_status,
         }
 
     # 결제 완료 출차
-    cur.execute("""
+    cur.execute(
+        """
         UPDATE parking_session
         SET exit_time = now(),
             status = 'EXITED',
             exit_image_url = %s
         WHERE id = %s
-    """, (image_url, session_id))
+        """,
+        (image_url, session_id),
+    )
 
     conn.commit()
     conn.close()
 
-    message = "출차가 확인되었습니다."
-
     return {
         "direction": "EXIT",
         "parking_session_id": session_id,
-        "barrier_open": True,
-
         "card": {
             "plate": plate,
             "vehicle_type": vehicle_type,
@@ -247,14 +250,11 @@ def resolve_direction_and_process(
             "exit_image_url": image_url,
             "payment_status": payment_status,
         },
-
         "time_info": {
             "entry_time": session["entry_time"].isoformat(),
             "exit_time": exit_time,
         },
-
-        "message": message,
-        "tts_url": synthesize(message),
+        "payment_status": payment_status,
     }
 
 
@@ -284,14 +284,22 @@ async def recognize_plate(image: UploadFile = File(...)):
             "confidence": confidence,
         }
 
-    result = resolve_direction_and_process(
+    db_result = resolve_direction_and_process(
         plate=plate,
         image_url=image_url,
     )
+
+    # 🔔 중앙 세션 엔진에 이벤트 전달
+    engine_result = app_state.session_engine.handle_event({
+        "type": "VEHICLE_DETECTED",
+        "direction": db_result["direction"],
+        "payment_status": db_result.get("payment_status"),
+    })
 
     return {
         "success": True,
         "plate": plate,
         "confidence": confidence,
-        **result,
+        **db_result,
+        **engine_result,
     }

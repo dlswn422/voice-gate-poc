@@ -184,23 +184,18 @@ export default function Home() {
     const formData = new FormData()
     formData.append("image", file)
 
-    // 최종 고정값 (화면은 판단 안 함)
-    formData.append("camera_type", "AUTO")
-
     const res = await fetch(`${API_BASE}/api/plate/recognize`, {
       method: "POST",
       body: formData,
     })
 
     const data = await res.json()
-
     if (!data.success) {
-      setBubbleText("번호판을 인식하지 못했어요.\n다시 시도해 주세요.")
+      setBubbleText("번호판을 인식하지 못했어요.")
       setStatus("idle")
       return
     }
 
-    /* 카드 정보 세팅 */
     setPlateCard({
       plate: data.plate,
       vehicleTypeLabel: data.card?.vehicle_type_label,
@@ -214,16 +209,21 @@ export default function Home() {
     setDirection(data.direction)
     setParkingSessionId(data.parking_session_id ?? null)
 
-    setBubbleText(data.message)
-    setStatus("speaking")
+    // 🔥 WS 시작
+    await startVoice()
 
-    const audio = new Audio(`${API_BASE}${data.tts_url}`)
-    muteMicHard()
-    audio.onended = () => {
-      unmuteMicHard()
-      startVoice()
-    }
-    audio.play()
+    // 🔥 번호판 결과를 WS로 전달 (TTS는 서버가 함)
+    setTimeout(() => {
+      wsRef.current?.send(JSON.stringify({
+        type: "vehicle_result",
+        direction: data.direction,
+        exit_context:
+          data.direction === "EXIT" &&
+          data.card?.payment_status !== "PAID"
+            ? "UNPAID"
+            : "NONE",
+      }))
+    }, 300)
   }
 
   /* ===============================
@@ -234,6 +234,8 @@ export default function Home() {
 
     setPaymentSubmitting(true)
     setPaymentFeedback(null)
+
+    // 🔒 결제 중 음성 잠금
     setVoiceLocked(true)
     muteMicHard()
 
@@ -253,28 +255,45 @@ export default function Home() {
 
       setPaymentFeedback(paymentResult)
 
+      // ===============================
+      // 🔥 결제 처리 후 UI / 음성 복구
+      // ===============================
       setTimeout(() => {
+        // 1️⃣ 결제 팝업 닫기
         setShowPaymentPopup(false)
 
+        // 2️⃣ 카드 상태 즉시 반영
         if (paymentResult === "SUCCESS") {
-          wsRef.current?.close()
-          setActive(false)
-          setStatus("idle")
-          setIntent("NONE")
-          setBubbleText(
-            "결제가 완료되었습니다.\n차량 번호판을 다시 업로드해 주세요."
+          setPlateCard(prev =>
+            prev ? { ...prev, paymentStatus: "PAID" } : prev
           )
-        } else {
-          setVoiceLocked(false)
-          unmuteMicHard()
-          setBubbleText("결제에 실패했습니다.\n무슨 문제가 생기셨나요?")
-          startVoice()
         }
-      }, 800)
-    } catch {
+
+        // 3️⃣ 음성 모드 해제 (PAYMENT → NORMAL)
+        wsRef.current?.send(JSON.stringify({
+          type: "voice_mode",
+          value: "NORMAL",
+        }))
+
+        // 4️⃣ 결제 결과를 WS로 전달 (TTS는 서버에서)
+        wsRef.current?.send(JSON.stringify({
+          type: "payment_result",
+          value: paymentResult, // "SUCCESS" | "FAIL"
+        }))
+
+        // 5️⃣ 마이크 & 음성 상담 재개
+        setVoiceLocked(false)
+        unmuteMicHard()
+      }, 500)
+
+    } catch (e) {
+      console.error("[PAYMENT ERROR]", e)
+
       setPaymentFeedback("FAIL")
       setVoiceLocked(false)
       unmuteMicHard()
+
+      // 서버 TTS 못 갔을 때 fallback
       setBubbleText("결제 처리 중 오류가 발생했어요.")
       startVoice()
     } finally {
@@ -422,10 +441,12 @@ export default function Home() {
                 setShowPaymentPopup(true)
                 setVoiceLocked(true)
                 muteMicHard()
-                wsRef.current?.close()
-                wsRef.current = null
-                setActive(false)
-                setStatus("idle")
+
+                // 🔥 WS는 유지
+                wsRef.current?.send(JSON.stringify({
+                  type: "voice_mode",
+                  value: "PAYMENT",
+                }))
               }}
               className="px-6 py-3 rounded-full bg-emerald-600 text-white font-semibold"
             >

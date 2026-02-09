@@ -161,24 +161,44 @@ async def voice_session_ws(websocket: WebSocket):
                     # ▶ 💳 결제 결과
                     if msg.get("type") == "payment_result":
                         result = msg.get("value")
-                        print(f"[PAYMENT] 💳 result={result}")
 
                         if result == "SUCCESS":
+                            # ✅ 성공 → 시스템 플로우
                             exit_context = "NONE"
-                            text = "결제가 완료되었습니다. 출차를 진행해주세요."
+                            text = "결제가 완료되었습니다. 출차를 진행하세요."
+
+                            last_activity_ts = time.time()
+                            io_state = "SPEAKING"
+
+                            # 🔥 추가: 음성 입력 다시 허용
+                            voice_mode = "NORMAL"
+
+                            await safe_send(websocket, {
+                                "type": "assistant_message",
+                                "text": text,
+                                "tts_url": synthesize(text),
+                            })
+                            continue
+
                         else:
-                            text = "결제에 실패했습니다. 다시 시도해 주세요."
+                            # ❌ 실패 → 상담 플로우
+                            text = (
+                                "결제에 실패했습니다.\n"
+                                "불편하신 점을 말씀해 주세요."
+                            )
 
-                        last_activity_ts = time.time()
-                        io_state = "SPEAKING"
+                            last_activity_ts = time.time()
+                            io_state = "SPEAKING"
 
-                        print("[TTS] 🗣 payment_result TTS")
-                        await safe_send(websocket, {
-                            "type": "assistant_message",
-                            "text": text,
-                            "tts_url": synthesize(text),
-                        })
-                        continue
+                            # 🔥 이미 잘됨
+                            voice_mode = "NORMAL"
+
+                            await safe_send(websocket, {
+                                "type": "assistant_message",
+                                "text": text,
+                                "tts_url": synthesize(text),
+                            })
+                            continue
 
                 except Exception as e:
                     print("[ERROR] ❌ Front message parse error:", e)

@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import os
 import re
+import json
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Literal, Tuple
+
+import requests
 
 from src.rag.manual_rag import ManualRAG
 
@@ -13,34 +16,53 @@ from src.rag.manual_rag import ManualRAG
 # ==================================================
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
 OLLAMA_MODEL = os.getenv("DIALOG_MODEL", os.getenv("OLLAMA_MODEL", "llama3.1:8b"))
-OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "60"))
+OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "120"))
 
-STRICT_SLOT_GATING = os.getenv("STRICT_SLOT_GATING", "1").strip().lower() in ("1", "true", "yes")
-USE_LLM_FOR_SOLVE = os.getenv("USE_LLM_FOR_SOLVE", "0").strip().lower() in ("1", "true", "yes")
 DEFAULT_HARD_TURN_LIMIT = int(os.getenv("SECOND_STAGE_HARD_TURN_LIMIT", "6") or 6)
-
 FAREWELL_TEXT = "이용해 주셔서 감사합니다. 안녕히 가세요."
 
 
 # ==================================================
-# 슬롯 정의 / 필수 슬롯
+# 슬롯 정책 (사용자 최종 정의)
+# - 슬롯은 symptom 1개만
+# - LLM이 질문 생성(ASK) 금지: dialog_llm_client에서는 질문을 만들지 않는다.
 # ==================================================
-SLOT_KEYS = ["symptom", "where", "when", "error_message", "attempted", "card_or_device"]
+SLOT_KEYS = ["symptom"]
 
-# ✅ 핵심: TIME_PRICE/REGISTRATION 같은 건 where가 없어도 해결 가능한 경우가 많아
+# ✅ Intent 축소: PAYMENT / REGISTRATION / FACILITY / LPR / NONE
 REQUIRED_SLOTS_BY_INTENT: Dict[str, List[str]] = {
-    "PAYMENT": ["where", "symptom"],
-    "EXIT": ["where", "symptom"],        # 출구/출차 위치가 중요
-    "ENTRY": ["where", "symptom"],       # 입구/입차 위치가 중요
-    "FACILITY": ["where", "symptom"],    # 기기/차단기 등 장비 위치가 중요
-    "REGISTRATION": ["symptom"],         # 등록은 단계/현상(symptom)이 더 중요
-    "TIME_PRICE": ["symptom"],           # 시간/요금 문의는 어디(where) 없어도 됨
-    "COMPLAINT": ["symptom"],
+    "PAYMENT": ["symptom"],
+    "REGISTRATION": ["symptom"],
+    "FACILITY": ["symptom"],
+    "LPR": ["symptom"],
     "NONE": ["symptom"],
 }
 
 
+# ==================================================
+# intent -> 메뉴얼 파일 매핑
+# (이 목록은 'src/manuals' 폴더에 존재해야 함)
+# ==================================================
+MANUAL_FILES_BY_INTENT: Dict[str, List[str]] = {
+    "PAYMENT": ["payment_card_fail.md"],
+    "LPR": ["entry_lpr_issue.md", "exit_lpr_issue.md"],
+    "REGISTRATION": ["visit_registration_fail.md"],
+    "FACILITY": ["facility_issue.md"],
+    "NONE": ["none_issue.md"],
+}
+
+
+# ==================================================
+# 유틸
+# ==================================================
 def _norm_intent_name(x: Any) -> str:
+    """
+    app_engine에서 넘어오는 intent는
+    - "PAYMENT"
+    - "Intent.PAYMENT"
+    - Intent Enum
+    등 형태가 섞일 수 있어 normalize 한다.
+    """
     if not x:
         return "NONE"
     s = str(x).strip().upper()
@@ -49,33 +71,11 @@ def _norm_intent_name(x: Any) -> str:
     return s if s in REQUIRED_SLOTS_BY_INTENT else "NONE"
 
 
-def _merge_slots(dst: Dict[str, Any], src: Dict[str, Any]) -> Dict[str, Any]:
-    out = dict(dst or {})
-    if not isinstance(src, dict):
-        return out
-    for k in SLOT_KEYS:
-        if k in src:
-            v = src.get(k)
-            if isinstance(v, str) and not v.strip():
-                v = None
-            out[k] = v
-    return out
-
-
-def _missing_required_slots(intent_name: str, slots: Dict[str, Any]) -> List[str]:
-    req = REQUIRED_SLOTS_BY_INTENT.get(_norm_intent_name(intent_name), ["symptom"])
-    miss = []
-    for k in req:
-        v = (slots or {}).get(k)
-        if v is None or (isinstance(v, str) and not v.strip()):
-            miss.append(k)
-    return miss
-
-
-# ==================================================
-# 종료 발화 감지
-# ==================================================
-DONE_KEYWORDS = ["됐어요", "되었습니다", "해결", "괜찮아요", "그만", "종료", "끝", "마칠게", "고마워", "감사", "안녕"]
+DONE_KEYWORDS = [
+    "됐어요", "되었습니다", "해결", "괜찮아요",
+    "그만", "종료", "끝", "마칠게",
+    "고마워", "감사", "안녕",
+]
 
 
 def _normalize(text: str) -> str:
@@ -87,442 +87,262 @@ def _is_done_utterance(text: str) -> bool:
     return any(_normalize(k) in t for k in DONE_KEYWORDS)
 
 
-# ==================================================
-# 질문 템플릿(슬롯별)
-# ==================================================
-def _question_for_missing_slot(intent_name: str, slot: str) -> str:
-    intent = _norm_intent_name(intent_name)
-
-    if slot == "where":
-        if intent == "PAYMENT":
-            return "결제를 어디에서 진행하셨나요? (출구 정산기/사전 정산기(키오스크)/모바일·앱·QR)"
-        if intent in ("EXIT", "ENTRY", "FACILITY"):
-            return "어느 위치/기기에서 문제가 발생했나요? (출구 차단기/입구 차단기/키오스크/정산기 등)"
-        return "문제가 발생한 위치/기기가 어디인가요? (출구/키오스크/차단기 등)"
-
-    if slot == "symptom":
-        if intent == "PAYMENT":
-            return "결제에서 어떤 현상이 발생하시나요? (승인 실패/카드 인식 불가/결제 버튼 무반응/정산 반영 문제)"
-        if intent in ("EXIT", "ENTRY"):
-            return "차단기에서 어떤 현상이신가요? (안 열림/무반응/차량 인식 불가/입차 기록 없음/오류 문구)"
-        if intent == "FACILITY":
-            return "기기/차단기에서 어떤 현상이신가요? (안 열림/무반응/먹통/영수증 미출력/오류 문구)"
-        if intent == "REGISTRATION":
-            return "등록에서 어떤 단계에서 막히셨나요? (번호 입력/인증/저장 버튼/완료 처리 등)"
-        if intent == "TIME_PRICE":
-            return "요금/시간 중 어떤 부분이 궁금하신가요? (요금 조회/무료시간/할인/정산 내역 등)"
-        return "어떤 현상이 문제인가요? (예: 안 됨/오류 문구/무반응 등)"
-
-    if slot == "error_message":
-        return "화면에 표시되는 오류 문구가 있나요? 그대로 읽어주실 수 있을까요?"
-    if slot == "attempted":
-        return "이미 시도해 보신 조치가 있나요? (재시도/재부팅/다른 카드/관리자 호출 등)"
-    if slot == "card_or_device":
-        return "어떤 결제수단(카드/모바일/QR) 또는 어떤 기기에서 문제가 발생했나요?"
-    if slot == "when":
-        return "언제부터 문제가 발생했나요? (방금/오늘/어제부터 등)"
-    return "조금 더 자세히 말씀해 주실 수 있을까요?"
+def _manuals_dir() -> str:
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "manuals"))
 
 
-def _first_clarify_question(intent_name: str) -> str:
-    intent = _norm_intent_name(intent_name)
-    if intent == "PAYMENT":
-        return "결제 문제 중 정확히 어떤 현상이신가요?"
-    if intent == "EXIT":
-        return "출구에서 어떤 문제가 발생하셨나요? (정산 완료 후 안 열림/무반응/입차 기록 없음 등)"
-    if intent == "ENTRY":
-        return "입구에서 어떤 문제가 발생하셨나요? (차량 인식/차단기 안 열림/무반응 등)"
-    if intent == "FACILITY":
-        return "기기/차단기 문제를 확인해볼게요. 어느 위치에서 어떤 현상이신가요?"
-    if intent == "REGISTRATION":
-        return "등록 문제를 확인해볼게요. 어떤 단계에서 막히셨나요?"
-    if intent == "TIME_PRICE":
-        return "요금/시간 문의군요. 어떤 항목이 궁금하신가요?"
-    return "어떤 도움을 원하시는지 조금 더 구체적으로 말씀해 주세요."
-
-
-# ==================================================
-# 휴리스틱: 의도 전환 감지(2차에서도 전환 허용)
-# ==================================================
-def _heuristic_intent_switch(text: str, current_intent: str) -> Optional[str]:
-    t = _normalize(text)
-    cur = _norm_intent_name(current_intent)
-
-    # 강한 키워드 기반 간단 전환
-    if any(k in t for k in ["결제", "정산", "승인", "카드", "qr", "큐알"]):
-        if cur != "PAYMENT":
-            return "PAYMENT"
-
-    if any(k in t for k in ["출차", "출구", "나가", "출구차단기", "출구게이트"]):
-        if cur != "EXIT":
-            return "EXIT"
-
-    if any(k in t for k in ["입차", "입구", "들어가", "입구차단기", "입구게이트"]):
-        if cur != "ENTRY":
-            return "ENTRY"
-
-    if any(k in t for k in ["등록", "방문", "방문자", "차량번호등록", "번호등록"]):
-        if cur != "REGISTRATION":
-            return "REGISTRATION"
-
-    if any(k in t for k in ["요금", "시간", "무료", "할인", "주차비"]):
-        if cur != "TIME_PRICE":
-            return "TIME_PRICE"
-
-    if any(k in t for k in ["고장", "먹통", "기기", "장애", "영수증", "프린터", "단말", "네트워크"]):
-        if cur != "FACILITY":
-            return "FACILITY"
-
-    return None
-
-
-# ==================================================
-# 휴리스틱 슬롯 추출 (STT 오탈자 방어)
-# ==================================================
-def _heuristic_extract_slots(user_text: str, intent_name: str) -> Dict[str, Any]:
-    t = (user_text or "").strip()
-    tt = _normalize(t)
-    intent = _norm_intent_name(intent_name)
-
-    out: Dict[str, Any] = {}
-
-    # -------------------------
-    # where (PAYMENT + EXIT/ENTRY/FACILITY 공통 확장)
-    # -------------------------
-    # 게이트/차단기 위치
-    if any(k in tt for k in ["출구차단기", "출구게이트", "출구"]):
-        out["where"] = "출구 차단기"
-    elif any(k in tt for k in ["입구차단기", "입구게이트", "입구"]):
-        out["where"] = "입구 차단기"
-    elif any(k in tt for k in ["차단기", "게이트"]):
-        out["where"] = "차단기"
-
-    # 결제/정산 장비 위치
-    if any(k in tt for k in ["출구정산기", "출구정산"]):
-        out["where"] = "출구 정산기"
-    elif any(k in tt for k in ["키오스크", "사전정산", "사전", "정산기"]):
-        out["where"] = "사전 정산기(키오스크)"
-    elif any(k in tt for k in ["모바일", "앱", "qr", "큐알"]):
-        out["where"] = "모바일·앱·QR"
-
-    # -------------------------
-    # symptom
-    # -------------------------
-    # 1) PAYMENT
-    if intent == "PAYMENT":
-        if ("승인" in tt or "증인" in tt) and "실패" in tt:
-            out["symptom"] = "승인 실패"
-        elif ("카드" in tt or "ic" in tt) and ("인식" in tt and ("안" in tt or "불가" in tt)):
-            out["symptom"] = "카드 인식 불가"
-        elif ("버튼" in tt or "터치" in tt) and ("무반응" in tt or "안" in tt):
-            out["symptom"] = "결제 버튼 무반응"
-        elif "반영" in tt and ("안" in tt or "누락" in tt):
-            out["symptom"] = "정산 반영 문제"
-        elif "영수증" in tt and ("안" in tt or "미출력" in tt):
-            out["symptom"] = "영수증 미출력"
-
-    # 2) EXIT/ENTRY/FACILITY: 게이트/기기 증상 확장
-    if intent in ("EXIT", "ENTRY", "FACILITY"):
-        # 무반응/안 열림/안 올라감
-        if any(k in tt for k in ["무반응", "먹통", "작동안", "작동안", "안됨", "안돼", "안되", "멈췄"]):
-            out["symptom"] = out.get("symptom") or "무반응"
-        if any(k in tt for k in ["안열", "안 열", "안올라", "안 올라", "안열려", "안 열려"]):
-            out["symptom"] = out.get("symptom") or "차단기 안 열림"
-        if "안올라" in tt or "안올라가" in tt:
-            out["symptom"] = out.get("symptom") or "차단기 안 올라감"
-
-        # 인식 문제
-        if any(k in tt for k in ["번호판", "인식안", "인식불가", "lpr"]):
-            out["symptom"] = "차량 인식 불가"
-
-        # 입차 기록 없음 / 미인식
-        if any(k in tt for k in ["입차기록없", "입차기록", "기록없", "기록이없", "미입차", "미인식"]):
-            out["symptom"] = "입차 기록 없음"
-
-        # 정산 완료인데 출구 차단기 안 열림 -> 강한 신호
-        if ("정산" in tt or "결제" in tt) and any(k in tt for k in ["완료", "했", "끝", "됐"]) and any(k in tt for k in ["출구", "출차"]) and any(k in tt for k in ["안열", "무반응", "안올라"]):
-            out["symptom"] = "정산 완료 후 출구 차단기 미개방"
-            out["where"] = out.get("where") or "출구 차단기"
-
-        # 기기 출력/프린터
-        if "영수증" in tt and any(k in tt for k in ["안", "미출력", "안나와", "안 나와"]):
-            out["symptom"] = "영수증 미출력"
-
-        # 네트워크/통신
-        if any(k in tt for k in ["네트워크", "통신", "서버", "연결", "끊"]):
-            out["symptom"] = out.get("symptom") or "통신/네트워크 문제"
-
-    # 3) REGISTRATION
-    if intent == "REGISTRATION":
-        if any(k in tt for k in ["번호", "차량번호"]):
-            out["symptom"] = out.get("symptom") or "차량번호 입력/등록 문제"
-        if any(k in tt for k in ["인증", "문자", "sms", "코드", "인증번호"]):
-            out["symptom"] = "인증/인증번호 문제"
-        if any(k in tt for k in ["저장", "등록", "완료"]) and any(k in tt for k in ["안", "안됨", "실패"]):
-            out["symptom"] = out.get("symptom") or "등록 저장/완료 실패"
-        if any(k in tt for k in ["키오스크", "정산기", "사전정산"]):
-            out["where"] = out.get("where") or "사전 정산기(키오스크)"
-
-    # 4) TIME_PRICE
-    if intent == "TIME_PRICE":
-        if any(k in tt for k in ["요금", "주차비", "얼마"]):
-            out["symptom"] = "요금 조회"
-        elif any(k in tt for k in ["시간", "몇시간", "언제"]):
-            out["symptom"] = "주차 시간 조회"
-        elif any(k in tt for k in ["무료", "할인", "감면"]):
-            out["symptom"] = "무료/할인 적용 문의"
-        if any(k in tt for k in ["키오스크", "정산기"]):
-            out["where"] = out.get("where") or "사전 정산기(키오스크)"
-
-    # error_message
-    if any(k in t for k in ["에러", "오류", "Error", "error", "코드", "code", "표시", "떠요", "떴"]):
-        out["error_message"] = t
-
-    # attempted
-    if any(k in tt for k in ["재시도", "다시", "재부팅", "껐다", "켰다", "다른카드", "다른 카드"]):
-        out["attempted"] = t
-
-    return out
-
-
-# ==================================================
-# manuals_v2 기반 RAG
-# ==================================================
-INTENT_TO_DOCS: Dict[str, List[str]] = {
-    "PAYMENT": ["payment_card_fail.md", "mobile_payment_qr_issue.md", "network_terminal_down.md", "discount_free_time_issue.md"],
-    "TIME_PRICE": ["price_inquiry.md", "discount_free_time_issue.md"],
-    "REGISTRATION": ["visit_registration_fail.md"],
-    "ENTRY": ["entry_gate_not_open.md", "lpr_mismatch_or_no_entry_record.md"],
-    "EXIT": ["exit_gate_not_open.md", "lpr_mismatch_or_no_entry_record.md"],
-    "FACILITY": ["barrier_physical_fault.md", "network_terminal_down.md", "failsafe_done.md"],
-    "COMPLAINT": [],
-    "NONE": [],
-}
-
-_rag = ManualRAG()
-
-
-def _clean_line(s: str) -> str:
-    s = (s or "").strip()
-    s = re.sub(r"[ \t]+", " ", s)
-    return s.strip()
-
-
-def _is_header_or_tag_line(line: str) -> bool:
-    s = line.strip()
-    if not s:
-        return True
-    if s.startswith("#"):
-        return True
-    if s.startswith("```") or s.endswith("```"):
-        return True
-    if s.startswith("tags:") or s.startswith("태그:"):
-        return True
-    return False
-
-
-def _extract_section(text: str, section_title_keywords: List[str]) -> str:
-    if not text:
+def _read_manual(filename: str) -> str:
+    path = os.path.join(_manuals_dir(), filename)
+    if not os.path.exists(path):
         return ""
-
-    lines = text.splitlines()
-    start_idx = -1
-
-    for i, ln in enumerate(lines):
-        s = _clean_line(ln)
-        for kw in section_title_keywords:
-            if kw in s:
-                start_idx = i + 1
-                break
-        if start_idx != -1:
-            break
-
-    if start_idx == -1:
-        return ""
-
-    end_idx = len(lines)
-    for j in range(start_idx, len(lines)):
-        s = _clean_line(lines[j])
-        if s.startswith("#") or (s.startswith("[") and s.endswith("]")):
-            end_idx = j
-            break
-        if re.match(r"^(필수 슬롯|추가 슬롯|진단 분기|조치 순서|에스컬레이션|첫 질문)\b", s):
-            end_idx = j
-            break
-
-    return "\n".join(lines[start_idx:end_idx]).strip()
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
 
 
-def _extract_solve_templates(chunk_text: str) -> List[str]:
-    sec = _extract_section(chunk_text, ["해결 안내 문장 템플릿", "SOLVE_TEMPLATE"])
-    if not sec:
-        return []
-
-    out: List[str] = []
-    for ln in sec.splitlines():
-        s = _clean_line(ln)
-        if not s:
-            continue
-        if _is_header_or_tag_line(s):
-            continue
-        s = re.sub(r"^[-•\*]\s+", "", s)
-        s = re.sub(r"^\d+[.)]\s+", "", s).strip()
-        if not s:
-            continue
-        if len(s) < 10:
-            continue
-        out.append(s)
-
-    uniq: List[str] = []
-    seen = set()
-    for x in out:
-        if x not in seen:
-            uniq.append(x)
-            seen.add(x)
-    return uniq
-
-
-def _extract_action_steps(chunk_text: str, limit: int = 5) -> List[str]:
-    sec = _extract_section(chunk_text, ["조치 순서", "조치", "우선순위"])
-    if not sec:
-        return []
-
-    out: List[str] = []
-    for ln in sec.splitlines():
-        s = _clean_line(ln)
-        if not s:
-            continue
-        if _is_header_or_tag_line(s):
-            continue
-        s = re.sub(r"^[-•\*]\s+", "", s)
-        s = re.sub(r"^\d+[.)]\s+", "", s).strip()
-        if not s:
-            continue
-        if not any(k in s for k in ["하세요", "해 주세요", "확인", "재시도", "호출", "연락", "점검", "대기", "재부팅", "다른"]):
-            continue
-        if len(s) > 180:
-            s = s[:180].rstrip() + "…"
-        out.append(s)
-        if len(out) >= limit:
-            break
-
-    uniq: List[str] = []
-    seen = set()
-    for x in out:
-        if x not in seen:
-            uniq.append(x)
-            seen.add(x)
-    return uniq
-
-
-def _build_manual_guidance(hits: List[Any]) -> Tuple[List[str], List[str]]:
-    solve_templates: List[str] = []
-    action_steps: List[str] = []
-
-    for c in hits or []:
-        raw = getattr(c, "text", "") or ""
-        if not raw:
-            continue
-
-        if not solve_templates:
-            solve_templates = _extract_solve_templates(raw)
-
-        if not action_steps:
-            action_steps = _extract_action_steps(raw, limit=5)
-
-        if solve_templates and action_steps:
-            break
-
-    return solve_templates, action_steps
-
-
-def _compose_solve_reply(intent_name: str, slots: Dict[str, Any], solve_templates: List[str], action_steps: List[str]) -> str:
-    intent = _norm_intent_name(intent_name)
-    where = (slots or {}).get("where") or ""
-    symptom = (slots or {}).get("symptom") or ""
-
-    header = f"확인 결과, **{where}**에서 **{symptom}** 상황으로 보입니다.".strip()
-    if not where and symptom:
-        header = f"확인 결과, **{symptom}** 상황으로 보입니다."
-    if not header.endswith("."):
-        header += "."
-
-    body_lines: List[str] = []
-
-    if solve_templates:
-        body_lines.append(solve_templates[0])
-
-    if action_steps:
-        for a in action_steps[:3]:
-            body_lines.append(f"- {a}")
-
-    if not body_lines:
-        if intent == "PAYMENT" and ("승인 실패" in symptom):
-            body_lines = [
-                "(승인 실패) 승인 실패는 카드사/카드 상태 또는 단말 통신 상태 문제일 수 있어요. 카드 방향/IC칩을 확인하고 다른 카드로도 재시도해 주세요.",
-                "- 동일하면 관리자 호출을 요청해 단말기/회선 점검을 진행해 주세요.",
-            ]
-        else:
-            body_lines = ["현재 정보로는 원인을 단정하기 어려워요. 잠시 후 재시도해 보시고, 동일하면 관리자 호출을 요청해 주세요."]
-
-    tail = "위 안내로 해결되셨나요? 다른 문제가 더 있으시면 말씀해 주세요."
-    return "\n".join([header, "", *body_lines, "", tail]).strip()
-
-
-# ==================================================
-# SOLVE 문장 자연화 (옵션)
-# ==================================================
-SYSTEM_PROMPT_SOLVE_ONLY = """
-너는 주차장 무인정산/차단기/출입 시스템 상담원이다.
-아래 [DRAFT]를 한국어로 자연스럽게 다듬어라.
-- 의미/조치 내용은 바꾸지 말 것
-- 불필요하게 길게 늘리지 말 것
-- 마지막에 '추가 문제가 있으면 말씀해 주세요'는 유지
-출력은 그냥 문장만.
-""".strip()
-
-
-def _llm_polish_solve(draft: str) -> str:
-    import requests
-
+def _ollama_chat(messages: List[Dict[str, str]], temperature: float = 0.0) -> str:
     url = f"{OLLAMA_BASE_URL}/api/chat"
     payload = {
         "model": OLLAMA_MODEL,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT_SOLVE_ONLY},
-            {"role": "user", "content": f"[DRAFT]\n{draft}"},
-        ],
+        "messages": messages,
         "stream": False,
-        "options": {"temperature": 0.2},
+        "options": {"temperature": temperature},
     }
     r = requests.post(url, json=payload, timeout=OLLAMA_TIMEOUT)
     r.raise_for_status()
     data = r.json()
-    return ((data.get("message") or {}).get("content", "") or "").strip() or draft
+    return ((data.get("message") or {}).get("content", "") or "").strip()
+
+
+def _json_extract(text: str) -> Optional[dict]:
+    if not text:
+        return None
+    s = text.strip()
+    try:
+        obj = json.loads(s)
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        pass
+    i = s.find("{")
+    j = s.rfind("}")
+    if i != -1 and j != -1 and j > i:
+        snippet = s[i:j + 1]
+        try:
+            obj = json.loads(snippet)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            return None
+    return None
+
+
+# ==================================================
+# 메뉴얼 후보 추출 (CASE 또는 SOLVE_TEMPLATE 섹션)
+# ==================================================
+@dataclass
+class ManualSolution:
+    manual_file: str
+    solution_text: str  # 메뉴얼에서 추출된 안내문(그대로)
+
+
+# ✅ CASE 헤더를 더 유연하게: P-01, F-01, R-01, N-01, L-01 등
+_CASE_RE = re.compile(r"^###\s*CASE\s*([A-Z]{1,3}-\d+)\s*$", re.IGNORECASE | re.MULTILINE)
+
+
+def _extract_case_solutions(md: str) -> List[str]:
+    """
+    ### CASE X-01
+    **조건**
+    ...
+    **안내 문장**
+    ... (여기 전체를 solution으로)
+    """
+    if not md:
+        return []
+    headers = [(m.group(1).strip().upper(), m.start()) for m in _CASE_RE.finditer(md)]
+    if not headers:
+        return []
+
+    sols: List[str] = []
+    for idx, (_cid, start) in enumerate(headers):
+        end = headers[idx + 1][1] if idx + 1 < len(headers) else len(md)
+        block = md[start:end].strip()
+
+        m_solve = re.search(r"\*\*안내\s*문장\*\*\s*(.*)$", block, re.IGNORECASE | re.DOTALL)
+        if not m_solve:
+            continue
+        solve = (m_solve.group(1) or "").strip()
+        solve = "\n".join([ln.rstrip() for ln in solve.splitlines() if ln.strip()])
+        if solve:
+            sols.append(solve)
+    return sols
+
+
+def _extract_solve_template_solutions(md: str) -> List[str]:
+    """
+    - SOLVE_TEMPLATE 섹션에서 bullet들을 후보로 뽑는다.
+    (메뉴얼 포맷이 조금 달라도 최대한 견고하게)
+    """
+    if not md:
+        return []
+
+    header_patterns = [
+        r"##\s*해결\s*안내\s*문장\s*템플릿.*?$",
+        r"##\s*SOLVE_TEMPLATE.*?$",
+        r"##\s*해결\s*안내.*?$",
+        r"##\s*조치\s*안내.*?$",
+    ]
+
+    start_idx = -1
+    for hp in header_patterns:
+        m = re.search(hp, md, re.IGNORECASE | re.MULTILINE)
+        if m:
+            start_idx = m.end()
+            break
+    if start_idx == -1:
+        return []
+
+    rest = md[start_idx:]
+    m_next = re.search(r"^\s*##\s+", rest, re.MULTILINE)
+    section = rest[: m_next.start()] if m_next else rest
+
+    bullets: List[str] = []
+    buf: List[str] = []
+    in_bullet = False
+
+    for ln in section.splitlines():
+        s = ln.rstrip().strip()
+
+        if re.match(r"^-\s+", s):
+            if buf:
+                bullets.append("\n".join(buf).strip())
+                buf = []
+            in_bullet = True
+            buf.append(s[2:].strip())
+            continue
+
+        if in_bullet:
+            if s == "":
+                if buf:
+                    bullets.append("\n".join(buf).strip())
+                buf = []
+                in_bullet = False
+                continue
+            buf.append(s)
+            continue
+
+    if buf:
+        bullets.append("\n".join(buf).strip())
+
+    bullets = [b for b in bullets if len(b) >= 6]
+    return bullets
+
+
+def _gather_solutions_for_intent(intent_name: str) -> List[ManualSolution]:
+    intent_name = _norm_intent_name(intent_name)
+    files = MANUAL_FILES_BY_INTENT.get(intent_name, [])
+    out: List[ManualSolution] = []
+
+    for fn in files:
+        md = _read_manual(fn)
+        if not md:
+            continue
+
+        case_sols = _extract_case_solutions(md)
+        if case_sols:
+            for s in case_sols:
+                out.append(ManualSolution(manual_file=fn, solution_text=s))
+            continue
+
+        tmpl_sols = _extract_solve_template_solutions(md)
+        for s in tmpl_sols:
+            out.append(ManualSolution(manual_file=fn, solution_text=s))
+
+    uniq: List[ManualSolution] = []
+    seen = set()
+    for it in out:
+        key = (it.manual_file, it.solution_text)
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(it)
+    return uniq
+
+
+# ==================================================
+# 솔루션 선택(LLM은 '선택만', 출력은 메뉴얼 그대로)
+# - 질문/ASK 금지: 선택기가 ASK를 내놔도 무시하고 ESCALATE로 처리
+# ==================================================
+SYSTEM_PROMPT_SELECT_SOLUTION = """
+너는 '솔루션 선택기'다.
+사용자 symptom(raw 문장)과 후보 솔루션들을 비교해서,
+가장 적합한 솔루션 1개를 '인덱스'로 선택한다.
+
+절대 규칙:
+- 솔루션 문장을 새로 만들거나 바꾸지 마라.
+- 후보에 없는 문장은 절대 출력하지 마라.
+- 출력은 JSON 1개만.
+형식:
+{"action":"SOLVE","index":0,"confidence":0.0~1.0}
+
+선택 기준:
+- symptom 문장에 들어있는 핵심 단어/표현과 가장 잘 맞는 후보
+- intent와 문맥이 맞는 후보(번호판/등록/결제/시설 등)
+""".strip()
+
+
+def _llm_select_solution_index(intent_name: str, symptom: str, sols: List[ManualSolution]) -> Tuple[Optional[int], float]:
+    if len(sols) == 1:
+        return 0, 0.99
+
+    candidates = [{"i": i, "manual": s.manual_file, "text": s.solution_text} for i, s in enumerate(sols)]
+    prompt = (
+        f"[intent]={intent_name}\n"
+        f"[symptom_raw]={symptom}\n"
+        f"[candidates]={json.dumps(candidates, ensure_ascii=False)}\n\n"
+        "가장 적합한 후보의 i 값을 선택해라.\n"
+    )
+    msgs = [
+        {"role": "system", "content": SYSTEM_PROMPT_SELECT_SOLUTION},
+        {"role": "user", "content": prompt},
+    ]
+    content = _ollama_chat(msgs, temperature=0.0)
+    obj = _json_extract(content) or {}
+
+    action = str(obj.get("action", "")).strip().upper()
+    conf = float(obj.get("confidence", 0.8) or 0.8)
+
+    if action != "SOLVE":
+        return None, conf
+
+    try:
+        idx = int(obj.get("index"))
+    except Exception:
+        return None, conf
+
+    if 0 <= idx < len(sols):
+        return idx, conf
+    return None, conf
 
 
 # ==================================================
 # 결과 타입
 # ==================================================
-DialogAction = Literal["ASK", "SOLVE", "DONE", "FAILSAFE", "ESCALATE_DONE"]
+DialogAction = Literal["SOLVE", "DONE", "ESCALATE_DONE"]
 
 
 @dataclass
 class DialogResult:
-    reply: str = ""
-    action: DialogAction = "ASK"
-    confidence: float = 0.5
-    slots: Dict[str, Any] = None
-    new_intent: Optional[str] = None
-    raw: Optional[str] = None
-
-    def __post_init__(self):
-        if self.slots is None:
-            self.slots = {}
+    reply: str
+    action: DialogAction = "SOLVE"
+    slots: Optional[Dict[str, Any]] = None
+    pending_slot: Optional[str] = None  # 정책상 사용하지 않음
+    new_intent: Optional[str] = None    # 정책상 변경하지 않음
+    confidence: float = 0.75
 
 
 # ==================================================
-# 메인 엔트리포인트
+# 메인 엔트리
 # ==================================================
 def dialog_llm_chat(
     user_text: str,
@@ -532,71 +352,82 @@ def dialog_llm_chat(
     debug: bool = False,
 ) -> DialogResult:
     if _is_done_utterance(user_text):
-        return DialogResult(reply=FAREWELL_TEXT, action="DONE", confidence=1.0)
+        return DialogResult(
+            reply=FAREWELL_TEXT,
+            action="DONE",
+            confidence=1.0,
+            slots=(context or {}).get("slots") or {},
+        )
 
     ctx = context or {}
     hard_limit = int(ctx.get("hard_turn_limit", DEFAULT_HARD_TURN_LIMIT) or DEFAULT_HARD_TURN_LIMIT)
     turn_count_user = int(ctx.get("turn_count_user", 0) or 0)
 
-    first_intent = _norm_intent_name(ctx.get("first_intent"))
-    current_intent = _norm_intent_name(ctx.get("current_intent") or first_intent)
+    current_intent = _norm_intent_name(ctx.get("intent"))
+    slots = ctx.get("slots") if isinstance(ctx.get("slots"), dict) else {}
 
-    ctx_slots = ctx.get("slots") or {}
-    if not isinstance(ctx_slots, dict):
-        ctx_slots = {}
-
-    # 1) 턴 제한(관리자 호출+종료)
     if turn_count_user >= hard_limit:
         return DialogResult(
             reply="여러 번 확인했지만 현재 정보로는 문제 상황을 정확히 특정하기 어렵습니다. 관리자를 호출해 도움을 받아주세요. " + FAREWELL_TEXT,
             action="ESCALATE_DONE",
             confidence=1.0,
-            slots=ctx_slots,
+            slots=slots,
+            new_intent=current_intent,
         )
 
-    # 2) 2차에서도 intent 전환 허용(휴리스틱)
-    switched = _heuristic_intent_switch(user_text, current_intent)
-    if switched:
-        current_intent = switched
+    # ✅ symptom 슬롯이 비어있으면 이번 발화를 그대로 symptom에 저장
+    if not (isinstance(slots.get("symptom"), str) and slots.get("symptom").strip()):
+        slots["symptom"] = user_text.strip()
 
-    # 3) 휴리스틱 슬롯 선반영 (전 intent 확장됨)
-    heuristic_slots = _heuristic_extract_slots(user_text, current_intent)
-    merged_pre = _merge_slots(ctx_slots, heuristic_slots)
+    symptom = str(slots.get("symptom") or "").strip()
 
-    # 4) 첫 2차 응답은 무조건 ASK
-    if turn_count_user == 0:
-        miss0 = _missing_required_slots(current_intent, merged_pre)
-        q = _question_for_missing_slot(current_intent, miss0[0]) if miss0 else _first_clarify_question(current_intent)
-        return DialogResult(reply=q, action="ASK", confidence=0.8, slots=merged_pre, new_intent=switched)
+    # 1) intent별 메뉴얼 후보 추출
+    sols = _gather_solutions_for_intent(current_intent)
 
-    # 5) 필수 슬롯 미충족이면 ASK 강제
-    missing = _missing_required_slots(current_intent, merged_pre)
-    if STRICT_SLOT_GATING and missing:
-        q = _question_for_missing_slot(current_intent, missing[0])
-        return DialogResult(reply=q, action="ASK", confidence=0.7, slots=merged_pre, new_intent=switched)
+    if debug:
+        print(f"[SOLVE] intent={current_intent} solutions={len(sols)} symptom={symptom}")
 
-    # 6) ✅ 필수 슬롯 충족 → SOLVE(매뉴얼 기반)
-    solve_templates: List[str] = []
-    action_steps: List[str] = []
-    try:
-        preferred_docs = INTENT_TO_DOCS.get(current_intent, [])
-        hits = _rag.retrieve(
-            query=f"{current_intent} {merged_pre.get('where') or ''} {merged_pre.get('symptom') or ''} {user_text}",
-            preferred_docs=preferred_docs,
-            hard_filter=True if preferred_docs else False,
-            debug=debug,
-        )
-        solve_templates, action_steps = _build_manual_guidance(hits or [])
-    except Exception as e:
-        if debug:
-            print(f"[RAG] failed: {e}")
-
-    draft = _compose_solve_reply(current_intent, merged_pre, solve_templates, action_steps)
-    if USE_LLM_FOR_SOLVE:
+    # 2) 후보 없으면 RAG fallback
+    if not sols:
+        rag = ManualRAG()
+        query = f"{current_intent} | symptom: {symptom}"
         try:
-            draft = _llm_polish_solve(draft)
+            hits = rag.retrieve(query=query, preferred_docs=None, hard_filter=False, debug=debug)
         except Exception as e:
             if debug:
-                print(f"[SOLVE_POLISH] failed: {e}")
+                print(f"[RAG] failed: {e}")
+            hits = []
 
-    return DialogResult(reply=draft, action="SOLVE", confidence=0.9, slots=merged_pre, new_intent=switched)
+        if hits:
+            top = (getattr(hits[0], "text", "") or "").strip()
+            if top:
+                return DialogResult(reply=top, action="SOLVE", slots=slots, confidence=0.85, new_intent=current_intent)
+
+        return DialogResult(
+            reply="현재 메뉴얼에서 해당 상황의 해결 안내를 찾지 못했습니다. 관리자를 호출해 도움을 받아주세요. " + FAREWELL_TEXT,
+            action="ESCALATE_DONE",
+            slots=slots,
+            confidence=1.0,
+            new_intent=current_intent,
+        )
+
+    # 3) 후보가 있으면 선택기(선택만)로 index 선택
+    idx, conf = _llm_select_solution_index(current_intent, symptom, sols)
+
+    if idx is None:
+        return DialogResult(
+            reply="현재 입력 정보로는 문제 유형을 정확히 특정하기 어렵습니다. 관리자를 호출해 도움을 받아주세요. " + FAREWELL_TEXT,
+            action="ESCALATE_DONE",
+            slots=slots,
+            confidence=1.0,
+            new_intent=current_intent,
+        )
+
+    chosen = sols[idx]
+    return DialogResult(
+        reply=chosen.solution_text.strip(),  # ✅ 메뉴얼 그대로
+        action="SOLVE",
+        slots=slots,
+        new_intent=current_intent,
+        confidence=min(0.99, max(0.8, conf)),
+    )

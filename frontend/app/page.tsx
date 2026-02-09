@@ -288,73 +288,40 @@ export default function Home() {
   return (
     <main className="min-h-screen bg-gradient-to-br from-emerald-50 via-sky-50 to-white flex items-center justify-center px-6 font-[Pretendard]">
       {/* 상단 헤더 */}
-      <header className="absolute top-8 text-center">
+      <header className="absolute top-8 text-center z-10">
         <h1 className="text-4xl font-semibold tracking-[0.35em]">PARKMATE</h1>
         <p className="mt-1 text-xs tracking-[0.35em] text-neutral-400 uppercase">
           Parking Guidance Kiosk
         </p>
       </header>
 
-      {/* 지미 + 말풍선 + 카드 */}
-      <div className="relative flex items-center">
-        {/* 지미 */}
-        <div className={`${status === "thinking" ? "animate-bounce" : ""}`}>
-          <div className="w-56 h-40 rounded-[2.5rem] bg-white shadow-2xl flex items-center justify-center">
-            <div className="w-44 h-28 rounded-2xl bg-gradient-to-br from-emerald-300 to-sky-400 flex items-center justify-center gap-6">
-              <span className="w-4 h-4 bg-white rounded-full" />
-              <span className="w-4 h-4 bg-white rounded-full" />
-            </div>
-          </div>
-          <p className="mt-4 text-center text-neutral-500">
-            지미 · 주차 안내 파트너
-          </p>
-        </div>
+      {/* 메인 컨텐츠 */}
+      <div className="relative flex items-center gap-12">
 
-        {/* 말풍선 */}
-        <div className="relative ml-6 -translate-y-12 max-w-[520px] bg-white px-10 py-8 rounded-[2.2rem] shadow-xl">
-          {/* 말풍선 꼬리 */}
-          <div
-            className="absolute left-[-14px] bottom-1/2 -translate-y-1/2 w-0 h-0
-            border-t-[10px] border-b-[10px] border-r-[16px]
-            border-transparent border-r-white"
-          />
+        {/* 🔥 차량 정보 카드 (지미 왼쪽 고정) */}
+        {plateCard && (
+          <div className="relative w-[420px] overflow-visible">
 
-          <p className="text-[22px] leading-relaxed whitespace-pre-line">
-            {bubbleText}
-          </p>
+            {/* 👉 카드 말풍선 꼬리 (오른쪽 향함) */}
+            <div
+              className="absolute -right-4 top-40 w-0 h-0 z-10
+              border-t-[14px] border-b-[14px] border-l-[18px]
+              border-transparent border-l-white"
+            />
 
-          <div className="mt-4 grid grid-cols-2 gap-3">
-            {INTENT_UI_KEYWORDS[intent].map((kw) => (
-              <button
-                key={kw}
-                className="py-3 px-4 rounded-full border font-semibold hover:bg-neutral-100 transition"
-              >
-                {kw}
-              </button>
-            ))}
-          </div>
-
-          {/* 🔥 지미가 알려주는 차량 카드 */}
-          {plateCard && (
-            <div className="relative mt-6 w-[360px] bg-white rounded-3xl shadow-2xl overflow-hidden">
-              {/* 카드 꼬리 */}
-              <div
-                className="absolute -top-3 left-10 w-0 h-0
-                border-l-[10px] border-r-[10px] border-b-[14px]
-                border-transparent border-b-white"
-              />
-
+            {/* 실제 카드 */}
+            <div className="bg-white rounded-3xl shadow-2xl overflow-hidden">
               <img
                 src={
                   (direction === "ENTRY"
                     ? plateCard.entryImageUrl
                     : plateCard.exitImageUrl) || "/placeholder.jpg"
                 }
-                className="w-full h-44 object-cover"
+                className="w-full h-64 object-cover"
               />
 
-              <div className="p-5 space-y-2">
-                <p className="text-xl font-bold tracking-wider">
+              <div className="p-7 space-y-3">
+                <p className="text-2xl font-bold tracking-wider">
                   {plateCard.plate}
                 </p>
 
@@ -363,7 +330,7 @@ export default function Home() {
                 </span>
 
                 {direction === "EXIT" && (
-                  <div className="mt-2 text-sm text-neutral-600 space-y-1">
+                  <div className="pt-3 text-sm text-neutral-600 space-y-1">
                     <p>
                       입차{" "}
                       {plateCard.entryTime &&
@@ -382,12 +349,52 @@ export default function Home() {
                 )}
               </div>
             </div>
-          )}
+          </div>
+        )}
+
+        {/* 지미 + 말풍선 */}
+        <div className="flex items-center">
+          {/* 지미 */}
+          <div className={`${status === "thinking" ? "animate-bounce" : ""}`}>
+            <div className="w-56 h-40 rounded-[2.5rem] bg-white shadow-2xl flex items-center justify-center">
+              <div className="w-44 h-28 rounded-2xl bg-gradient-to-br from-emerald-300 to-sky-400 flex items-center justify-center gap-6">
+                <span className="w-4 h-4 bg-white rounded-full" />
+                <span className="w-4 h-4 bg-white rounded-full" />
+              </div>
+            </div>
+            <p className="mt-4 text-center text-neutral-500">
+              지미 · 주차 안내 파트너
+            </p>
+          </div>
+
+          {/* 말풍선 */}
+          <div className="relative ml-6 -translate-y-10 max-w-[520px] bg-white px-10 py-8 rounded-[2.2rem] shadow-xl">
+            <div
+              className="absolute left-[-14px] top-1/2 -translate-y-1/2 w-0 h-0
+              border-t-[10px] border-b-[10px] border-r-[16px]
+              border-transparent border-r-white"
+            />
+
+            <p className="text-[22px] leading-relaxed whitespace-pre-line">
+              {bubbleText}
+            </p>
+
+            <div className="mt-4 grid grid-cols-2 gap-3">
+              {INTENT_UI_KEYWORDS[intent].map((kw) => (
+                <button
+                  key={kw}
+                  className="py-3 px-4 rounded-full border font-semibold hover:bg-neutral-100 transition"
+                >
+                  {kw}
+                </button>
+              ))}
+            </div>
+          </div>
         </div>
       </div>
 
       {/* 하단 버튼 */}
-      <div className="absolute bottom-12 flex flex-col items-center gap-2">
+      <div className="absolute bottom-12 flex flex-col items-center gap-2 z-10">
         <input
           ref={plateInputRef}
           type="file"
@@ -413,15 +420,10 @@ export default function Home() {
             <button
               onClick={() => {
                 setShowPaymentPopup(true)
-
-                // 🔒 음성 완전 차단
                 setVoiceLocked(true)
                 muteMicHard()
-
-                // 🔌 WebSocket 중단
                 wsRef.current?.close()
                 wsRef.current = null
-
                 setActive(false)
                 setStatus("idle")
               }}
@@ -438,7 +440,7 @@ export default function Home() {
       </div>
 
       {/* ===============================
-         결제 팝업 (UI 개선, 나머지 전부 동일)
+          결제 팝업 (🔥 생략 없음)
       =============================== */}
       {showPaymentPopup && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm">
@@ -501,13 +503,12 @@ export default function Home() {
               </div>
             )}
 
-            {/* 경고 문구 */}
             {(!paymentResult || (paymentResult === "FAIL" && !paymentReason)) && (
               <p className="mt-4 text-sm text-rose-500 text-center">
                 결제 결과와 필요한 정보를 모두 선택해 주세요.
               </p>
             )}
-            {/* 결제 결과 피드백 */}
+
             {paymentFeedback && (
               <div
                 className={`mt-4 p-3 rounded-xl text-center font-semibold
@@ -521,6 +522,7 @@ export default function Home() {
                   : "결제에 실패했습니다. 다시 시도해 주세요."}
               </div>
             )}
+
             <div className="mt-6 flex justify-between">
               <button
                 onClick={() => setShowPaymentPopup(false)}

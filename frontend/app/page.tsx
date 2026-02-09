@@ -173,10 +173,14 @@ export default function Home() {
     const formData = new FormData()
     formData.append("image", file)
 
+    // 최종 고정값 (화면은 판단 안 함)
+    formData.append("camera_type", "AUTO")
+
     const res = await fetch(`${API_BASE}/api/plate/recognize`, {
       method: "POST",
       body: formData,
     })
+
     const data = await res.json()
 
     if (!data.success) {

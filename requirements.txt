@@ -3,25 +3,9 @@
 # ==================================================
 
 torch
-# PyTorch
-# - 모든 딥러닝 모델의 기반 프레임워크
-# - Whisper(STT), 임베딩 모델, Silero VAD, LLM 추론에 필수
-# - GPU 환경에서는 CUDA 지원 버전 설치 권장
-
 transformers
-# Hugging Face Transformers
-# - Qwen, Whisper 등 LLM/STT 모델 로딩 및 추론
-# - 일부 대화 모델, 실험용 모델에서 사용
-
 accelerate
-# Transformers 로딩/추론 최적화
-# - 디바이스 매핑, 메모리 관리
-# - GPU/CPU 환경 모두에서 안정적인 모델 로딩
-
 pydantic
-# 데이터 스키마 검증
-# - IntentResult, DialogResult 등 구조 정의
-# - AppEngine ↔ NLU ↔ API 응답 인터페이스 안정화
 
 
 # ==================================================
@@ -29,60 +13,26 @@ pydantic
 # ==================================================
 
 numpy>=1.23.0
-# 수치 연산 핵심 라이브러리
-# - 오디오 파형 처리
-# - PCM 스트리밍 처리
-# - STT / VAD 공통 의존성
-
 scipy
-# 신호 처리 라이브러리
-# - 오디오 리샘플링 (48kHz → 16kHz 등)
-# - 일부 전처리 단계에서 사용
-
 sounddevice
-# 마이크 입력 수집
-# - 로컬 개발 / 키오스크 환경용
-# - WebSocket 서버 모드에서는 필수는 아니지만 유지
-
 soundfile
-# 오디오 파일 입출력
-# - PCM → WAV 변환
-# - faster-whisper 안정적인 입력 처리용
-
 faster-whisper
-# Whisper 기반 고속 STT 엔진
-# - CPU 환경에서도 실시간 수준 성능
-# - FastAPI 서버에서 모델 상주 형태로 사용
-
 openai-whisper
-# Whisper 원본 구현
-# - 실험/비교용
-# - faster-whisper fallback 용도
 
 
 # ==================================================
-# Voice Activity Detection (🔥 상시 마이크 핵심)
+# Voice Activity Detection
 # ==================================================
 
 silero-vad
-# Silero Voice Activity Detection
-# - 실시간 음성/무음 판단
-# - 상시 마이크 + 발화 종료 감지 핵심 라이브러리
 
 
 # ==================================================
-# Intent Classification (Embedding 기반 1차 분류)
+# Intent Classification (Embedding 기반)
 # ==================================================
 
 sentence-transformers>=2.2.2
-# 문장 임베딩 모델 래퍼
-# - all-MiniLM-L6-v2 사용
-# - LLM 없이 CPU에서 빠른 의도 분류
-
 scikit-learn>=1.2.0
-# 머신러닝 유틸
-# - cosine_similarity 사용
-# - intent_embedding.py에서 임베딩 유사도 계산
 
 
 # ==================================================
@@ -90,29 +40,15 @@ scikit-learn>=1.2.0
 # ==================================================
 
 requests
-# HTTP 클라이언트
-# - Ollama API 호출 (Intent LLM, Dialog LLM)
-# - 외부 서비스 연동
 
 
 # ==================================================
-# Web API / Service (🔥 서비스화 핵심)
+# Web API / Service
 # ==================================================
 
 fastapi
-# 웹 API 프레임워크
-# - HTTP (/voice) + WebSocket (/ws/voice) 엔드포인트 제공
-# - 상시 음성 대화 서비스 구현
-
 uvicorn[standard]
-# ASGI 서버
-# - FastAPI 실행용
-# - python -m uvicorn 방식 권장 (Windows 안정성)
-
 python-multipart
-# multipart/form-data 파싱
-# - UploadFile / File(...) 사용 시 필수
-# - 음성 파일 업로드 처리
 
 
 # ==================================================
@@ -120,14 +56,7 @@ python-multipart
 # ==================================================
 
 psycopg2-binary
-# PostgreSQL 드라이버
-# - Supabase(Postgres) 연동
-# - intent_logger / dialog_logger에서 사용
-
 python-dotenv
-# 환경 변수 관리
-# - .env 파일 로드
-# - DATABASE_URL, OLLAMA_BASE_URL 등 관리
 
 
 # ==================================================
@@ -135,27 +64,12 @@ python-dotenv
 # ==================================================
 
 gtts
-# Google Translate TTS
-# - 간단한 TTS 출력용
-# - static/tts/*.mp3 생성
 
 
 # ==================================================
-# 🚗 License Plate Recognition (CPU ONLY, 신규 추가)
+# 🚗 License Plate Recognition (CPU ONLY)
 # ==================================================
 
 easyocr
-# CPU 기반 OCR 라이브러리
-# - 한국어/영어 지원
-# - 번호판 문자열 추출에 사용
-# - GPU 없어도 정상 동작
-
 opencv-python
-# 이미지 처리
-# - 업로드 이미지 디코딩
-# - OCR 전처리 (resize / grayscale 등)
-
 pillow
-# 이미지 IO 보조 라이브러리
-# - FastAPI UploadFile 처리 보조
-

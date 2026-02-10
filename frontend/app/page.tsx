@@ -61,7 +61,10 @@ export default function Home() {
     statusRef.current = s
     _setStatus(s)
   }
-
+  // 🔥 THINK UX 제어용
+  const THINK_MIN_MS = 300
+  const thinkStartRef = useRef<number | null>(null)
+  
   const [bubbleText, setBubbleText] = useState("어떤 문의가 있으신가요?")
   const [active, setActive] = useState(false)
   const [intent, setIntent] = useState<Intent>("NONE")

@@ -264,8 +264,14 @@ async def voice_session_ws(websocket: WebSocket):
                     pcm_buffer.clear()
                     continue
 
+                # 🔥 THINKING 진입 (UX용 상태 브로드캐스트)
                 io_state = "THINKING"
+                await safe_send(websocket, {
+                    "type": "assistant_state",
+                    "state": "THINKING",
+                })
 
+                # 🔤 STT
                 text = transcribe_pcm_chunks(
                     pcm_buffer,
                     whisper_model=app_state.whisper_model,
@@ -274,10 +280,15 @@ async def voice_session_ws(websocket: WebSocket):
 
                 if not is_meaningful_text(text):
                     io_state = "LISTENING"
+                    await safe_send(websocket, {
+                        "type": "assistant_state",
+                        "state": "LISTENING",
+                    })
                     continue
 
                 last_activity_ts = time.time()
 
+                # 🤖 AppEngine 처리
                 result = app_state.app_engine.handle_text(text)
                 reply = result.get("text")
 
@@ -290,6 +301,10 @@ async def voice_session_ws(websocket: WebSocket):
                     })
                 else:
                     io_state = "LISTENING"
+                    await safe_send(websocket, {
+                        "type": "assistant_state",
+                        "state": "LISTENING",
+                    })
 
     except WebSocketDisconnect:
         print("[WS] ❌ Voice disconnected")

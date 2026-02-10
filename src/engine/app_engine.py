@@ -17,6 +17,15 @@ SITE_ID = "parkassist_local"
 DONE_COOLDOWN_SEC = 1.2
 SECOND_STAGE_HARD_TURN_LIMIT = 6
 
+# 🔴 욕설/공격 감지 스위치 (ADD)
+ENABLE_AGGRESSION_GUARD = True
+
+MASKED_PROFANITY_PATTERNS = [
+    r"씨[\*xX]+발",
+    r"씨[\*xX]+",
+    r"개[\*xX]+",
+    r"[\*xX]+나",
+]
 
 # ==================================================
 # NONE 시 안내 메시지
@@ -50,6 +59,24 @@ CALL_ADMIN_KEYWORDS = [
     "도와", "도움",
 ]
 
+# 🔴 욕설/공격 감지 키워드 (ADD)
+PROFANITY_KEYWORDS = [
+    "씨발", "시발", "병신", "미친", "좆", "개새끼",
+    "fuck", "shit", "asshole",
+]
+
+AGGRESSIVE_PATTERNS = [
+    r"사람.*나와",
+    r"책임자",
+    r"당장.*불러",
+    r"가만.*안",
+    r"똑바로.*해",
+]
+
+def _contains_masked_profanity(text: str) -> bool:
+    t = text.lower()
+    return any(re.search(p, t) for p in MASKED_PROFANITY_PATTERNS)
+
 
 def _normalize(text: str) -> str:
     return re.sub(r"[\s\.\,\!\?]+", "", text.strip().lower())
@@ -57,12 +84,23 @@ def _normalize(text: str) -> str:
 
 def _is_done_utterance(text: str) -> bool:
     t = _normalize(text)
-    return any(_normalize(k) in t for k in DONE_KEYWORDS)
+    return any(_normalize(k) == t for k in DONE_KEYWORDS)
 
 
 def _is_call_admin_utterance(text: str) -> bool:
     t = _normalize(text)
     return any(_normalize(k) in t for k in CALL_ADMIN_KEYWORDS)
+
+
+# 🔴 욕설/공격 감지 함수 (ADD)
+def _contains_profanity(text: str) -> bool:
+    t = _normalize(text)
+    return any(k in t for k in PROFANITY_KEYWORDS)
+
+
+def _contains_aggression(text: str) -> bool:
+    t = _normalize(text)
+    return any(re.search(p, t) for p in AGGRESSIVE_PATTERNS)
 
 
 class AppEngine:
@@ -81,7 +119,7 @@ class AppEngine:
 
     def _reset_all(self):
         self.session_id = None
-        self.state = "FIRST_STAGE"   # FIRST_STAGE | SECOND_STAGE
+        self.state = "FIRST_STAGE"
         self.first_intent = None
         self.intent_log_id = None
 
@@ -91,7 +129,7 @@ class AppEngine:
         self._ignore_until_ts = 0.0
 
         self.second_turn_count_user = 0
-        self.second_slots = {}              # dialog_llm_client: slots["symptom"] 사용
+        self.second_slots = {}
         self.second_pending_slot = None
 
     def _start_new_session(self):
@@ -146,7 +184,7 @@ class AppEngine:
 
     def _handle_call_admin(self, text: str):
         self._log_dialog("user", text)
-        reply = "관리실에 연락했습니다.\n잠시만 기다려 주세요."
+        reply = "불편을드려 죄송합니다.\n관리실에 연락했습니다.\n잠시만 기다려 주세요."
         self._log_dialog("assistant", reply)
         self._end_session("call_admin")
 
@@ -157,21 +195,7 @@ class AppEngine:
             system_action="CALL_ADMIN",
         )
 
-    # ==================================================
-    # ✅ PAYMENT DB 조회 (payment/payment_log)
-    # ==================================================
     def _fetch_payment_ctx(self) -> Optional[Dict[str, Any]]:
-        """
-        returns:
-          {
-            "parking_session_id": str,
-            "payment_id": str|None,
-            "payment_status": str|None,   # PAID/UNPAID/FREE ...
-            "has_attempt": bool,
-            "log_result": str|None,       # 0/1/2/3... 또는 SUCCESS/FAIL...
-            "log_reason": str|None,       # 한도초과/잔액부족...
-          }
-        """
         try:
             from src import app_state
             from src.db.postgres import get_conn
@@ -197,7 +221,6 @@ class AppEngine:
             conn = get_conn()
             cur = conn.cursor()
 
-            # payment 1개 조회(최신 1개)
             cur.execute(
                 """
                 SELECT id, payment_status
@@ -216,8 +239,6 @@ class AppEngine:
             ctx["payment_id"] = str(payment_id)
             ctx["payment_status"] = pay.get("payment_status")
 
-            # payment_log 최신 1개
-            # (스키마에 따라 컬럼명이 다를 수 있어 가장 보편적으로 사용)
             cur.execute(
                 """
                 SELECT result, reason
@@ -256,14 +277,10 @@ class AppEngine:
             pass
         return None
 
-    # ==================================================
-    # dialog_llm_client 호출 공통
-    # ==================================================
     def _run_dialog(self, text: str) -> Dict[str, Any]:
         direction = self._get_direction_ctx()
 
         payment_ctx = None
-        # intent는 FIRST_STAGE에서 세팅되고 SECOND에서도 고정
         if (self.first_intent or "").upper() == "PAYMENT":
             payment_ctx = self._fetch_payment_ctx()
 
@@ -277,7 +294,6 @@ class AppEngine:
                 "hard_turn_limit": SECOND_STAGE_HARD_TURN_LIMIT,
                 "slots": self.second_slots,
                 "pending_slot": self.second_pending_slot,
-                # ✅ 추가 컨텍스트
                 "direction": direction,
                 "payment_ctx": payment_ctx,
             },
@@ -326,6 +342,12 @@ class AppEngine:
         if not self.session_id:
             self._start_new_session()
 
+        # 🔴 욕설/공격 감지 → 즉시 관리실 호출 (ADD)
+        if ENABLE_AGGRESSION_GUARD and (
+            _contains_profanity(text) or _contains_aggression(text) or _contains_masked_profanity(text)
+        ):
+            return self._handle_call_admin(text)
+
         if _is_call_admin_utterance(text):
             return self._handle_call_admin(text)
 
@@ -339,9 +361,6 @@ class AppEngine:
                 end_session=True,
             )
 
-        # ==================================================
-        # FIRST_STAGE: 의도 분류 후 즉시 dialog 실행
-        # ==================================================
         if self.state == "FIRST_STAGE":
             result = detect_intent_embedding(text)
 
@@ -356,7 +375,6 @@ class AppEngine:
             self.first_intent = result.intent.value
             self._log_dialog("user", text)
 
-            # ✅ Intent.NONE Enum이 없을 수 있으니 문자열도 허용
             intent_value = (result.intent.value or "").upper()
             none_enum = getattr(Intent, "NONE", None)
             is_none = (none_enum is not None and result.intent == none_enum) or (intent_value == "NONE")
@@ -373,7 +391,4 @@ class AppEngine:
             self.state = "SECOND_STAGE"
             return self._run_dialog(text)
 
-        # ==================================================
-        # SECOND_STAGE
-        # ==================================================
         return self._run_dialog(text)

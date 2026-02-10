@@ -11,6 +11,9 @@ import requests
 from src.rag.manual_rag import ManualRAG
 
 
+# ==================================================
+# 환경/정책
+# ==================================================
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
 OLLAMA_MODEL = os.getenv("DIALOG_MODEL", os.getenv("OLLAMA_MODEL", "llama3.1:8b"))
 OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "120"))
@@ -19,25 +22,34 @@ DEFAULT_HARD_TURN_LIMIT = int(os.getenv("SECOND_STAGE_HARD_TURN_LIMIT", "6") or 
 FAREWELL_TEXT = "이용해 주셔서 감사합니다. 안녕히 가세요."
 
 
+# ==================================================
+# 슬롯 정책
+# ==================================================
 SLOT_KEYS = ["symptom"]
 
+# ✅ Intent 축소: PAYMENT / REGISTRATION / FACILITY / NONE
 REQUIRED_SLOTS_BY_INTENT: Dict[str, List[str]] = {
     "PAYMENT": ["symptom"],
     "REGISTRATION": ["symptom"],
     "FACILITY": ["symptom"],
-    "LPR": ["symptom"],
     "NONE": ["symptom"],
 }
 
+
+# ==================================================
+# intent -> 메뉴얼 파일 매핑
+# ==================================================
 MANUAL_FILES_BY_INTENT: Dict[str, List[str]] = {
     "PAYMENT": ["payment_card_fail.md"],
-    "LPR": ["entry_lpr_issue.md", "exit_lpr_issue.md"],
     "REGISTRATION": ["visit_registration_fail.md"],
     "FACILITY": ["facility_issue.md"],
     "NONE": ["none_issue.md"],
 }
 
 
+# ==================================================
+# 유틸
+# ==================================================
 def _norm_intent_name(x: Any) -> str:
     if not x:
         return "NONE"
@@ -112,6 +124,9 @@ def _json_extract(text: str) -> Optional[dict]:
     return None
 
 
+# ==================================================
+# 메뉴얼 후보 추출
+# ==================================================
 @dataclass
 class ManualSolution:
     manual_file: str
@@ -195,27 +210,13 @@ def _extract_solve_template_solutions(md: str) -> List[str]:
     if buf:
         bullets.append("\n".join(buf).strip())
 
-    return [b for b in bullets if len(b) >= 6]
+    bullets = [b for b in bullets if len(b) >= 6]
+    return bullets
 
 
-def _manual_files_for_intent(intent_name: str, *, direction: Optional[str] = None) -> List[str]:
+def _gather_solutions_for_intent(intent_name: str) -> List[ManualSolution]:
     intent_name = _norm_intent_name(intent_name)
     files = MANUAL_FILES_BY_INTENT.get(intent_name, [])
-
-    # ✅ LPR: direction(ENTRY/EXIT)에 따라 후보 제한
-    if intent_name == "LPR":
-        d = (direction or "").upper()
-        if d == "ENTRY":
-            return ["entry_lpr_issue.md"]
-        if d == "EXIT":
-            return ["exit_lpr_issue.md"]
-        return files
-
-    return files
-
-
-def _gather_solutions_for_intent(intent_name: str, *, direction: Optional[str] = None) -> List[ManualSolution]:
-    files = _manual_files_for_intent(intent_name, direction=direction)
     out: List[ManualSolution] = []
 
     for fn in files:
@@ -244,6 +245,9 @@ def _gather_solutions_for_intent(intent_name: str, *, direction: Optional[str] =
     return uniq
 
 
+# ==================================================
+# 솔루션 선택기 (LLM은 선택만)
+# ==================================================
 SYSTEM_PROMPT_SELECT_SOLUTION = """
 너는 '솔루션 선택기'다.
 사용자 symptom(raw 문장)과 후보 솔루션들을 비교해서,
@@ -258,7 +262,7 @@ SYSTEM_PROMPT_SELECT_SOLUTION = """
 
 선택 기준:
 - symptom 문장에 들어있는 핵심 단어/표현과 가장 잘 맞는 후보
-- intent와 문맥이 맞는 후보(번호판/등록/결제/시설 등)
+- intent와 문맥이 맞는 후보(결제/등록/시설 등)
 """.strip()
 
 
@@ -296,6 +300,9 @@ def _llm_select_solution_index(intent_name: str, symptom: str, sols: List[Manual
     return None, conf
 
 
+# ==================================================
+# 결과 타입
+# ==================================================
 DialogAction = Literal["SOLVE", "DONE", "ESCALATE_DONE"]
 
 
@@ -309,6 +316,9 @@ class DialogResult:
     confidence: float = 0.75
 
 
+# ==================================================
+# 메인
+# ==================================================
 def dialog_llm_chat(
     user_text: str,
     *,
@@ -329,9 +339,6 @@ def dialog_llm_chat(
     turn_count_user = int(ctx.get("turn_count_user", 0) or 0)
 
     current_intent = _norm_intent_name(ctx.get("intent"))
-    direction = (ctx.get("direction") or "").upper() or None
-    payment_ctx = ctx.get("payment_ctx") if isinstance(ctx.get("payment_ctx"), dict) else None
-
     slots = ctx.get("slots") if isinstance(ctx.get("slots"), dict) else {}
 
     if turn_count_user >= hard_limit:
@@ -343,52 +350,28 @@ def dialog_llm_chat(
             new_intent=current_intent,
         )
 
-    # ✅ symptom은 이번 발화로 항상 갱신
+    # ✅ symptom 매 턴 덮어쓰기
     slots["symptom"] = user_text.strip()
     symptom = str(slots.get("symptom") or "").strip()
 
-    # ==================================================
-    # ✅ PAYMENT: DB(payment_log result/reason) 반영
-    # ==================================================
-    if current_intent == "PAYMENT" and payment_ctx:
-        has_attempt = bool(payment_ctx.get("has_attempt"))
-        payment_status = (payment_ctx.get("payment_status") or "")
-        log_result = payment_ctx.get("log_result")
-        log_reason = payment_ctx.get("log_reason")
-
-        # 1) 결제 시도 내역 자체가 없으면 -> 고정 안내(네가 말한 문구)
-        if not has_attempt and str(payment_status).upper() in ("UNPAID", "", "NONE", "NULL"):
-            reply = (
-                "현재 차량의 결제 시도 내역이 확인되지 않습니다.\n"
-                "아직 결제가 되지 않은 상태이니, 정산기 화면에서 결제를 먼저 진행해 주시기 바랍니다."
+    # ✅ PAYMENT면 payment_ctx 힌트를 symptom에만 부착(선택 품질 개선용)
+    symptom_for_select = symptom
+    if current_intent == "PAYMENT":
+        pctx = ctx.get("payment_ctx") if isinstance(ctx.get("payment_ctx"), dict) else {}
+        if pctx:
+            symptom_for_select = (
+                f"{symptom}\n"
+                f"(결제로그: result={pctx.get('log_result')}, reason={pctx.get('log_reason')}, payment_status={pctx.get('payment_status')})"
             )
-            return DialogResult(reply=reply, action="SOLVE", slots=slots, confidence=0.95, new_intent=current_intent)
 
-        # 2) 결제 로그가 있으면 reason/result를 선택 입력에 “힌트”로 섞어서 메뉴얼 CASE가 제대로 선택되게 함
-        hint_parts = []
-        if log_result is not None:
-            hint_parts.append(f"result={log_result}")
-        if log_reason:
-            hint_parts.append(f"reason={log_reason}")
-        if payment_status:
-            hint_parts.append(f"payment_status={payment_status}")
-        if hint_parts:
-            symptom_for_select = f"{symptom}\n(결제로그: {', '.join(hint_parts)})"
-        else:
-            symptom_for_select = symptom
-    else:
-        symptom_for_select = symptom
-
-    # 1) intent별 메뉴얼 후보 추출 (LPR은 direction 반영)
-    sols = _gather_solutions_for_intent(current_intent, direction=direction)
+    sols = _gather_solutions_for_intent(current_intent)
 
     if debug:
-        print(f"[SOLVE] intent={current_intent} direction={direction} solutions={len(sols)} symptom={symptom_for_select}")
+        print(f"[SOLVE] intent={current_intent} solutions={len(sols)} symptom={symptom_for_select}")
 
-    # 2) 후보 없으면 RAG fallback
     if not sols:
         rag = ManualRAG()
-        query = f"{current_intent} | direction: {direction or 'N/A'} | symptom: {symptom_for_select}"
+        query = f"{current_intent} | symptom: {symptom_for_select}"
         try:
             hits = rag.retrieve(query=query, preferred_docs=None, hard_filter=False, debug=debug)
         except Exception as e:
@@ -409,7 +392,6 @@ def dialog_llm_chat(
             new_intent=current_intent,
         )
 
-    # 3) 후보가 있으면 선택기(선택만)로 index 선택
     idx, conf = _llm_select_solution_index(current_intent, symptom_for_select, sols)
 
     if idx is None:

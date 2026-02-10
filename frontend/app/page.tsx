@@ -180,22 +180,54 @@ export default function Home() {
     setVoiceLocked(false)
     setStatus("thinking")
     setBubbleText("차량 번호판을 확인 중이에요…")
+    setPlateCard(null)
+    setDirection(null)
+    setParkingSessionId(null)
 
     const formData = new FormData()
     formData.append("image", file)
 
-    const res = await fetch(`${API_BASE}/api/plate/recognize`, {
-      method: "POST",
-      body: formData,
-    })
+    let data: any
+    try {
+      const res = await fetch(`${API_BASE}/api/plate/recognize`, {
+        method: "POST",
+        body: formData,
+      })
+      data = await res.json()
+    } catch {
+      setBubbleText("서버와 통신할 수 없어요.")
+      setStatus("idle")
+      return
+    }
 
-    const data = await res.json()
-    if (!data.success) {
+    if (!data?.success) {
       setBubbleText("번호판을 인식하지 못했어요.")
       setStatus("idle")
       return
     }
 
+    // 🚫 만차
+    if (data.direction === "ENTRY_DENIED" && data.reason === "FULL") {
+      setDirection("ENTRY")
+      setPlateCard(null)
+      setParkingSessionId(null)
+
+      await startVoice()
+
+      setTimeout(() => {
+        wsRef.current?.send(JSON.stringify({
+          type: "vehicle_result",
+          direction: "ENTRY_DENIED",
+          reason: "FULL",
+          occupied: data.parking_lot?.occupied,
+          capacity: data.parking_lot?.capacity,
+        }))
+      }, 300)
+
+      return
+    }
+
+    // ✅ ENTRY / EXIT
     setPlateCard({
       plate: data.plate,
       vehicleTypeLabel: data.card?.vehicle_type_label,
@@ -209,10 +241,8 @@ export default function Home() {
     setDirection(data.direction)
     setParkingSessionId(data.parking_session_id ?? null)
 
-    // 🔥 WS 시작
     await startVoice()
 
-    // 🔥 번호판 결과를 WS로 전달 (TTS는 서버가 함)
     setTimeout(() => {
       wsRef.current?.send(JSON.stringify({
         type: "vehicle_result",
@@ -225,6 +255,7 @@ export default function Home() {
       }))
     }, 300)
   }
+
 
   /* ===============================
      Payment

@@ -10,12 +10,11 @@ from psycopg2.extras import RealDictCursor
 
 from src.db.postgres import get_conn
 from src.storage import upload_image
-import src.app_state as app_state
 
 router = APIRouter()
 
 # =========================
-# OCR 설정 (CPU ONLY)
+# OCR 설정
 # =========================
 reader = easyocr.Reader(["ko", "en"], gpu=False)
 
@@ -42,7 +41,7 @@ def normalize_plate(text: str) -> str:
 # =========================
 # 번호판 영역 탐지
 # =========================
-def detect_plate_region(img: np.ndarray) -> np.ndarray | None:
+def detect_plate_region(img: np.ndarray):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     blur = cv2.bilateralFilter(gray, 11, 17, 17)
     edges = cv2.Canny(blur, 30, 200)
@@ -66,7 +65,7 @@ def detect_plate_region(img: np.ndarray) -> np.ndarray | None:
 # =========================
 # OCR 추출
 # =========================
-def extract_plate(image: np.ndarray) -> tuple[str | None, float]:
+def extract_plate(image: np.ndarray):
     results = reader.readtext(image)
     best = None
 
@@ -81,18 +80,32 @@ def extract_plate(image: np.ndarray) -> tuple[str | None, float]:
 
 
 # =========================
-# 입출차 처리 (DB 전용)
+# 입출차 + 만차 처리
 # =========================
 def resolve_direction_and_process(
     plate: str,
     image_url: str,
+    parking_lot_id: str,
 ):
     now = datetime.utcnow()
 
     conn = get_conn()
     cur = conn.cursor(cursor_factory=RealDictCursor)
 
-    # 1️⃣ vehicle 조회 or 생성
+    # 🔒 주차장 row lock (동시 입차 방지)
+    cur.execute(
+        """
+        SELECT capacity
+        FROM parking_lot
+        WHERE id = %s
+        FOR UPDATE
+        """,
+        (parking_lot_id,),
+    )
+    lot = cur.fetchone()
+    capacity = lot["capacity"]
+
+    # 차량 조회 / 생성
     cur.execute(
         """
         SELECT id, vehicle_type
@@ -114,19 +127,17 @@ def resolve_direction_and_process(
             (plate,),
         )
         vehicle = cur.fetchone()
-        conn.commit()
 
     vehicle_id = vehicle["id"]
     vehicle_type = vehicle["vehicle_type"]
 
-    # 2️⃣ 활성 세션 조회
+    # 활성 세션 확인
     cur.execute(
         """
         SELECT id, entry_time, entry_image_url
         FROM parking_session
         WHERE vehicle_id = %s
           AND exit_time IS NULL
-        ORDER BY entry_time DESC
         LIMIT 1
         """,
         (vehicle_id,),
@@ -137,19 +148,46 @@ def resolve_direction_and_process(
     # ENTRY
     # =========================
     if not session:
+        # 현재 주차 중 대수
+        cur.execute(
+            """
+            SELECT COUNT(*) AS occupied
+            FROM parking_session
+            WHERE parking_lot_id = %s
+              AND exit_time IS NULL
+            """,
+            (parking_lot_id,),
+        )
+        occupied = cur.fetchone()["occupied"]
+
+        # 🚫 만차
+        if occupied >= capacity:
+            conn.rollback()
+            conn.close()
+            return {
+                "direction": "ENTRY_DENIED",
+                "reason": "FULL",
+                "parking_lot": {
+                    "occupied": occupied,
+                    "capacity": capacity,
+                },
+            }
+
+        # 입차 처리
         cur.execute(
             """
             INSERT INTO parking_session (
                 vehicle_id,
+                parking_lot_id,
                 entry_time,
                 status,
                 entry_image_url,
                 created_at
             )
-            VALUES (%s, now(), 'PARKED', %s, now())
+            VALUES (%s, %s, now(), 'PARKED', %s, now())
             RETURNING id, entry_time
             """,
-            (vehicle_id, image_url),
+            (vehicle_id, parking_lot_id, image_url),
         )
         new_session = cur.fetchone()
         session_id = new_session["id"]
@@ -181,6 +219,10 @@ def resolve_direction_and_process(
                 "vehicle_type_label": VEHICLE_TYPE_LABEL.get(vehicle_type),
                 "entry_image_url": image_url,
             },
+            "parking_lot": {
+                "occupied": occupied + 1,
+                "capacity": capacity,
+            },
             "payment_status": payment_status,
         }
 
@@ -194,21 +236,16 @@ def resolve_direction_and_process(
         SELECT payment_status
         FROM payment
         WHERE parking_session_id = %s
-        LIMIT 1
         """,
         (session_id,),
     )
-    payment = cur.fetchone()
-    payment_status = payment["payment_status"]
+    payment_status = cur.fetchone()["payment_status"]
 
-    exit_time = now.isoformat()
-
-    # 미결제 → 출차 불가
+    # 미결제 출차 차단
     if payment_status not in ("PAID", "FREE"):
         conn.close()
         return {
             "direction": "EXIT",
-            "parking_session_id": session_id,
             "card": {
                 "plate": plate,
                 "vehicle_type": vehicle_type,
@@ -217,14 +254,10 @@ def resolve_direction_and_process(
                 "exit_image_url": image_url,
                 "payment_status": payment_status,
             },
-            "time_info": {
-                "entry_time": session["entry_time"].isoformat(),
-                "exit_time": exit_time,
-            },
             "payment_status": payment_status,
         }
 
-    # 결제 완료 출차
+    # 출차 처리
     cur.execute(
         """
         UPDATE parking_session
@@ -232,6 +265,7 @@ def resolve_direction_and_process(
             status = 'EXITED',
             exit_image_url = %s
         WHERE id = %s
+          AND exit_time IS NULL
         """,
         (image_url, session_id),
     )
@@ -242,18 +276,6 @@ def resolve_direction_and_process(
     return {
         "direction": "EXIT",
         "parking_session_id": session_id,
-        "card": {
-            "plate": plate,
-            "vehicle_type": vehicle_type,
-            "vehicle_type_label": VEHICLE_TYPE_LABEL.get(vehicle_type),
-            "entry_image_url": session["entry_image_url"],
-            "exit_image_url": image_url,
-            "payment_status": payment_status,
-        },
-        "time_info": {
-            "entry_time": session["entry_time"].isoformat(),
-            "exit_time": exit_time,
-        },
         "payment_status": payment_status,
     }
 
@@ -269,8 +291,10 @@ async def recognize_plate(image: UploadFile = File(...)):
     if img is None:
         return {"success": False, "error": "INVALID_IMAGE"}
 
-    image_key = f"parking/raw/{uuid.uuid4()}.jpg"
-    image_url = upload_image(contents, image_key)
+    image_url = upload_image(
+        contents,
+        f"parking/raw/{uuid.uuid4()}.jpg"
+    )
 
     plate_img = detect_plate_region(img)
     if plate_img is None:
@@ -284,22 +308,18 @@ async def recognize_plate(image: UploadFile = File(...)):
             "confidence": confidence,
         }
 
-    db_result = resolve_direction_and_process(
+    # 🔧 현재는 주차장 1개 고정 (실제 UUID 사용)
+    parking_lot_id = "33e088ea-66d8-4ef9-aa0b-dd533cdb885b"
+
+    result = resolve_direction_and_process(
         plate=plate,
         image_url=image_url,
+        parking_lot_id=parking_lot_id,
     )
-
-    # 🔔 중앙 세션 엔진에 이벤트 전달
-    engine_result = app_state.session_engine.handle_event({
-        "type": "VEHICLE_DETECTED",
-        "direction": db_result["direction"],
-        "payment_status": db_result.get("payment_status"),
-    })
 
     return {
         "success": True,
         "plate": plate,
         "confidence": confidence,
-        **db_result,
-        **engine_result,
+        **result,
     }

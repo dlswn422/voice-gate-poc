@@ -133,30 +133,37 @@ async def voice_session_ws(websocket: WebSocket):
                     # ▶ 🚗 번호판 결과
                     if msg.get("type") == "vehicle_result":
                         direction = msg.get("direction")
+                        reason = msg.get("reason")
                         exit_context = msg.get("exit_context", "NONE")
 
-                        print(f"[VEHICLE] 🚗 direction={direction}, exit_context={exit_context}")
+                        if direction == "ENTRY_DENIED" and reason == "FULL":
+                            text = (
+                                "현재 주차장이 만차입니다. "
+                                "근처 주차장을 찾을 수 없습니다."
+                            )
+
+                            await safe_send(websocket, {
+                                "type": "assistant_message",
+                                "text": text,
+                                "tts_url": synthesize(text),
+                                # end_session 없음 → 무음 타임아웃 종료
+                            })
+                            continue
 
                         if direction == "ENTRY":
                             text = "입차가 정상적으로 등록되었습니다."
+
                         elif direction == "EXIT":
                             if exit_context == "UNPAID":
                                 text = "미결제 상태입니다. 결제 후 출차가 가능합니다."
                             else:
                                 text = "출차를 진행합니다."
-                        else:
-                            continue
 
-                        last_activity_ts = time.time()
-                        io_state = "SPEAKING"
-
-                        print("[TTS] 🗣 vehicle_result TTS")
                         await safe_send(websocket, {
                             "type": "assistant_message",
                             "text": text,
                             "tts_url": synthesize(text),
                         })
-                        continue
 
                     # ▶ 💳 결제 결과
                     if msg.get("type") == "payment_result":

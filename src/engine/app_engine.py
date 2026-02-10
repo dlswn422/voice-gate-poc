@@ -28,6 +28,25 @@ MASKED_PROFANITY_PATTERNS = [
 ]
 
 # ==================================================
+# ✅ 데모 정책: 1차 의도 허용 목록 (LPR 제거)
+# ==================================================
+ALLOWED_INTENTS = {"PAYMENT", "REGISTRATION", "FACILITY", "NONE"}
+
+# ==================================================
+# ✅ PAYMENT 불만/부정 감지 → 즉시 관리자 호출 + 종료 (데모 정책)
+# - "차단봉 올려드릴게요/열어드릴게요" 류 안내 후
+# - 다음 턴에 불만/부정이 나오면 종료
+# ==================================================
+PAYMENT_NEGATIVE_KEYWORDS = [
+    "안올라", "안 올라", "안올라가", "안 올라가", "안올라가는데", "안 올라가는데",
+    "안열려", "안 열려", "안열리", "안 열리", "안열리는데", "안 열리는데",
+    "안돼", "안 돼", "안되", "안 되", "안되는데", "안 되는데",
+    "계속", "또", "여전히", "아직", "왜",
+    "안움직", "안 움직", "멈춰", "먹통",
+]
+
+
+# ==================================================
 # NONE 시 안내 메시지
 # ==================================================
 NONE_RETRY_TEXT = (
@@ -73,6 +92,7 @@ AGGRESSIVE_PATTERNS = [
     r"똑바로.*해",
 ]
 
+
 def _contains_masked_profanity(text: str) -> bool:
     t = text.lower()
     return any(re.search(p, t) for p in MASKED_PROFANITY_PATTERNS)
@@ -103,15 +123,39 @@ def _contains_aggression(text: str) -> bool:
     return any(re.search(p, t) for p in AGGRESSIVE_PATTERNS)
 
 
+def _contains_payment_negative(text: str) -> bool:
+    t = _normalize(text)
+    return any(_normalize(k) in t for k in PAYMENT_NEGATIVE_KEYWORDS)
+
+
+def _reply_implies_barrier_action(reply: str) -> bool:
+    """
+    assistant reply가 '차단봉/차단기 열어줌/올려줌' 류인지 감지해서
+    다음 턴 불만이면 관리자 호출하기 위한 플래그를 켠다.
+    """
+    r = _normalize(reply)
+    # 너무 빡세게 걸면 안 잡히고, 너무 넓히면 오탐 많아서 최소 키워드 조합으로
+    keywords = [
+        "차단봉올려", "차단기올려", "차단봉열어", "차단기열어",
+        "올려드릴", "열어드릴", "열어드릴게", "올려드릴게",
+        "올려드리겠", "열어드리겠",
+    ]
+    return any(k in r for k in keywords)
+
+
 class AppEngine:
     """
     AppEngine (REFINED)
 
     ✔ 전역 인터럽트(관리실 호출)
-    ✔ 1차 의도 분류 -> 곧바로 dialog_llm_client로 메뉴얼 기반 응답
+    ✔ 1차 의도 분류 -> dialog_llm_client로 메뉴얼 기반 응답
     ✔ 질문 생성 없음 (LLM이 질문하지 않음)
     ✔ PAYMENT일 때 DB(payment/payment_log) 조회 결과를 context로 전달
-    ✔ LPR일 때 direction(ENTRY/EXIT) context로 전달하여 메뉴얼 후보 제한
+
+    ✅ 데모 정책 추가
+    - FACILITY: 즉시 관리자 호출 + 종료
+    - PAYMENT: '차단봉/차단기 올려드림' 안내 후 불만/부정 들어오면 즉시 관리자 호출 + 종료
+    - LPR 제거: ALLOWED_INTENTS 밖 intent는 NONE으로 강등
     """
 
     def __init__(self):
@@ -132,6 +176,9 @@ class AppEngine:
         self.second_slots = {}
         self.second_pending_slot = None
 
+        # ✅ PAYMENT 차단봉 처리 안내 후, 다음 턴 불만이면 관리자 호출
+        self._payment_barrier_promised = False
+
     def _start_new_session(self):
         self.session_id = str(uuid.uuid4())
         self.state = "FIRST_STAGE"
@@ -141,6 +188,8 @@ class AppEngine:
         self.second_turn_count_user = 0
         self.second_slots = {}
         self.second_pending_slot = None
+
+        self._payment_barrier_promised = False
 
         print(f"[ENGINE] 🆕 New session started: {self.session_id}")
 
@@ -182,9 +231,9 @@ class AppEngine:
             "system_action": system_action,
         }
 
-    def _handle_call_admin(self, text: str):
+    def _handle_call_admin(self, text: str, *, reply_override: Optional[str] = None):
         self._log_dialog("user", text)
-        reply = "불편을드려 죄송합니다.\n관리실에 연락했습니다.\n잠시만 기다려 주세요."
+        reply = reply_override or "불편을드려 죄송합니다.\n관리실에 연락했습니다.\n잠시만 기다려 주세요."
         self._log_dialog("assistant", reply)
         self._end_session("call_admin")
 
@@ -267,18 +316,14 @@ class AppEngine:
             except Exception:
                 pass
 
-    def _get_direction_ctx(self) -> Optional[str]:
-        try:
-            from src import app_state
-            d = getattr(app_state, "current_direction", None)
-            if d:
-                return str(d).upper()
-        except Exception:
-            pass
-        return None
-
     def _run_dialog(self, text: str) -> Dict[str, Any]:
-        direction = self._get_direction_ctx()
+        # ✅ PAYMENT 차단봉 안내 후 다음 턴 불만/부정 → 즉시 관리자 호출 + 종료
+        if (self.first_intent or "").upper() == "PAYMENT":
+            if self._payment_barrier_promised and _contains_payment_negative(text):
+                return self._handle_call_admin(
+                    text,
+                    reply_override="불편을 드려서 죄송합니다. 관리자를 빠르게 호출하겠습니다."
+                )
 
         payment_ctx = None
         if (self.first_intent or "").upper() == "PAYMENT":
@@ -294,7 +339,7 @@ class AppEngine:
                 "hard_turn_limit": SECOND_STAGE_HARD_TURN_LIMIT,
                 "slots": self.second_slots,
                 "pending_slot": self.second_pending_slot,
-                "direction": direction,
+                # ✅ LPR 제거: direction/context 전달 제거
                 "payment_ctx": payment_ctx,
             },
             debug=True,
@@ -302,6 +347,11 @@ class AppEngine:
 
         reply = getattr(res, "reply", "") or "조금 더 자세히 말씀해 주실 수 있을까요?"
         self._log_dialog("assistant", reply, model="llama-3.1-8b")
+
+        # ✅ PAYMENT에서 '차단봉/차단기 올려드림' 안내를 했으면 플래그 ON
+        if (self.first_intent or "").upper() == "PAYMENT":
+            if _reply_implies_barrier_action(reply):
+                self._payment_barrier_promised = True
 
         self.second_turn_count_user += 1
         self.second_slots = getattr(res, "slots", self.second_slots) or self.second_slots
@@ -364,20 +414,39 @@ class AppEngine:
         if self.state == "FIRST_STAGE":
             result = detect_intent_embedding(text)
 
+            # ✅ LPR 제거 정책: 허용되지 않은 intent면 NONE으로 강등
+            intent_value = (getattr(result.intent, "value", None) or "").upper()
+            if intent_value not in ALLOWED_INTENTS:
+                # Intent.NONE이 enum에 있든 없든 안전하게 처리
+                none_enum = getattr(Intent, "NONE", None)
+                if none_enum is not None:
+                    result.intent = none_enum
+                else:
+                    # 최악의 경우 문자열 기반으로만 처리되게
+                    class _Tmp:  # fallback
+                        value = "NONE"
+                    result.intent = _Tmp()
+
             self.intent_log_id = log_intent(
                 utterance=text,
-                predicted_intent=result.intent.value,
-                predicted_confidence=result.confidence,
+                predicted_intent=getattr(result.intent, "value", "NONE"),
+                predicted_confidence=getattr(result, "confidence", 0.0),
                 source="kiosk",
                 site_id=SITE_ID,
             )
 
-            self.first_intent = result.intent.value
+            self.first_intent = getattr(result.intent, "value", "NONE")
             self._log_dialog("user", text)
 
-            intent_value = (result.intent.value or "").upper()
+            # ✅ FACILITY는 즉시 관리자 호출 + 세션 종료(데모 정책)
+            if (self.first_intent or "").upper() == "FACILITY":
+                return self._handle_call_admin(
+                    text,
+                    reply_override="기기 결함으로 보입니다. 불편을 드려 죄송합니다.\n관리자를 바로 호출하겠습니다."
+                )
+
             none_enum = getattr(Intent, "NONE", None)
-            is_none = (none_enum is not None and result.intent == none_enum) or (intent_value == "NONE")
+            is_none = (none_enum is not None and result.intent == none_enum) or ((self.first_intent or "").upper() == "NONE")
 
             if is_none:
                 self._log_dialog("assistant", NONE_RETRY_TEXT)

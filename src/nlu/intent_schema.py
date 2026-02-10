@@ -12,8 +12,7 @@ class Intent(str, Enum):
 
     PAYMENT = "PAYMENT"
     REGISTRATION = "REGISTRATION"
-    FACILITY = "FACILITY"
-    LPR = "LPR"       
+    FACILITY = "FACILITY"     
     NONE = "NONE"
 
 class IntentResult(BaseModel):

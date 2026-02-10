@@ -1,6 +1,6 @@
 "use client"
 
-import { useRef, useState } from "react"
+import { useRef, useState, useEffect } from "react"
 
 /* ===============================
    Types
@@ -175,7 +175,10 @@ export default function Home() {
      Plate Upload
   =============================== */
   const handlePlateUpload = async (file: File) => {
-    if (active) return
+    wsRef.current?.send(JSON.stringify({
+      type: "user_activity",
+    }))
+    if (active && !parkingSessionId) return
 
     setVoiceLocked(false)
     setStatus("thinking")
@@ -261,6 +264,8 @@ export default function Home() {
      Payment
   =============================== */
   const confirmPayment = async () => {
+    // 🔒 중복 클릭 방지
+    if (paymentSubmitting) return
     if (!paymentResult || !parkingSessionId) return
 
     setPaymentSubmitting(true)
@@ -282,40 +287,51 @@ export default function Home() {
       })
 
       const data = await res.json()
-      if (!res.ok || !data.success) throw new Error()
+      if (!res.ok || !data.success) {
+        throw new Error(data?.detail || "PAYMENT_FAILED")
+      }
 
+      // ✅ 결제 결과 UI 반영
       setPaymentFeedback(paymentResult)
 
       // ===============================
-      // 🔥 결제 처리 후 UI / 음성 복구
+      // 🔥 결제 성공 후 처리
+      // ===============================
+      if (paymentResult === "SUCCESS") {
+        // 1️⃣ 카드 상태 즉시 PAID 반영 (🔥 이게 핵심)
+        setPlateCard(prev =>
+          prev ? { ...prev, paymentStatus: "PAID" } : prev
+        )
+
+        // 2️⃣ 안내 문구 명확히
+        setBubbleText(
+          "결제가 완료되었습니다.\n차량 번호판을 다시 업로드해 주세요."
+        )
+      }
+
+      // ===============================
+      // 🔥 UI / 음성 복구
       // ===============================
       setTimeout(() => {
-        // 1️⃣ 결제 팝업 닫기
+        // 3️⃣ 결제 팝업 닫기
         setShowPaymentPopup(false)
 
-        // 2️⃣ 카드 상태 즉시 반영
-        if (paymentResult === "SUCCESS") {
-          setPlateCard(prev =>
-            prev ? { ...prev, paymentStatus: "PAID" } : prev
-          )
-        }
-
-        // 3️⃣ 음성 모드 해제 (PAYMENT → NORMAL)
+        // 4️⃣ 서버 음성 모드 복구
         wsRef.current?.send(JSON.stringify({
           type: "voice_mode",
           value: "NORMAL",
         }))
 
-        // 4️⃣ 결제 결과를 WS로 전달 (TTS는 서버에서)
+        // 5️⃣ 서버에 결제 결과 전달 (TTS 처리용)
         wsRef.current?.send(JSON.stringify({
           type: "payment_result",
-          value: paymentResult, // "SUCCESS" | "FAIL"
+          value: paymentResult,
         }))
 
-        // 5️⃣ 마이크 & 음성 상담 재개
+        // 6️⃣ 음성 입력 재개
         setVoiceLocked(false)
         unmuteMicHard()
-      }, 500)
+      }, 300)
 
     } catch (e) {
       console.error("[PAYMENT ERROR]", e)
@@ -324,13 +340,38 @@ export default function Home() {
       setVoiceLocked(false)
       unmuteMicHard()
 
-      // 서버 TTS 못 갔을 때 fallback
       setBubbleText("결제 처리 중 오류가 발생했어요.")
       startVoice()
     } finally {
       setPaymentSubmitting(false)
     }
   }
+
+    /* ===============================
+     🔥 결제 팝업 ↔ 음성 세션 동기화
+     - 팝업 열림: 서버 무음 타이머 정지
+     - 팝업 닫힘: 음성 정상 복구
+  =============================== */
+  useEffect(() => {
+    const ws = wsRef.current
+    if (!ws || ws.readyState !== WebSocket.OPEN) return
+
+    if (showPaymentPopup) {
+      // 🔥 여기서는 "서버만" 막는다
+      muteMicHard()
+
+      ws.send(JSON.stringify({
+        type: "voice_mode",
+        value: "PAYMENT",
+      }))
+    } else {
+      ws.send(JSON.stringify({
+        type: "voice_mode",
+        value: "NORMAL",
+      }))
+      unmuteMicHard()
+    }
+  }, [showPaymentPopup])
 
   /* ===============================
      UI
@@ -393,7 +434,9 @@ export default function Home() {
                     </p>
                     <p className="font-semibold">
                       결제{" "}
-                      {plateCard.paymentStatus === "FREE" ? "완료" : "미결제"}
+                      {plateCard.paymentStatus === "PAID" || plateCard.paymentStatus === "FREE"
+                        ? "완료"
+                        : "미결제"}
                     </p>
                   </div>
                 )}
@@ -495,7 +538,7 @@ export default function Home() {
           결제 팝업 (🔥 생략 없음)
       =============================== */}
       {showPaymentPopup && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm">
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
           <div className="bg-white rounded-2xl px-10 py-8 shadow-2xl w-[420px]">
             <p className="text-xl font-semibold text-center">💳 결제 처리</p>
 
@@ -574,20 +617,24 @@ export default function Home() {
                   : "결제에 실패했습니다. 다시 시도해 주세요."}
               </div>
             )}
-
-            <div className="mt-6 flex justify-between">
+            <div className="mt-6 flex justify-end gap-3">
               <button
                 onClick={() => setShowPaymentPopup(false)}
-                className="px-4 py-2 rounded-full border"
+                className="px-5 py-2 rounded-full border border-neutral-300 text-neutral-600 hover:bg-neutral-100"
               >
                 취소
               </button>
+
               <button
                 onClick={confirmPayment}
-                disabled={!paymentResult || (paymentResult === "FAIL" && !paymentReason)}
+                disabled={
+                  paymentSubmitting ||
+                  !paymentResult ||
+                  (paymentResult === "FAIL" && !paymentReason)
+                }
                 className="px-4 py-2 rounded-full bg-emerald-600 text-white disabled:opacity-40"
               >
-                확인
+                {paymentSubmitting ? "처리 중..." : "확인"}
               </button>
             </div>
           </div>

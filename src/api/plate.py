@@ -80,19 +80,17 @@ def extract_plate(image: np.ndarray):
 
 
 # =========================
-# 입출차 + 만차 처리
+# 입출차 + 만차 처리 (🔥 FINAL)
 # =========================
 def resolve_direction_and_process(
     plate: str,
     image_url: str,
     parking_lot_id: str,
 ):
-    now = datetime.utcnow()
-
     conn = get_conn()
     cur = conn.cursor(cursor_factory=RealDictCursor)
 
-    # 🔒 주차장 row lock (동시 입차 방지)
+    # 🔒 주차장 row lock
     cur.execute(
         """
         SELECT capacity
@@ -148,7 +146,6 @@ def resolve_direction_and_process(
     # ENTRY
     # =========================
     if not session:
-        # 현재 주차 중 대수
         cur.execute(
             """
             SELECT COUNT(*) AS occupied
@@ -160,7 +157,6 @@ def resolve_direction_and_process(
         )
         occupied = cur.fetchone()["occupied"]
 
-        # 🚫 만차
         if occupied >= capacity:
             conn.rollback()
             conn.close()
@@ -173,7 +169,6 @@ def resolve_direction_and_process(
                 },
             }
 
-        # 입차 처리
         cur.execute(
             """
             INSERT INTO parking_session (
@@ -185,12 +180,11 @@ def resolve_direction_and_process(
                 created_at
             )
             VALUES (%s, %s, now(), 'PARKED', %s, now())
-            RETURNING id, entry_time
+            RETURNING id
             """,
             (vehicle_id, parking_lot_id, image_url),
         )
-        new_session = cur.fetchone()
-        session_id = new_session["id"]
+        session_id = cur.fetchone()["id"]
 
         payment_status = "FREE" if vehicle_type != "NORMAL" else "UNPAID"
 
@@ -218,16 +212,13 @@ def resolve_direction_and_process(
                 "vehicle_type": vehicle_type,
                 "vehicle_type_label": VEHICLE_TYPE_LABEL.get(vehicle_type),
                 "entry_image_url": image_url,
-            },
-            "parking_lot": {
-                "occupied": occupied + 1,
-                "capacity": capacity,
+                "payment_status": payment_status,
             },
             "payment_status": payment_status,
         }
 
     # =========================
-    # EXIT
+    # EXIT (🔥 구조 통일)
     # =========================
     session_id = session["id"]
 
@@ -241,23 +232,27 @@ def resolve_direction_and_process(
     )
     payment_status = cur.fetchone()["payment_status"]
 
-    # 미결제 출차 차단
+    # 공통 카드 구성 (⭐ 중요)
+    card = {
+        "plate": plate,
+        "vehicle_type": vehicle_type,
+        "vehicle_type_label": VEHICLE_TYPE_LABEL.get(vehicle_type),
+        "entry_image_url": session["entry_image_url"],
+        "exit_image_url": image_url,
+        "payment_status": payment_status,
+    }
+
+    # 미결제
     if payment_status not in ("PAID", "FREE"):
         conn.close()
         return {
             "direction": "EXIT",
-            "card": {
-                "plate": plate,
-                "vehicle_type": vehicle_type,
-                "vehicle_type_label": VEHICLE_TYPE_LABEL.get(vehicle_type),
-                "entry_image_url": session["entry_image_url"],
-                "exit_image_url": image_url,
-                "payment_status": payment_status,
-            },
+            "parking_session_id": session_id,
+            "card": card,
             "payment_status": payment_status,
         }
 
-    # 출차 처리
+    # 결제 완료 → 출차 처리
     cur.execute(
         """
         UPDATE parking_session
@@ -276,6 +271,7 @@ def resolve_direction_and_process(
     return {
         "direction": "EXIT",
         "parking_session_id": session_id,
+        "card": card,              # ✅ 항상 포함
         "payment_status": payment_status,
     }
 
@@ -308,7 +304,6 @@ async def recognize_plate(image: UploadFile = File(...)):
             "confidence": confidence,
         }
 
-    # 🔧 현재는 주차장 1개 고정 (실제 UUID 사용)
     parking_lot_id = "33e088ea-66d8-4ef9-aa0b-dd533cdb885b"
 
     result = resolve_direction_and_process(

@@ -138,7 +138,7 @@ async def voice_session_ws(websocket: WebSocket):
 
                         if direction == "ENTRY_DENIED" and reason == "FULL":
                             text = (
-                                "현재 주차장이 만차입니다. "
+                                "현재 주차장이 만차입니다.\n"
                                 "근처 주차장을 찾을 수 없습니다."
                             )
 
@@ -151,13 +151,22 @@ async def voice_session_ws(websocket: WebSocket):
                             continue
 
                         if direction == "ENTRY":
-                            text = "입차가 정상적으로 등록되었습니다."
-
+                            text = (
+                                "입차가 정상적으로 등록되었습니다.\n"
+                                "문제가 있으면 말씀해주세요."
+                            )
+                            
                         elif direction == "EXIT":
                             if exit_context == "UNPAID":
-                                text = "미결제 상태입니다. 결제 후 출차가 가능합니다."
+                                text = (
+                                "미결제 상태입니다\n. 결제 후 출차가 가능합니다.\n"
+                                "혹시 문제가 있으신가요?"
+                            )
                             else:
-                                text = "출차를 진행합니다."
+                                text = (
+                                "출차를 진행합니다.\n"
+                                "문제가 있으면 말씀해주세요."
+                                )
 
                         await safe_send(websocket, {
                             "type": "assistant_message",
@@ -172,7 +181,7 @@ async def voice_session_ws(websocket: WebSocket):
                         if result == "SUCCESS":
                             # ✅ 성공 → 시스템 플로우
                             exit_context = "NONE"
-                            text = "결제가 완료되었습니다. 출차를 진행하세요."
+                            text = "결제가 완료되었습니다\n. 출차를 진행하세요."
 
                             last_activity_ts = time.time()
                             io_state = "SPEAKING"
@@ -191,7 +200,7 @@ async def voice_session_ws(websocket: WebSocket):
                             # ❌ 실패 → 상담 플로우
                             text = (
                                 "결제에 실패했습니다.\n"
-                                "불편하신 점을 말씀해 주세요."
+                                "혹시 문제가 있으신가요?"
                             )
 
                             last_activity_ts = time.time()

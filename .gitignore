@@ -53,3 +53,14 @@ Thumbs.db
 # RAG cache
 src/manuals/.rag_cache.json
 
+
+.env
+# local debug
+src/api/stt_debug.py
+
+# runtime artifacts
+static/tts/
+static/**/*.mp3
+tmp/
+*.log
+

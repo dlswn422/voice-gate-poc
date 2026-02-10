@@ -23,25 +23,27 @@ router = APIRouter()
 # --------------------------------------------------
 # ▶ 무음 판단 RMS 기준
 # --------------------------------------------------
-SILENCE_RMS_THRESHOLD = 0.0045
+SILENCE_RMS_THRESHOLD = 0.0030
 
 # --------------------------------------------------
 # ▶ 발화 종료 판단 침묵 시간 (초)
 # --------------------------------------------------
-END_SILENCE_SEC = 0.25
+END_SILENCE_SEC = 0.55
 
 # --------------------------------------------------
 # ▶ 발화 중 잠깐 멈췄을 때 STT pre-run 시작 시점
+# (현재 로직에서는 적극 사용 안 함: 유지)
 # --------------------------------------------------
 PRERUN_SILENCE_SEC = 0.3
 
 # --------------------------------------------------
 # ▶ 최소 음성 길이 (초)
 # --------------------------------------------------
-MIN_AUDIO_SEC = 0.5
+MIN_AUDIO_SEC = 0.35
 
 # --------------------------------------------------
 # ▶ STT pre-run 시 뒤쪽 잡음 컷 길이
+# (현재 로직에서는 적극 사용 안 함: 유지)
 # --------------------------------------------------
 CUT_AUDIO_SEC = 0.2
 
@@ -56,34 +58,40 @@ MIN_SPEECH_FRAMES = 2
 # --------------------------------------------------
 # ▶ TTS 종료 직후 입력 무시 시간
 # --------------------------------------------------
-IGNORE_INPUT_AFTER_TTS_SEC = 0.2
+IGNORE_INPUT_AFTER_TTS_SEC = 0.1
 
 # --------------------------------------------------
 # ▶ 최대 발화 허용 시간
 # --------------------------------------------------
-MAX_SPEECH_SEC = 4.0
+MAX_SPEECH_SEC = 6.0
 
-# ▶ 발화 종료 직후 짧은 무시 구간
+# ▶ 발화 종료 직후 짧은 무시 구간 (현재 미사용: 유지)
 POST_SPEECH_IGNORE_SEC = 0.25
 
 # --------------------------------------------------
 # ▶ 무음 정책 (세션 자동 종료)
 # --------------------------------------------------
-NO_INPUT_WARN_SEC = 5.0
-NO_INPUT_END_SEC = 9.0
+NO_INPUT_WARN_SEC = 12.0
+NO_INPUT_END_SEC = 25.0
 
 
 # ==================================================
-# 🔒 WebSocket 안전 유틸
+# 🔒 WebSocket 안전 유틸 (중복 close/send 방지)
 # ==================================================
 async def safe_send(ws: WebSocket, payload: dict):
-    if ws.application_state == WebSocketState.CONNECTED:
-        await ws.send_json(payload)
+    try:
+        if ws.client_state == WebSocketState.CONNECTED:
+            await ws.send_json(payload)
+    except Exception:
+        pass
 
 
 async def safe_close(ws: WebSocket):
-    if ws.application_state == WebSocketState.CONNECTED:
-        await ws.close()
+    try:
+        if ws.client_state == WebSocketState.CONNECTED:
+            await ws.close()
+    except Exception:
+        pass
 
 
 # ==================================================
@@ -117,7 +125,7 @@ async def voice_ws(websocket: WebSocket):
     io_state = "LISTENING"
 
     # ==================================================
-    # 🔑 NEW ▶ 음성 동작 모드 (핵심)
+    # 🔑 음성 동작 모드
     # ==================================================
     # NORMAL        : 일반 대화
     # PAYMENT       : 결제 팝업 중 (음성 완전 무시)
@@ -125,7 +133,7 @@ async def voice_ws(websocket: WebSocket):
     voice_mode = "NORMAL"
 
     # ▶ 출차 컨텍스트
-    exit_context = "NONE"          # NONE | UNPAID | PAID
+    exit_context = "NONE"  # NONE | UNPAID | PAID
 
     pcm_buffer: list[np.ndarray] = []
     collecting = False
@@ -140,9 +148,6 @@ async def voice_ws(websocket: WebSocket):
     last_activity_ts = time.time()
     no_input_warned = False
 
-    # --------------------------------------------------
-    # ▶ 의미 없는 발화 연속 카운트
-    # --------------------------------------------------
     meaningless_count = 0
     MAX_MEANINGLESS_COUNT = 3
 
@@ -155,6 +160,11 @@ async def voice_ws(websocket: WebSocket):
             # ==================================================
             if voice_mode == "POST_PAYMENT":
                 message = await websocket.receive()
+
+                # ✅ disconnect 처리 (중요)
+                if message.get("type") == "websocket.disconnect":
+                    print("[WS] 🔌 disconnect received (POST_PAYMENT)")
+                    break
 
                 # 프론트 제어 메시지만 수신
                 if "text" in message:
@@ -196,7 +206,15 @@ async def voice_ws(websocket: WebSocket):
                         "end_session": False,
                     })
 
+            # ==================================================
+            # 📩 수신
+            # ==================================================
             message = await websocket.receive()
+
+            # ✅ disconnect 처리 (중요)
+            if message.get("type") == "websocket.disconnect":
+                print("[WS] 🔌 disconnect received")
+                break
 
             # --------------------------------------------------
             # 🔁 프론트 → 제어 메시지
@@ -225,7 +243,10 @@ async def voice_ws(websocket: WebSocket):
                         prerun_task = None
                         speech_frame_count = 0
                         ignore_until_ts = time.time() + IGNORE_INPUT_AFTER_TTS_SEC
+
+                        # 활동 갱신 (TTS 종료도 세션 활동으로 간주)
                         last_activity_ts = time.time()
+                        no_input_warned = False
 
                         await safe_send(websocket, {
                             "type": "assistant_state",
@@ -272,6 +293,10 @@ async def voice_ws(websocket: WebSocket):
                     speech_frame_count = 0
                     speech_start_ts = now
                     last_non_silence_ts = now
+
+                    # ✅ 발화 시작도 활동으로 간주 (idle 끊김 방지)
+                    last_activity_ts = time.time()
+                    no_input_warned = False
                 continue
 
             # --------------------------------------------------
@@ -294,7 +319,10 @@ async def voice_ws(websocket: WebSocket):
                 if total_samples / SAMPLE_RATE < MIN_AUDIO_SEC:
                     pcm_buffer.clear()
                     prerun_task = None
+
+                    # ✅ 사용자가 말은 했으니 활동 갱신
                     last_activity_ts = time.time()
+                    no_input_warned = False
                     continue
 
                 io_state = "THINKING"
@@ -303,23 +331,34 @@ async def voice_ws(websocket: WebSocket):
                     "state": "THINKING",
                 })
 
+                # ✅ 말한 직후 활동 갱신 (idle 끊김 방지)
+                last_activity_ts = time.time()
+                no_input_warned = False
+
+                # --------------------------------------------------
+                # 🧠 STT (PERF 로그)
+                # --------------------------------------------------
+                t0 = time.time()
                 text = transcribe_pcm_chunks(
                     pcm_buffer,
                     whisper_model=app_state.whisper_model,
                 )
+                stt_dt = time.time() - t0
                 pcm_buffer.clear()
+                print(f"[PERF] STT took {stt_dt:.2f}s, text='{text}'")
 
                 if not is_meaningful_text(text):
                     io_state = "LISTENING"
                     continue
 
-                last_activity_ts = time.time()
-
                 # --------------------------------------------------
-                # 🧠 AppEngine
+                # 🧠 AppEngine (PERF 로그)
                 # --------------------------------------------------
+                t1 = time.time()
                 result = app_state.app_engine.handle_text(text)
+                engine_dt = time.time() - t1
                 intent = result.get("intent")
+                print(f"[PERF] ENGINE took {engine_dt:.2f}s, intent={intent}")
 
                 # ▶ 출차 미결제 방어
                 if exit_context == "UNPAID" and intent == "EXIT":

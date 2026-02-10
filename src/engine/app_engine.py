@@ -1,6 +1,4 @@
 from src.nlu.intent_embedding import detect_intent_embedding
-# from src.nlu.llm_client import detect_intent_llm  # 필요 시 사용
-
 from src.nlu.intent_schema import Intent
 from src.engine.intent_logger import log_intent, log_dialog
 from src.nlu.dialog_llm_client import dialog_llm_chat
@@ -8,7 +6,7 @@ from src.nlu.dialog_llm_client import dialog_llm_chat
 import uuid
 import time
 import re
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 
 # ==================================================
@@ -18,27 +16,6 @@ SITE_ID = "parkassist_local"
 
 DONE_COOLDOWN_SEC = 1.2
 SECOND_STAGE_HARD_TURN_LIMIT = 6
-
-
-# ==================================================
-# 1차 확정 시 원턴 응답
-# ==================================================
-DEFAULT_ONE_TURN_REPLY = "현재 어떤 문의가 있으신가요?"
-
-ONE_TURN_RESPONSES = {
-    Intent.EXIT:
-        "입·출차 과정에서 문제가 있는 것 같아요.\n어떤 상황인지 조금 더 말씀해 주세요.",
-    Intent.ENTRY:
-        "입차 중 차량 인식이나 차단기 쪽에 문제가 있어 보입니다.\n현재 상황을 알려주세요.",
-    Intent.PAYMENT:
-        "주차 요금 결제와 관련된 문제로 보입니다.\n불편한 점을 말씀해 주세요.",
-    Intent.REGISTRATION:
-        "차량이나 방문자 등록 과정에서 문제가 발생한 것 같아요.\n어디에서 막혔는지 알려주세요.",
-    Intent.TIME_PRICE:
-        "주차 시간이나 요금 확인이 필요해 보입니다.\n궁금한 점을 말씀해 주세요.",
-    Intent.FACILITY:
-        "주차장 기기나 차단기에 이상이 있는 것 같아요.\n현재 상태를 설명해 주세요.",
-}
 
 
 # ==================================================
@@ -84,34 +61,24 @@ def _is_done_utterance(text: str) -> bool:
 
 
 def _is_call_admin_utterance(text: str) -> bool:
-    """
-    STT 특성상 문장이 깨져도
-    '관리실', '직원', '사람', '불러' 류가 섞이면 바로 인터럽트
-    """
     t = _normalize(text)
     return any(_normalize(k) in t for k in CALL_ADMIN_KEYWORDS)
 
 
-# ==================================================
-# AppEngine
-# ==================================================
 class AppEngine:
     """
-    AppEngine (FINAL)
+    AppEngine (REFINED)
 
-    ✔ 전역 인터럽트 (관리실 호출)
-    ✔ 1차 Intent → 원턴 응답
-    ✔ 원턴 시 키워드 UI 노출(one_turn)
-    ✔ 키워드 클릭 = 일반 발화와 동일 처리
-    ✔ 이후 무조건 SECOND_STAGE
+    ✔ 전역 인터럽트(관리실 호출)
+    ✔ 1차 의도 분류 -> 곧바로 dialog_llm_client로 메뉴얼 기반 응답
+    ✔ 질문 생성 없음 (LLM이 질문하지 않음)
+    ✔ PAYMENT일 때 DB(payment/payment_log) 조회 결과를 context로 전달
+    ✔ LPR일 때 direction(ENTRY/EXIT) context로 전달하여 메뉴얼 후보 제한
     """
 
     def __init__(self):
         self._reset_all()
 
-    # --------------------------------------------------
-    # 내부 상태 초기화
-    # --------------------------------------------------
     def _reset_all(self):
         self.session_id = None
         self.state = "FIRST_STAGE"   # FIRST_STAGE | SECOND_STAGE
@@ -122,22 +89,17 @@ class AppEngine:
         self.dialog_history = []
 
         self._ignore_until_ts = 0.0
-        self._just_one_turn = False
 
         self.second_turn_count_user = 0
-        self.second_slots = {}
+        self.second_slots = {}              # dialog_llm_client: slots["symptom"] 사용
         self.second_pending_slot = None
 
-    # --------------------------------------------------
-    # 세션 관리
-    # --------------------------------------------------
     def _start_new_session(self):
         self.session_id = str(uuid.uuid4())
         self.state = "FIRST_STAGE"
         self.dialog_turn_index = 0
         self.dialog_history = []
 
-        self._just_one_turn = False
         self.second_turn_count_user = 0
         self.second_slots = {}
         self.second_pending_slot = None
@@ -149,9 +111,6 @@ class AppEngine:
         self._reset_all()
         self._ignore_until_ts = time.time() + DONE_COOLDOWN_SEC
 
-    # --------------------------------------------------
-    # 로그
-    # --------------------------------------------------
     def _log_dialog(self, role, content, model="system"):
         self.dialog_turn_index += 1
         log_dialog(
@@ -164,21 +123,14 @@ class AppEngine:
         )
 
         if role in ("user", "assistant"):
-            self.dialog_history.append({
-                "role": role,
-                "content": content,
-            })
+            self.dialog_history.append({"role": role, "content": content})
 
-    # --------------------------------------------------
-    # 응답 포맷 (UI 연동 포함)
-    # --------------------------------------------------
     def _make_response(
         self,
         text: str,
         *,
         conversation_state: str,
         end_session: bool = False,
-        one_turn: bool = False,
         intent: str | None = None,
         system_action: str | None = None,
     ):
@@ -188,20 +140,14 @@ class AppEngine:
             "conversation_state": conversation_state,
             "end_session": end_session,
             "session_id": self.session_id,
-            "one_turn": one_turn,
             "intent": intent,
             "system_action": system_action,
         }
 
-
-    # --------------------------------------------------
-    # 관리실 호출 처리
-    # --------------------------------------------------
     def _handle_call_admin(self, text: str):
         self._log_dialog("user", text)
         reply = "관리실에 연락했습니다.\n잠시만 기다려 주세요."
         self._log_dialog("assistant", reply)
-
         self._end_session("call_admin")
 
         return self._make_response(
@@ -211,22 +157,115 @@ class AppEngine:
             system_action="CALL_ADMIN",
         )
 
-    # --------------------------------------------------
-    # SECOND_STAGE 처리
-    # --------------------------------------------------
-    def _handle_second_stage(self, text: str) -> Dict[str, Any]:
-        if _is_done_utterance(text):
-            self._log_dialog("user", text)
-            self._log_dialog("assistant", FAREWELL_TEXT)
-            self._end_session("user_done")
+    # ==================================================
+    # ✅ PAYMENT DB 조회 (payment/payment_log)
+    # ==================================================
+    def _fetch_payment_ctx(self) -> Optional[Dict[str, Any]]:
+        """
+        returns:
+          {
+            "parking_session_id": str,
+            "payment_id": str|None,
+            "payment_status": str|None,   # PAID/UNPAID/FREE ...
+            "has_attempt": bool,
+            "log_result": str|None,       # 0/1/2/3... 또는 SUCCESS/FAIL...
+            "log_reason": str|None,       # 한도초과/잔액부족...
+          }
+        """
+        try:
+            from src import app_state
+            from src.db.postgres import get_conn
+        except Exception as e:
+            print(f"[ENGINE][PAYMENT_CTX] import failed: {e}")
+            return None
 
-            return self._make_response(
-                FAREWELL_TEXT,
-                conversation_state="ENDED",
-                end_session=True,
+        psid = getattr(app_state, "current_parking_session_id", None)
+        if not psid:
+            return None
+
+        ctx: Dict[str, Any] = {
+            "parking_session_id": str(psid),
+            "payment_id": None,
+            "payment_status": None,
+            "has_attempt": False,
+            "log_result": None,
+            "log_reason": None,
+        }
+
+        conn = None
+        try:
+            conn = get_conn()
+            cur = conn.cursor()
+
+            # payment 1개 조회(최신 1개)
+            cur.execute(
+                """
+                SELECT id, payment_status
+                FROM payment
+                WHERE parking_session_id = %s
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (psid,),
             )
+            pay = cur.fetchone()
+            if not pay:
+                return ctx
 
-        self._log_dialog("user", text)
+            payment_id = pay["id"]
+            ctx["payment_id"] = str(payment_id)
+            ctx["payment_status"] = pay.get("payment_status")
+
+            # payment_log 최신 1개
+            # (스키마에 따라 컬럼명이 다를 수 있어 가장 보편적으로 사용)
+            cur.execute(
+                """
+                SELECT result, reason
+                FROM payment_log
+                WHERE payment_id = %s
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (payment_id,),
+            )
+            log = cur.fetchone()
+            if log:
+                ctx["has_attempt"] = True
+                ctx["log_result"] = log.get("result")
+                ctx["log_reason"] = log.get("reason")
+
+            return ctx
+
+        except Exception as e:
+            print(f"[ENGINE][PAYMENT_CTX] query failed: {e}")
+            return ctx
+        finally:
+            try:
+                if conn:
+                    conn.close()
+            except Exception:
+                pass
+
+    def _get_direction_ctx(self) -> Optional[str]:
+        try:
+            from src import app_state
+            d = getattr(app_state, "current_direction", None)
+            if d:
+                return str(d).upper()
+        except Exception:
+            pass
+        return None
+
+    # ==================================================
+    # dialog_llm_client 호출 공통
+    # ==================================================
+    def _run_dialog(self, text: str) -> Dict[str, Any]:
+        direction = self._get_direction_ctx()
+
+        payment_ctx = None
+        # intent는 FIRST_STAGE에서 세팅되고 SECOND에서도 고정
+        if (self.first_intent or "").upper() == "PAYMENT":
+            payment_ctx = self._fetch_payment_ctx()
 
         res = dialog_llm_chat(
             text,
@@ -238,6 +277,9 @@ class AppEngine:
                 "hard_turn_limit": SECOND_STAGE_HARD_TURN_LIMIT,
                 "slots": self.second_slots,
                 "pending_slot": self.second_pending_slot,
+                # ✅ 추가 컨텍스트
+                "direction": direction,
+                "payment_ctx": payment_ctx,
             },
             debug=True,
         )
@@ -246,31 +288,29 @@ class AppEngine:
         self._log_dialog("assistant", reply, model="llama-3.1-8b")
 
         self.second_turn_count_user += 1
-        self.second_slots = getattr(res, "slots", self.second_slots)
+        self.second_slots = getattr(res, "slots", self.second_slots) or self.second_slots
         self.second_pending_slot = getattr(res, "pending_slot", None)
 
-        if getattr(res, "action", "") in ("DONE", "ESCALATE_DONE"):
+        action = getattr(res, "action", "SOLVE")
+        if action in ("DONE", "ESCALATE_DONE"):
             self._end_session("llm_done")
             return self._make_response(
                 reply,
                 conversation_state="ENDED",
                 end_session=True,
+                intent=self.first_intent,
             )
 
         return self._make_response(
             reply,
             conversation_state="WAITING_USER",
+            end_session=False,
+            intent=self.first_intent,
         )
 
-    # --------------------------------------------------
-    # 메인 엔트리
-    # --------------------------------------------------
     def handle_text(self, text: Any) -> Dict[str, Any]:
         now = time.time()
 
-        # ==================================================
-        # UI 키워드 입력 처리
-        # ==================================================
         if isinstance(text, dict) and text.get("type") == "ui_keyword":
             text = text.get("text", "")
 
@@ -281,30 +321,26 @@ class AppEngine:
             )
 
         if now < self._ignore_until_ts:
-            return self._make_response(
-                "",
-                conversation_state="WAITING_USER",
-            )
+            return self._make_response("", conversation_state="WAITING_USER")
 
         if not self.session_id:
             self._start_new_session()
 
-        # ==================================================
-        # 🚨 전역 인터럽트: 관리실 호출
-        # ==================================================
         if _is_call_admin_utterance(text):
             return self._handle_call_admin(text)
 
-        # ==================================================
-        # 원턴 이후 → SECOND_STAGE
-        # ==================================================
-        if self._just_one_turn:
-            self.state = "SECOND_STAGE"
-            self._just_one_turn = False
-            return self._handle_second_stage(text)
+        if _is_done_utterance(text):
+            self._log_dialog("user", text)
+            self._log_dialog("assistant", FAREWELL_TEXT)
+            self._end_session("user_done")
+            return self._make_response(
+                FAREWELL_TEXT,
+                conversation_state="ENDED",
+                end_session=True,
+            )
 
         # ==================================================
-        # FIRST_STAGE
+        # FIRST_STAGE: 의도 분류 후 즉시 dialog 실행
         # ==================================================
         if self.state == "FIRST_STAGE":
             result = detect_intent_embedding(text)
@@ -320,39 +356,24 @@ class AppEngine:
             self.first_intent = result.intent.value
             self._log_dialog("user", text)
 
-            # --------------------------------------------------
-            # NONE → 원턴 + 키워드
-            # --------------------------------------------------
-            if result.intent == Intent.NONE:
-                self._log_dialog("assistant", NONE_RETRY_TEXT)
-                self._just_one_turn = True
+            # ✅ Intent.NONE Enum이 없을 수 있으니 문자열도 허용
+            intent_value = (result.intent.value or "").upper()
+            none_enum = getattr(Intent, "NONE", None)
+            is_none = (none_enum is not None and result.intent == none_enum) or (intent_value == "NONE")
 
+            if is_none:
+                self._log_dialog("assistant", NONE_RETRY_TEXT)
                 return self._make_response(
                     NONE_RETRY_TEXT,
                     conversation_state="WAITING_USER",
-                    one_turn=True,
-                    intent=Intent.NONE.value,
+                    end_session=False,
+                    intent="NONE",
                 )
 
-            # --------------------------------------------------
-            # 확정 Intent → 원턴 응답
-            # --------------------------------------------------
-            reply = ONE_TURN_RESPONSES.get(
-                result.intent,
-                "현재 어떤 문제가 발생했나요?"
-            )
-
-            self._log_dialog("assistant", reply)
-            self._just_one_turn = True
-
-            return self._make_response(
-                reply,
-                conversation_state="WAITING_USER",
-                one_turn=True,
-                intent=self.first_intent,
-            )
+            self.state = "SECOND_STAGE"
+            return self._run_dialog(text)
 
         # ==================================================
         # SECOND_STAGE
         # ==================================================
-        return self._handle_second_stage(text)
+        return self._run_dialog(text)

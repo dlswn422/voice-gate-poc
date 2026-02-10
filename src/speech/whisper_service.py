@@ -110,7 +110,7 @@ def transcribe_pcm_chunks(
             # beam_size > 1 이면 정확도는
             # 약간 오르지만 CPU 속도 급락
             # ----------------------------
-            beam_size=1,
+            beam_size=3,
             best_of=1,
 
             # ----------------------------

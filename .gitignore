@@ -1,0 +1,17 @@
+# ===== Python venv =====
+speech_to_text_demo/Lib/
+speech_to_text_demo/Scripts/
+speech_to_text_demo/pyvenv.cfg
+
+# 일반적인 venv 이름
+.venv/
+venv/
+env/
+
+# ===== Python cache =====
+__pycache__/
+*.pyc
+
+# ===== secrets =====
+.env
+speech_demo.json

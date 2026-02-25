@@ -23,6 +23,13 @@ export function useVoiceWs() {
   const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
 
+  // ✅ TTS 재생 중 마이크 프레임 전송 차단(안정적으로 TTS 들리게)
+  const captureMutedRef = useRef<boolean>(false);
+
+  // ✅ Barge-in(끼어들기) 감지용(로컬 마이크 RMS)
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const rafIdRef = useRef<number | null>(null);
+
   // ✅ 현재 재생 오디오 추적
   const playingAudioRef = useRef<HTMLAudioElement | null>(null);
   const playingUrlRef = useRef<string | null>(null);
@@ -50,6 +57,16 @@ export function useVoiceWs() {
   }, []);
 
   const cleanupAudioCapture = useCallback(async () => {
+    // ✅ barge-in 모니터 중단
+    try {
+      if (rafIdRef.current != null) cancelAnimationFrame(rafIdRef.current);
+    } catch {}
+    rafIdRef.current = null;
+
+    try {
+      analyserRef.current?.disconnect();
+    } catch {}
+    analyserRef.current = null;
     try {
       workletNodeRef.current?.disconnect();
     } catch {}
@@ -73,6 +90,7 @@ export function useVoiceWs() {
     try {
       // ✅ 재생 중단
       stopPlayback();
+      captureMutedRef.current = false;
 
       // audio capture stop
       await cleanupAudioCapture();
@@ -143,6 +161,62 @@ export function useVoiceWs() {
 
         const source = audioCtx.createMediaStreamSource(stream);
         sourceRef.current = source;
+// ✅ 로컬 barge-in 감지(마이크 레벨)용 analyser
+const analyser = audioCtx.createAnalyser();
+analyser.fftSize = 2048;
+analyserRef.current = analyser;
+try {
+  source.connect(analyser);
+} catch {}
+
+// ✅ barge-in 모니터 시작 (TTS 재생 중 사용자가 말하면 즉시 끊고 전송 재개)
+const buf = new Float32Array(analyser.fftSize);
+const BAR_GE_IN_RMS = 0.03; // 환경에 따라 조절
+const HOLD_FRAMES = 3;
+let hit = 0;
+
+const tick = () => {
+  try {
+    analyser.getFloatTimeDomainData(buf);
+    let sum = 0;
+    for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
+    const rms = Math.sqrt(sum / buf.length);
+
+    const audio = playingAudioRef.current;
+    const isTtsPlaying = !!audio && !audio.paused;
+
+    // TTS 재생 중 + 입력 차단 상태에서만 끼어들기 감지
+    if (isTtsPlaying && captureMutedRef.current) {
+      if (rms > BAR_GE_IN_RMS) hit++;
+      else hit = 0;
+
+      if (hit >= HOLD_FRAMES) {
+        hit = 0;
+
+        // ✅ 1) TTS 즉시 끊기
+        stopPlayback();
+
+        // ✅ 2) 입력 차단 해제(사용자 발화를 서버로 전송)
+        captureMutedRef.current = false;
+
+        // ✅ 3) 서버에도 현재 턴 중단 요청(LLM/TTS task 취소)
+        try {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: "barge_in" }));
+          }
+        } catch {}
+      }
+    } else {
+      hit = 0;
+    }
+  } catch {
+    // ignore
+  }
+  rafIdRef.current = requestAnimationFrame(tick);
+};
+
+rafIdRef.current = requestAnimationFrame(tick);
+
 
         const node = new AudioWorkletNode(audioCtx, "pcm16-processor");
         workletNodeRef.current = node;
@@ -150,6 +224,10 @@ export function useVoiceWs() {
         node.port.onmessage = (e: MessageEvent) => {
           const data = e.data;
           if (!(data instanceof ArrayBuffer)) return;
+
+          // ✅ TTS 재생 중에는 마이크 프레임 전송 차단
+          if (captureMutedRef.current) return;
+
           if (ws.readyState === WebSocket.OPEN) {
             try {
               ws.send(data);
@@ -193,8 +271,9 @@ export function useVoiceWs() {
         }
 
         if (msg.type === "partial") {
-          // ✅ 사용자가 말 시작(부분인식) -> 즉시 재생 중단
+          // ✅ 사용자가 말 시작(부분인식) -> 즉시 재생 중단 + 입력 허용
           stopPlayback();
+          captureMutedRef.current = false;
           setPartial(msg.text || "");
           return;
         }
@@ -248,6 +327,9 @@ export function useVoiceWs() {
             // ✅ 새 오디오가 오면 이전 재생 무조건 중단 후 재생
             stopPlayback();
 
+            // ✅ TTS 재생 중에는 입력 차단(스피커->마이크 루프 방지)
+            captureMutedRef.current = true;
+
             const blob = new Blob([wavBytes], { type: "audio/wav" });
             const url = URL.createObjectURL(blob);
             playingUrlRef.current = url;
@@ -257,6 +339,8 @@ export function useVoiceWs() {
 
             audio.play().catch(() => {});
             audio.onended = () => {
+              // ✅ TTS 종료 -> 입력 허용
+              captureMutedRef.current = false;
               // 끝났는데 이미 다른 url로 교체됐을 수도 있으니 체크
               if (playingUrlRef.current === url) {
                 try {
@@ -279,6 +363,9 @@ export function useVoiceWs() {
         // -----------------------
         stopPlayback();
 
+        // ✅ TTS 재생 중에는 입력 차단
+        captureMutedRef.current = true;
+
         const blob = new Blob([buf], { type: "audio/wav" });
         const url = URL.createObjectURL(blob);
         playingUrlRef.current = url;
@@ -288,6 +375,8 @@ export function useVoiceWs() {
 
         audio.play().catch(() => {});
         audio.onended = () => {
+          // ✅ TTS 종료 -> 입력 허용
+          captureMutedRef.current = false;
           if (playingUrlRef.current === url) {
             try {
               URL.revokeObjectURL(url);

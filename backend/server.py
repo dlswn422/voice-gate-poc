@@ -105,7 +105,9 @@ async def ws_voice(ws: WebSocket):
     current_task: asyncio.Task | None = None
     task_lock = asyncio.Lock()       # task 교체/취소 동기화
 
-    async def bump_playback_and_stop():
+    last_bump_ts = 0.0             # stopPlayback 폭주 방지(초)
+
+    async def bump_playback_and_stop(force: bool = False):
         """
         새 발화/새 답변이 시작되면:
         1) playback_id 증가
@@ -113,6 +115,13 @@ async def ws_voice(ws: WebSocket):
         3) 이전 답변 task가 있으면 취소
         """
         nonlocal playback_id, current_task
+
+        # 부분인식이 연속으로 들어오면 stopPlayback이 폭주할 수 있어 디바운스
+        nonlocal last_bump_ts
+        now = loop.time()
+        if (not force) and (now - last_bump_ts < 0.4):
+            return playback_id
+        last_bump_ts = now
 
         async with task_lock:
             playback_id += 1
@@ -214,6 +223,12 @@ async def ws_voice(ws: WebSocket):
                     ctrl = json.loads(msg["text"])
                     if ctrl.get("type") == "stop":
                         break
+
+
+                    if ctrl.get("type") == "barge_in":
+                        # 프론트가 '끼어들기' 감지 -> 현재 턴 즉시 중단
+                        await bump_playback_and_stop(force=True)
+                        continue
                 except Exception:
                     pass
 

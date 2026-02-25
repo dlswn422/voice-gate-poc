@@ -5,7 +5,11 @@ import MicCards from "./MicCards"
 
 type Status = "OFF" | "LISTENING" | "THINKING" | "SPEAKING"
 
-const WS_URL = process.env.NEXT_PUBLIC_WS_URL!
+// ===============================
+// WS URL (Production은 env 필수)
+// ===============================
+const ENV_WS = process.env.NEXT_PUBLIC_BACKEND_WS?.trim()
+const WS_URL = ENV_WS || "ws://localhost:8000/ws/voice"
 
 // ===============================
 // Audio helpers (Float32 48k -> PCM16 16k)
@@ -58,7 +62,13 @@ export default function Home() {
   const audioCtxRef = useRef<AudioContext | null>(null)
   const processorRef = useRef<ScriptProcessorNode | null>(null)
 
-  const isWsOpen = useMemo(() => wsRef.current?.readyState === WebSocket.OPEN, [isRunning])
+  // (참고) useMemo에 ref.current 넣어봤자 렌더 트리거가 아니라 의미가 약함.
+  // 그래도 디버깅 용도로 남겨둠.
+  const isWsOpen = useMemo(
+    () => wsRef.current?.readyState === WebSocket.OPEN,
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [isRunning]
+  )
 
   // WAV 재생용(서버가 send_bytes로 보냄)
   const playWavBytes = async (wavBytes: ArrayBuffer) => {
@@ -70,7 +80,6 @@ export default function Home() {
       await audio.play()
       audio.onended = () => {
         URL.revokeObjectURL(url)
-        // 말 끝나면 다시 듣는 상태로
         if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
           setStatus("LISTENING")
         } else {
@@ -78,7 +87,6 @@ export default function Home() {
         }
       }
     } catch {
-      // 재생 실패 시에도 상태 복구
       if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) setStatus("LISTENING")
       else setStatus("OFF")
     }
@@ -97,9 +105,12 @@ export default function Home() {
       }
     } catch {}
 
-    // close ws
+    // close ws (OPEN/CONNECTING에서만)
     try {
-      wsRef.current?.close()
+      const ws = wsRef.current
+      if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+        ws.close()
+      }
     } catch {}
     wsRef.current = null
 
@@ -109,7 +120,7 @@ export default function Home() {
     } catch {}
     mediaStreamRef.current = null
 
-    // close audio context
+    // close audio graph
     try {
       processorRef.current?.disconnect()
     } catch {}
@@ -122,8 +133,14 @@ export default function Home() {
   }
 
   const startAll = async () => {
+    // ✅ env가 없으면 바로 티나게 (배포에서 특히 중요)
+    if (!ENV_WS && typeof window !== "undefined" && window.location.protocol === "https:") {
+      console.error("❌ NEXT_PUBLIC_BACKEND_WS is missing on HTTPS (production).")
+    }
+
     // 1) WS 연결
     const ws = new WebSocket(WS_URL)
+    wsRef.current = ws // ✅ 아주 중요: onopen 전에 ref 먼저 세팅 (audio loop에서 ref 참조함)
     ws.binaryType = "arraybuffer"
 
     ws.onopen = async () => {
@@ -142,7 +159,7 @@ export default function Home() {
         mediaStreamRef.current = stream
 
         const AudioCtx = window.AudioContext || (window as any).webkitAudioContext
-        const audioCtx = new AudioCtx()
+        const audioCtx: AudioContext = new AudioCtx()
         audioCtxRef.current = audioCtx
 
         const source = audioCtx.createMediaStreamSource(stream)
@@ -155,7 +172,6 @@ export default function Home() {
           const sock = wsRef.current
           if (!sock || sock.readyState !== WebSocket.OPEN) return
 
-          // 브라우저 입력은 보통 48k float32
           const input = e.inputBuffer.getChannelData(0)
           const inRate = e.inputBuffer.sampleRate
           const down = downsampleBuffer(input, inRate, 16000)
@@ -186,7 +202,6 @@ export default function Home() {
           }
           if (msg.type === "bot_text") {
             setBotText(msg.text ?? "")
-            // bot_text가 오면 곧바로 wav bytes가 올 수도 있고, 안 올 수도 있음
           }
         } catch {
           // ignore
@@ -212,11 +227,8 @@ export default function Home() {
     }
 
     ws.onclose = async () => {
-      // 사용자가 stop 누른 경우도 여기로 옴
       await stopAll()
     }
-
-    wsRef.current = ws
   }
 
   const onToggle = async () => {
@@ -224,7 +236,7 @@ export default function Home() {
       await stopAll()
       return
     }
-    // 시작
+
     setPartialText("")
     setFinalText("")
     setBotText("")
@@ -261,24 +273,31 @@ export default function Home() {
             <div className="mt-4 space-y-3 text-sm">
               <div className="flex gap-3">
                 <div className="w-24 shrink-0 text-neutral-500">PARTIAL</div>
-                <div className="text-neutral-800">{partialText || <span className="text-neutral-400">-</span>}</div>
+                <div className="text-neutral-800">
+                  {partialText || <span className="text-neutral-400">-</span>}
+                </div>
               </div>
 
               <div className="flex gap-3">
                 <div className="w-24 shrink-0 text-neutral-500">FINAL</div>
-                <div className="text-neutral-800">{finalText || <span className="text-neutral-400">-</span>}</div>
+                <div className="text-neutral-800">
+                  {finalText || <span className="text-neutral-400">-</span>}
+                </div>
               </div>
 
               <div className="flex gap-3">
                 <div className="w-24 shrink-0 text-neutral-500">BOT</div>
-                <div className="text-neutral-800">{botText || <span className="text-neutral-400">-</span>}</div>
+                <div className="text-neutral-800">
+                  {botText || <span className="text-neutral-400">-</span>}
+                </div>
               </div>
 
               <div className="pt-2 text-xs text-neutral-400">
                 WS: {WS_URL} · 연결상태:{" "}
                 {wsRef.current
                   ? ["CONNECTING", "OPEN", "CLOSING", "CLOSED"][wsRef.current.readyState] ?? "UNKNOWN"
-                  : "NONE"}
+                  : "NONE"}{" "}
+                {isWsOpen ? "(open)" : ""}
               </div>
             </div>
           </div>

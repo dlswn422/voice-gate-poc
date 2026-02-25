@@ -33,11 +33,22 @@ export function useVoiceWs() {
   // ✅ 현재 재생 오디오 추적
   const playingAudioRef = useRef<HTMLAudioElement | null>(null);
   const playingUrlRef = useRef<string | null>(null);
+  const bufferSourceRef = useRef<AudioBufferSourceNode | null>(null);
 
   // ✅ “최신 답변 세대(playback_id)” 추적: 이 값과 pid가 같을 때만 재생
   const currentPidRef = useRef<number>(0);
 
   const stopPlayback = useCallback(() => {
+    // ✅ WebAudio 재생 중단
+    const bs = bufferSourceRef.current;
+    if (bs) {
+      try {
+        bs.stop();
+      } catch {}
+    }
+    bufferSourceRef.current = null;
+
+    // ✅ HTMLAudio 재생 중단(구버전 fallback)
     const audio = playingAudioRef.current;
     if (audio) {
       try {
@@ -54,7 +65,7 @@ export function useVoiceWs() {
       } catch {}
     }
     playingUrlRef.current = null;
-  }, []);
+  }, []);;
 
   const cleanupAudioCapture = useCallback(async () => {
     // ✅ barge-in 모니터 중단
@@ -156,6 +167,8 @@ export function useVoiceWs() {
         // iOS/Safari 호환: sampleRate 등은 브라우저가 결정
         const audioCtx = new AudioContext();
         audioCtxRef.current = audioCtx;
+        // ✅ 사용자 클릭 직후 오디오 재생 가능하도록 unlock
+        try { await audioCtx.resume(); } catch {}
 
         await audioCtx.audioWorklet.addModule("/worklets/pcm16-processor.js");
 
@@ -330,6 +343,30 @@ rafIdRef.current = requestAnimationFrame(tick);
             // ✅ TTS 재생 중에는 입력 차단(스피커->마이크 루프 방지)
             captureMutedRef.current = true;
 
+            // ✅ WebAudio로 재생(브라우저 정책/코덱 이슈에 더 안정적)
+            const audioCtx = audioCtxRef.current;
+            if (audioCtx) {
+              try {
+                const decoded = await audioCtx.decodeAudioData(wavBytes.slice(0));
+                const src = audioCtx.createBufferSource();
+                src.buffer = decoded;
+                src.connect(audioCtx.destination);
+                bufferSourceRef.current = src;
+
+                src.onended = () => {
+                  // ✅ TTS 종료 -> 입력 허용
+                  captureMutedRef.current = false;
+                  if (bufferSourceRef.current === src) bufferSourceRef.current = null;
+                };
+
+                src.start(0);
+                return;
+              } catch (e) {
+                console.warn("WebAudio decode/play failed, fallback to HTMLAudio:", e);
+              }
+            }
+
+            // (fallback) HTMLAudio
             const blob = new Blob([wavBytes], { type: "audio/wav" });
             const url = URL.createObjectURL(blob);
             playingUrlRef.current = url;
@@ -337,11 +374,10 @@ rafIdRef.current = requestAnimationFrame(tick);
             const audio = new Audio(url);
             playingAudioRef.current = audio;
 
-            audio.play().catch(() => {});
+            audio.play().catch((e) => console.warn("audio.play blocked/failed:", e));
             audio.onended = () => {
               // ✅ TTS 종료 -> 입력 허용
               captureMutedRef.current = false;
-              // 끝났는데 이미 다른 url로 교체됐을 수도 있으니 체크
               if (playingUrlRef.current === url) {
                 try {
                   URL.revokeObjectURL(url);
@@ -366,6 +402,27 @@ rafIdRef.current = requestAnimationFrame(tick);
         // ✅ TTS 재생 중에는 입력 차단
         captureMutedRef.current = true;
 
+        const audioCtx = audioCtxRef.current;
+        if (audioCtx) {
+          try {
+            const decoded = await audioCtx.decodeAudioData(buf.slice(0));
+            const src = audioCtx.createBufferSource();
+            src.buffer = decoded;
+            src.connect(audioCtx.destination);
+            bufferSourceRef.current = src;
+
+            src.onended = () => {
+              captureMutedRef.current = false;
+              if (bufferSourceRef.current === src) bufferSourceRef.current = null;
+            };
+
+            src.start(0);
+            return;
+          } catch (e) {
+            console.warn("WebAudio decode/play failed (fallback), using HTMLAudio:", e);
+          }
+        }
+
         const blob = new Blob([buf], { type: "audio/wav" });
         const url = URL.createObjectURL(blob);
         playingUrlRef.current = url;
@@ -373,9 +430,8 @@ rafIdRef.current = requestAnimationFrame(tick);
         const audio = new Audio(url);
         playingAudioRef.current = audio;
 
-        audio.play().catch(() => {});
+        audio.play().catch((e) => console.warn("audio.play blocked/failed:", e));
         audio.onended = () => {
-          // ✅ TTS 종료 -> 입력 허용
           captureMutedRef.current = false;
           if (playingUrlRef.current === url) {
             try {
@@ -388,8 +444,7 @@ rafIdRef.current = requestAnimationFrame(tick);
               URL.revokeObjectURL(url);
             } catch {}
           }
-        };
-      }
+        };      }
     };
 
     ws.onerror = () => {

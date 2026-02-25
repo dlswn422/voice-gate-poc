@@ -8,8 +8,8 @@ type ServerMsg =
   | { type: "partial"; text?: string }
   | { type: "final"; text?: string }
   | { type: "bot_text"; text?: string }
-  | { type: "barge_in" }
-  | { type: "error"; message?: string };
+  | { type: "error"; message?: string }
+  | { type: "barge_in" }; // (서버에서 보내면 잡음)
 
 export function useVoiceWs() {
   const [status, setStatus] = useState<WsStatus>("OFF");
@@ -23,34 +23,32 @@ export function useVoiceWs() {
   const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
 
-  // ✅ 현재 재생 중인 TTS를 단 하나로 관리
-  const currentAudioRef = useRef<HTMLAudioElement | null>(null);
-  const currentAudioUrlRef = useRef<string | null>(null);
+  // ✅ 오디오 1개만 유지 + URL도 추적해서 정리
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const audioUrlRef = useRef<string | null>(null);
 
-  const stopTtsNow = useCallback(() => {
-    const a = currentAudioRef.current;
+  const stopAudio = useCallback(() => {
+    const a = audioRef.current;
     if (a) {
       try {
         a.pause();
         a.currentTime = 0;
         a.src = "";
+        a.load();
       } catch {}
     }
-    currentAudioRef.current = null;
-
-    const url = currentAudioUrlRef.current;
-    if (url) {
+    if (audioUrlRef.current) {
       try {
-        URL.revokeObjectURL(url);
+        URL.revokeObjectURL(audioUrlRef.current);
       } catch {}
+      audioUrlRef.current = null;
     }
-    currentAudioUrlRef.current = null;
   }, []);
 
   const stop = useCallback(async () => {
     try {
-      // ✅ TTS 강제 중단
-      stopTtsNow();
+      // ✅ 현재 재생 중인 TTS도 즉시 중단
+      stopAudio();
 
       // audio stop
       workletNodeRef.current?.disconnect();
@@ -73,18 +71,14 @@ export function useVoiceWs() {
       setStatus("OFF");
       setPartial("");
     }
-  }, [stopTtsNow]);
+  }, [stopAudio]);
 
   const start = useCallback(async () => {
     if (status !== "OFF") return;
     setStatus("CONNECTING");
 
-    const wsUrl = process.env.NEXT_PUBLIC_BACKEND_WS?.trim();
-    if (!wsUrl) {
-      console.error("❌ NEXT_PUBLIC_BACKEND_WS is undefined");
-      setStatus("OFF");
-      return;
-    }
+    const wsUrl = process.env.NEXT_PUBLIC_BACKEND_WS?.trim() || "ws://localhost:8000/ws/voice";
+    console.log("WS URL:", wsUrl);
 
     const ws = new WebSocket(wsUrl);
     ws.binaryType = "arraybuffer";
@@ -134,45 +128,57 @@ export function useVoiceWs() {
         }
         if (!msg) return;
 
-        if (msg.type === "barge_in") {
-          // ✅ 끼어들기: 재생 중 TTS 즉시 중단
-          stopTtsNow();
-          return;
+        if (msg.type === "partial") {
+          // ✅ 사용자가 말하기 시작하면 기존 TTS 즉시 중단 (겹침 방지 핵심)
+          stopAudio();
+          setPartial(msg.text || "");
         }
 
-        if (msg.type === "partial") setPartial(msg.text || "");
         if (msg.type === "final") {
           setFinalText(msg.text || "");
           setPartial("");
         }
-        if (msg.type === "bot_text") setBotText(msg.text || "");
+
+        if (msg.type === "bot_text") {
+          setBotText(msg.text || "");
+        }
+
+        if (msg.type === "error") {
+          console.error(msg.message);
+        }
+
+        if (msg.type === "barge_in") {
+          // 서버가 barge-in을 보내면 이것도 즉시 stop
+          stopAudio();
+        }
+
         return;
       }
 
       // binary 오디오 (WAV bytes)
       if (evt.data instanceof ArrayBuffer) {
-        // ✅ 새 TTS 오면 기존 TTS는 무조건 끊고 재생(겹침 방지)
-        stopTtsNow();
+        // ✅ 새 TTS가 오면 이전 TTS 즉시 중단 (겹침 방지 핵심)
+        stopAudio();
+
+        if (!audioRef.current) audioRef.current = new Audio();
 
         const blob = new Blob([evt.data], { type: "audio/wav" });
         const url = URL.createObjectURL(blob);
-        currentAudioUrlRef.current = url;
+        audioUrlRef.current = url;
 
-        const audio = new Audio(url);
-        currentAudioRef.current = audio;
+        const a = audioRef.current;
+        a.src = url;
 
-        audio.onended = () => {
-          // 끝나면 URL 정리
-          if (currentAudioUrlRef.current === url) {
-            try { URL.revokeObjectURL(url); } catch {}
-            currentAudioUrlRef.current = null;
-          }
-          if (currentAudioRef.current === audio) {
-            currentAudioRef.current = null;
+        a.onended = () => {
+          if (audioUrlRef.current === url) {
+            try {
+              URL.revokeObjectURL(url);
+            } catch {}
+            audioUrlRef.current = null;
           }
         };
 
-        audio.play().catch(() => {});
+        a.play().catch(() => {});
       }
     };
 
@@ -183,7 +189,7 @@ export function useVoiceWs() {
     ws.onclose = () => {
       setStatus("OFF");
     };
-  }, [status, stop, stopTtsNow]);
+  }, [status, stop, stopAudio]);
 
   return { status, partial, finalText, botText, start, stop };
 }

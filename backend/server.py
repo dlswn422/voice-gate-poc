@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import json
 import asyncio
-import uuid
+import struct
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 import azure.cognitiveservices.speech as speechsdk
@@ -13,6 +13,10 @@ load_dotenv()
 
 app = FastAPI()
 
+# ----------------------------
+# NOTE: 멀티 유저 허용(단일세션 락 없음)
+# 세션은 "웹소켓 연결 1개 = 1세션"으로 격리됨
+# ----------------------------
 
 def make_aoai_client() -> AzureOpenAI:
     endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "").strip().rstrip("/")
@@ -43,7 +47,7 @@ SYSTEM_PROMPT = (
 )
 
 
-def llm_reply_sync(user_text: str) -> str:
+def llm_reply(user_text: str) -> str:
     resp = AOAI.chat.completions.create(
         model=DEPLOYMENT,
         messages=[
@@ -56,7 +60,7 @@ def llm_reply_sync(user_text: str) -> str:
     return (resp.choices[0].message.content or "").strip()
 
 
-def synth_wav_sync(text: str) -> bytes:
+def synth_wav(text: str) -> bytes:
     speech_config = speechsdk.SpeechConfig(subscription=SPEECH_KEY, region=SPEECH_REGION)
     speech_config.speech_synthesis_voice_name = SPEECH_VOICE
     speech_config.set_speech_synthesis_output_format(
@@ -69,54 +73,75 @@ def synth_wav_sync(text: str) -> bytes:
     return r.audio_data  # WAV bytes
 
 
+def pack_wav_frame(playback_id: int, wav_bytes: bytes) -> bytes:
+    """
+    WS 바이너리 프레임:
+      [0:4]  b'WAV0'
+      [4:8]  uint32 playback_id (little-endian)
+      [8:]   wav bytes
+    """
+    return b"WAV0" + struct.pack("<I", playback_id) + wav_bytes
+
+
 @app.websocket("/ws/voice")
 async def ws_voice(ws: WebSocket):
-    # ✅ 멀티 세션 허용 (락 제거)
     await ws.accept()
 
-    # 세션 ID(디버깅용)
-    session_id = uuid.uuid4().hex[:8]
-
-    # --- STT 세션별 객체 생성 (절대 전역 공유 금지) ---
-    stream_format = speechsdk.audio.AudioStreamFormat(
-        samples_per_second=16000, bits_per_sample=16, channels=1
-    )
+    # --- Azure Speech (STT) 준비 ---
+    stream_format = speechsdk.audio.AudioStreamFormat(samples_per_second=16000, bits_per_sample=16, channels=1)
     push_stream = speechsdk.audio.PushAudioInputStream(stream_format)
     audio_config = speechsdk.audio.AudioConfig(stream=push_stream)
 
     speech_config = speechsdk.SpeechConfig(subscription=SPEECH_KEY, region=SPEECH_REGION)
     speech_config.speech_recognition_language = SPEECH_LANG
+
     recognizer = speechsdk.SpeechRecognizer(speech_config=speech_config, audio_config=audio_config)
 
     loop = asyncio.get_running_loop()
     final_queue: asyncio.Queue[str] = asyncio.Queue()
 
-    # 한 WS 세션 안에서 턴 처리(LLM+TTS)는 직렬화
-    turn_lock = asyncio.Lock()
+    # --- 끼어들기/겹침 방지 상태 ---
+    playback_id = 0                  # 답변 "세대" 번호
+    current_task: asyncio.Task | None = None
+    task_lock = asyncio.Lock()       # task 교체/취소 동기화
 
-    # TTS “재생 세대” 관리: 새로운 답변이 시작되면 playback_id 증가
-    playback_id = 0
+    async def bump_playback_and_stop():
+        """
+        새 발화/새 답변이 시작되면:
+        1) playback_id 증가
+        2) 프론트에 stopPlayback 통지
+        3) 이전 답변 task가 있으면 취소
+        """
+        nonlocal playback_id, current_task
 
-    def safe_create_task(coro):
-        try:
-            asyncio.create_task(coro)
-        except RuntimeError:
-            # loop closed 등
-            pass
+        async with task_lock:
+            playback_id += 1
+            try:
+                await ws.send_text(json.dumps({"type": "stopPlayback", "playback_id": playback_id}))
+            except Exception:
+                pass
 
-    # 이벤트 핸들러(스레드 콜백 가능 → thread-safe로 loop에 올림)
+            if current_task and not current_task.done():
+                current_task.cancel()
+            current_task = None
+
+        return playback_id
+
+    # recognizing(부분인식) 들어오면: "사용자가 말하기 시작" => 즉시 stopPlayback
     def on_recognizing(evt):
         text = (evt.result.text or "").strip()
         if not text:
             return
 
         async def _send_partial():
+            # 사용자가 말 시작하면 즉시 끼어들기 처리
+            await bump_playback_and_stop()
             try:
-                await ws.send_text(json.dumps({"type": "partial", "text": text, "sid": session_id}))
+                await ws.send_text(json.dumps({"type": "partial", "text": text}))
             except Exception:
                 pass
 
-        loop.call_soon_threadsafe(lambda: safe_create_task(_send_partial()))
+        loop.call_soon_threadsafe(lambda: asyncio.create_task(_send_partial()))
 
     def on_recognized(evt):
         if evt.result.reason != speechsdk.ResultReason.RecognizedSpeech:
@@ -131,60 +156,52 @@ async def ws_voice(ws: WebSocket):
 
     recognizer.start_continuous_recognition()
 
+    async def handle_turn(text: str, my_id: int):
+        """
+        한 턴(LLM -> TTS -> send audio)
+        my_id == 현재 playback_id일 때만 '의미 있는' 오디오로 취급됨.
+        프론트도 playback_id로 필터링하므로, 늦게 도착해도 재생 안됨.
+        """
+        try:
+            await ws.send_text(json.dumps({"type": "final", "text": text, "playback_id": my_id}))
+
+            # LLM (blocking) -> 필요하면 asyncio.to_thread로 빼도 됨
+            bot = await asyncio.to_thread(llm_reply, text)
+            if not bot:
+                bot = "죄송합니다. 다시 한 번 말씀해 주세요."
+
+            await ws.send_text(json.dumps({"type": "bot_text", "text": bot, "playback_id": my_id}))
+
+            wav = await asyncio.to_thread(synth_wav, bot)
+            if not wav:
+                return
+
+            frame = pack_wav_frame(my_id, wav)
+            await ws.send_bytes(frame)
+
+        except asyncio.CancelledError:
+            # 새 발화가 들어와서 이전 턴이 취소된 경우
+            return
+        except Exception as e:
+            try:
+                await ws.send_text(json.dumps({"type": "error", "message": str(e)}))
+            except Exception:
+                pass
+
     async def final_consumer():
-        nonlocal playback_id
+        nonlocal current_task
         while True:
             text = await final_queue.get()
 
-            async with turn_lock:
-                # 너무 짧은 잡음 컷
-                if len(text) <= 1:
-                    continue
+            # 너무 짧은 잡음 컷(선택)
+            if len(text) <= 1:
+                continue
 
-                # FINAL 텍스트
-                try:
-                    await ws.send_text(json.dumps({"type": "final", "text": text, "sid": session_id}))
-                except Exception:
-                    return
+            # 새 답변 시작 => 이전 task 취소 + playback_id 증가
+            my_id = await bump_playback_and_stop()
 
-                # ✅ 새 답변 시작: playback_id 증가 + 프론트에 stopPlayback 신호
-                playback_id += 1
-                current_pid = playback_id
-                try:
-                    await ws.send_text(json.dumps({"type": "stopPlayback", "playback_id": current_pid, "sid": session_id}))
-                except Exception:
-                    return
-
-                # LLM (블로킹 → 스레드로)
-                try:
-                    bot = await asyncio.to_thread(llm_reply_sync, text)
-                except Exception:
-                    bot = ""
-
-                if not bot:
-                    bot = "죄송합니다. 다시 한 번 말씀해 주세요."
-
-                # bot 텍스트
-                try:
-                    await ws.send_text(json.dumps({"type": "bot_text", "text": bot, "playback_id": current_pid, "sid": session_id}))
-                except Exception:
-                    return
-
-                # TTS (블로킹 → 스레드로)
-                try:
-                    wav = await asyncio.to_thread(synth_wav_sync, bot)
-                except Exception:
-                    wav = b""
-
-                # ✅ 혹시 다음 턴이 먼저 시작됐으면(끼어들기) 이 wav는 버림
-                if current_pid != playback_id:
-                    continue
-
-                if wav:
-                    try:
-                        await ws.send_bytes(wav)
-                    except Exception:
-                        return
+            async with task_lock:
+                current_task = asyncio.create_task(handle_turn(text, my_id))
 
     consumer_task = asyncio.create_task(final_consumer())
 
@@ -192,7 +209,6 @@ async def ws_voice(ws: WebSocket):
         while True:
             msg = await ws.receive()
 
-            # control message
             if "text" in msg and msg["text"]:
                 try:
                     ctrl = json.loads(msg["text"])
@@ -201,7 +217,6 @@ async def ws_voice(ws: WebSocket):
                 except Exception:
                     pass
 
-            # audio chunk
             if "bytes" in msg and msg["bytes"]:
                 push_stream.write(msg["bytes"])
 
@@ -212,16 +227,17 @@ async def ws_voice(ws: WebSocket):
             push_stream.close()
         except Exception:
             pass
-
         try:
             recognizer.stop_continuous_recognition()
         except Exception:
             pass
-
         try:
             consumer_task.cancel()
         except Exception:
             pass
+        async with task_lock:
+            if current_task and not current_task.done():
+                current_task.cancel()
 
 
 @app.get("/health")

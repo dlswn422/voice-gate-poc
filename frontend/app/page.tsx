@@ -280,7 +280,7 @@ export default function Home() {
           <GuideCards />
 
           <p className="mt-8 text-center text-xs text-neutral-400">
-            * 버튼을 누르면 브라우저 마이크를 캡처해 WebSocket으로 백엔드에 전송합니다.
+            
           </p>
         </section>
       </div>

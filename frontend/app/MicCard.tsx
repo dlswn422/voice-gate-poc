@@ -57,25 +57,36 @@ export default function MicCards({ isRunning, status, onToggle }: Props) {
               {statusLabel}
             </div>
 
-            <button
-              type="button"
-              className="size-8 rounded-full border border-neutral-200 bg-white/70 text-neutral-500 hover:text-neutral-800 hover:bg-white transition grid place-items-center"
-              title="소음이 있으면 가까이 말씀해 주세요. 짧게 핵심만 말하면 더 빠르게 안내됩니다."
-              aria-label="도움말"
-            >
-              i
-            </button>
+                    <button
+            type="button"
+            className={[
+              "size-8 rounded-full border transition-colors duration-200 grid place-items-center",
+              isRunning
+                ? "border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100"
+                : "border-neutral-200 bg-white/70 text-neutral-500 hover:text-neutral-800 hover:bg-white",
+            ].join(" ")}
+            title="소음이 있으면 가까이 말씀해 주세요. 짧게 핵심만 말하면 더 빠르게 안내됩니다."
+            aria-label="도움말"
+          >
+            i
+          </button>
           </div>
         </div>
 
         <button
           onClick={onToggle}
           className={[
-            "mt-6 w-full rounded-2xl py-6 flex items-center justify-center gap-3 transition shadow-lg",
-            isRunning
-              ? "bg-emerald-600 text-white hover:bg-emerald-500"
-              : "bg-neutral-900 text-white hover:bg-neutral-800",
-          ].join(" ")}
+          "mt-6 w-full rounded-2xl py-6 flex items-center justify-center gap-3",
+          "transition-all duration-200 ease-out",
+          "cursor-pointer select-none",
+          "shadow-lg hover:shadow-xl active:shadow-md",
+            "hover:-translate-y-[2px] hover:scale-[1.01]",
+            "active:translate-y-[1px] active:scale-[0.99]",
+
+          isRunning
+            ? "bg-emerald-600 text-white hover:bg-emerald-500 active:bg-emerald-700"
+            : "bg-neutral-900 text-white hover:bg-neutral-800 active:bg-neutral-950",
+        ].join(" ")}
         >
           <MicIcon />
           <span className="text-base font-semibold">{isRunning ? "중지" : "마이크 시작"}</span>

@@ -5,10 +5,11 @@ import { useCallback, useRef, useState } from "react";
 type WsStatus = "OFF" | "CONNECTING" | "RUNNING";
 
 type ServerMsg =
-  | { type: "partial"; text?: string }
-  | { type: "final"; text?: string }
-  | { type: "bot_text"; text?: string }
-  | { type: "barge_in" } // ✅ 추가
+  | { type: "partial"; text?: string; playback_id?: number }
+  | { type: "final"; text?: string; playback_id?: number }
+  | { type: "bot_text"; text?: string; playback_id?: number }
+  | { type: "stopPlayback"; playback_id?: number } // ✅ server.py에서 오는 타입
+  | { type: "barge_in" } // ✅ 구버전 호환
   | { type: "error"; message?: string };
 
 export function useVoiceWs() {
@@ -48,7 +49,6 @@ export function useVoiceWs() {
 
   const stop = useCallback(async () => {
     try {
-      // ✅ 재생 중단
       stopPlayback();
 
       // audio capture stop
@@ -91,7 +91,8 @@ export function useVoiceWs() {
     if (status !== "OFF") return;
     setStatus("CONNECTING");
 
-    const wsUrl = process.env.NEXT_PUBLIC_BACKEND_WS?.trim() || "ws://localhost:8000/ws/voice";
+    const wsUrl =
+      process.env.NEXT_PUBLIC_BACKEND_WS?.trim() || "ws://localhost:8000/ws/voice";
     console.log("WS URL:", wsUrl);
 
     const ws = new WebSocket(wsUrl);
@@ -111,7 +112,8 @@ export function useVoiceWs() {
         });
         streamRef.current = stream;
 
-        const audioCtx = new AudioContext();
+        // ✅ sampleRate 힌트(브라우저는 무시할 수도 있지만 시도)
+        const audioCtx = new AudioContext({ sampleRate: 16000 });
         audioCtxRef.current = audioCtx;
 
         await audioCtx.audioWorklet.addModule("/worklets/pcm16-processor.js");
@@ -149,13 +151,13 @@ export function useVoiceWs() {
         }
         if (!msg) return;
 
-        // ✅ 끼어들기 신호 오면 즉시 재생 중단
-        if (msg.type === "barge_in") {
+        // ✅ 서버가 "새 답변 시작"을 알리면 즉시 기존 재생 중단
+        if (msg.type === "stopPlayback" || msg.type === "barge_in") {
           stopPlayback();
           return;
         }
 
-        // ✅ 사용자가 말하는 partial이 오면(=말 시작) 재생 중단
+        // ✅ 사용자가 말하기 시작하면(Partial) 재생 중단 (바지인)
         if (msg.type === "partial") {
           stopPlayback();
           setPartial(msg.text || "");
@@ -163,7 +165,6 @@ export function useVoiceWs() {
         }
 
         if (msg.type === "final") {
-          // final이 오면 partial 지우기
           setFinalText(msg.text || "");
           setPartial("");
           return;
@@ -197,6 +198,7 @@ export function useVoiceWs() {
 
         audio.play().catch(() => {});
         audio.onended = () => {
+          // 현재 재생 중인 url이 이 url이면 정리
           if (playingUrlRef.current === url) {
             try {
               URL.revokeObjectURL(url);
@@ -204,7 +206,7 @@ export function useVoiceWs() {
             playingUrlRef.current = null;
             playingAudioRef.current = null;
           } else {
-            // 이미 다른 오디오로 교체됐으면 그냥 정리만
+            // 이미 다른 오디오로 교체됐으면 이것만 정리
             try {
               URL.revokeObjectURL(url);
             } catch {}

@@ -1,7 +1,9 @@
 "use client"
 
 import { useEffect, useMemo, useRef, useState } from "react"
-import MicCards from "./MicCards"
+import MicCards from "./MicCard"
+import RealtimeLogCard from "./RealtimeLogCard"
+import GuideCards from "./GuideCards"
 
 type Status = "OFF" | "LISTENING" | "THINKING" | "SPEAKING"
 
@@ -261,96 +263,27 @@ export default function Home() {
           </p>
         </header>
 
-        <section className="mt-24 flex flex-col items-center">
+        <section className="mt-14 flex flex-col items-center">
           <div className="w-full">
             <MicCards isRunning={isRunning} status={status} onToggle={onToggle} />
           </div>
 
-          {/* ✅ STT/LLM 상태 표시(연결 확인용) */}
-          <div className="mt-8 w-full rounded-2xl border border-white/60 bg-white/70 p-6 shadow-sm backdrop-blur">
-            <div className="text-sm font-semibold text-neutral-900">실시간 로그</div>
+          <RealtimeLogCard
+            partialText={partialText}
+            finalText={finalText}
+            botText={botText}
+            wsUrl={WS_URL}
+            wsRef={wsRef}
+            isWsOpen={isWsOpen}
+          />
 
-            <div className="mt-4 space-y-3 text-sm">
-              <div className="flex gap-3">
-                <div className="w-24 shrink-0 text-neutral-500">PARTIAL</div>
-                <div className="text-neutral-800">
-                  {partialText || <span className="text-neutral-400">-</span>}
-                </div>
-              </div>
+          <GuideCards />
 
-              <div className="flex gap-3">
-                <div className="w-24 shrink-0 text-neutral-500">FINAL</div>
-                <div className="text-neutral-800">
-                  {finalText || <span className="text-neutral-400">-</span>}
-                </div>
-              </div>
-
-              <div className="flex gap-3">
-                <div className="w-24 shrink-0 text-neutral-500">BOT</div>
-                <div className="text-neutral-800">
-                  {botText || <span className="text-neutral-400">-</span>}
-                </div>
-              </div>
-
-              <div className="pt-2 text-xs text-neutral-400">
-                WS: {WS_URL} · 연결상태:{" "}
-                {wsRef.current
-                  ? ["CONNECTING", "OPEN", "CLOSING", "CLOSED"][wsRef.current.readyState] ?? "UNKNOWN"
-                  : "NONE"}{" "}
-                {isWsOpen ? "(open)" : ""}
-              </div>
-            </div>
-          </div>
-
-          <div className="mt-20 w-full grid grid-cols-1 gap-8 sm:grid-cols-3">
-            <GuideChip title="사용 방법" items={["마이크 시작 누르기", "문의하기", "안내 듣기"]} icon="🧭" />
-            <GuideChip title="지원 항목" items={["요금/정산", "출차/입차", "등록/오류 안내"]} icon="🧩" />
-            <GuideChip
-              title="안내"
-              items={[
-                "음성 인식 후 자동으로 안내 시작",
-                "결제 오류 시 사유 안내 가능",
-                "필요 시 직원 호출이 가능",
-              ]}
-              icon="ℹ️"
-            />
-          </div>
-
-          <p className="mt-12 text-center text-xs text-neutral-400">
+          <p className="mt-8 text-center text-xs text-neutral-400">
             * 버튼을 누르면 브라우저 마이크를 캡처해 WebSocket으로 백엔드에 전송합니다.
           </p>
         </section>
       </div>
     </main>
-  )
-}
-
-function GuideChip({
-  title,
-  items,
-  icon,
-}: {
-  title: string
-  items: string[]
-  icon: string
-}) {
-  return (
-    <div className="min-h-[180px] rounded-2xl border border-white/60 bg-white/70 p-7 shadow-sm backdrop-blur">
-      <div className="flex items-center gap-3">
-        <span className="text-xl" aria-hidden="true">
-          {icon}
-        </span>
-        <div className="text-base font-semibold text-neutral-900">{title}</div>
-      </div>
-
-      <ul className="mt-5 space-y-3 text-sm text-neutral-600">
-        {items.map((t) => (
-          <li key={t} className="flex items-start gap-3">
-            <span className="mt-[7px] inline-block size-2 rounded-full bg-neutral-300" />
-            <span>{t}</span>
-          </li>
-        ))}
-      </ul>
-    </div>
   )
 }

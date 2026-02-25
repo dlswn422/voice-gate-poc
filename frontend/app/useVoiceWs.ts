@@ -51,8 +51,18 @@ export function useVoiceWs() {
     if (status !== "OFF") return;
     setStatus("CONNECTING");
 
-    const wsUrl = process.env.NEXT_PUBLIC_BACKEND_WS || "ws://localhost:8000/ws/voice";
-    const ws = new WebSocket(wsUrl);
+    // const wsUrl = process.env.NEXT_PUBLIC_BACKEND_WS || "ws://localhost:8000/ws/voice";
+    // const ws = new WebSocket(wsUrl);
+    const wsUrl = process.env.NEXT_PUBLIC_BACKEND_WS?.trim();
+
+if (!wsUrl) {
+  console.error("❌ NEXT_PUBLIC_BACKEND_WS is undefined");
+  return;
+}
+
+console.log("WS URL:", wsUrl);
+
+const ws = new WebSocket(wsUrl);
     ws.binaryType = "arraybuffer";
     wsRef.current = ws;
 

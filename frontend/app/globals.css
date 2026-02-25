@@ -1,7 +1,12 @@
 @import "tailwindcss";
 
 :root {
-  --background: radial-gradient(circle at 50% 35%, #eef6f8 0%, #dce8ed 70%, #d7e4ea 100%);
+  /* ✅ 원래 화면 느낌: 밝은 흰바탕 + 위쪽 시안 + 가장자리 은은한 그라데이션 */
+  --background:
+    radial-gradient(circle at 50% 24%, rgba(185, 235, 255, 0.35) 0%, rgba(255, 255, 255, 0) 55%),
+    radial-gradient(circle at 50% 55%, rgba(0, 0, 0, 0.035) 0%, rgba(0, 0, 0, 0) 60%),
+    linear-gradient(180deg, #f3fbff 0%, #f7fcff 35%, #ffffff 100%);
+
   --foreground: #171717;
 }
 
@@ -14,14 +19,23 @@
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --background: radial-gradient(circle at 50% 35%, #0a0a0a 0%, #111827 70%, #0b1220 100%);
+    --background:
+      radial-gradient(circle at 50% 25%, rgba(56, 189, 248, 0.18) 0%, rgba(0, 0, 0, 0) 55%),
+      linear-gradient(180deg, #0a0a0a 0%, #111827 70%, #0b1220 100%);
     --foreground: #ededed;
   }
 }
 
+html,
 body {
-  background: var(--background);
+  height: 100%;
+  background: var(--background) !important;
+}
+
+body {
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
   min-height: 100vh;
+  margin: 0;
+  overscroll-behavior: none;
 }

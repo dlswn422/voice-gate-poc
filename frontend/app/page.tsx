@@ -263,7 +263,7 @@ export default function Home() {
           </p>
         </header>
 
-        <section className="mt-14 flex flex-col items-center">
+        <section className="mt-12 flex flex-col items-center">
           <div className="w-full">
             <MicCards isRunning={isRunning} status={status} onToggle={onToggle} />
           </div>

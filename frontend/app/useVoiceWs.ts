@@ -258,7 +258,7 @@ rafIdRef.current = requestAnimationFrame(tick);
       }
     };
 
-    ws.onmessage = (evt: MessageEvent) => {
+    ws.onmessage = async (evt: MessageEvent) => {
       // -----------------------
       // 1) JSON 텍스트 메시지
       // -----------------------
@@ -347,6 +347,8 @@ rafIdRef.current = requestAnimationFrame(tick);
             const audioCtx = audioCtxRef.current;
             if (audioCtx) {
               try {
+                // ✅ 일부 브라우저에서 재생 직전 resume 필요
+                try { await audioCtx.resume(); } catch {}
                 const decoded = await audioCtx.decodeAudioData(wavBytes.slice(0));
                 const src = audioCtx.createBufferSource();
                 src.buffer = decoded;
@@ -405,6 +407,7 @@ rafIdRef.current = requestAnimationFrame(tick);
         const audioCtx = audioCtxRef.current;
         if (audioCtx) {
           try {
+            try { await audioCtx.resume(); } catch {}
             const decoded = await audioCtx.decodeAudioData(buf.slice(0));
             const src = audioCtx.createBufferSource();
             src.buffer = decoded;

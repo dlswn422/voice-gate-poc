@@ -22,9 +22,31 @@ export function useVoiceWs() {
   const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
 
+  // ✅ TTS 재생 겹침 방지용: 현재 재생 중인 오디오 1개만 유지
+  const ttsAudioRef = useRef<HTMLAudioElement | null>(null);
+  const ttsUrlRef = useRef<string | null>(null);
+
+  const stopTts = useCallback(() => {
+    try {
+      if (ttsAudioRef.current) {
+        ttsAudioRef.current.pause();
+        ttsAudioRef.current.currentTime = 0;
+      }
+    } catch {}
+    ttsAudioRef.current = null;
+
+    try {
+      if (ttsUrlRef.current) URL.revokeObjectURL(ttsUrlRef.current);
+    } catch {}
+    ttsUrlRef.current = null;
+  }, []);
+
   const stop = useCallback(async () => {
     try {
-      // audio stop
+      // ✅ TTS stop 먼저
+      stopTts();
+
+      // audio capture stop
       workletNodeRef.current?.disconnect();
       sourceRef.current?.disconnect();
       await audioCtxRef.current?.close().catch(() => {});
@@ -42,27 +64,26 @@ export function useVoiceWs() {
       workletNodeRef.current = null;
       sourceRef.current = null;
       streamRef.current = null;
+
       setStatus("OFF");
       setPartial("");
     }
-  }, []);
+  }, [stopTts]);
 
   const start = useCallback(async () => {
     if (status !== "OFF") return;
     setStatus("CONNECTING");
 
-    // const wsUrl = process.env.NEXT_PUBLIC_BACKEND_WS || "ws://localhost:8000/ws/voice";
-    // const ws = new WebSocket(wsUrl);
     const wsUrl = process.env.NEXT_PUBLIC_BACKEND_WS?.trim();
+    if (!wsUrl) {
+      console.error("❌ NEXT_PUBLIC_BACKEND_WS is undefined");
+      setStatus("OFF");
+      return;
+    }
 
-if (!wsUrl) {
-  console.error("❌ NEXT_PUBLIC_BACKEND_WS is undefined");
-  return;
-}
+    console.log("WS URL:", wsUrl);
 
-console.log("WS URL:", wsUrl);
-
-const ws = new WebSocket(wsUrl);
+    const ws = new WebSocket(wsUrl);
     ws.binaryType = "arraybuffer";
     wsRef.current = ws;
 
@@ -112,6 +133,13 @@ const ws = new WebSocket(wsUrl);
         }
         if (!msg) return;
 
+        if (msg.type === "error") {
+          // 서버가 "이미 상담 중" 같은 에러를 보내면 UI에 보여주고 종료
+          setBotText(msg.message || "서버 오류가 발생했습니다.");
+          stop();
+          return;
+        }
+
         if (msg.type === "partial") setPartial(msg.text || "");
         if (msg.type === "final") {
           setFinalText(msg.text || "");
@@ -123,11 +151,28 @@ const ws = new WebSocket(wsUrl);
 
       // binary 오디오 (WAV bytes)
       if (evt.data instanceof ArrayBuffer) {
+        // ✅ 새 TTS가 오면 기존 TTS 즉시 중단 (겹침 방지)
+        stopTts();
+
         const blob = new Blob([evt.data], { type: "audio/wav" });
         const url = URL.createObjectURL(blob);
+        ttsUrlRef.current = url;
+
         const audio = new Audio(url);
+        ttsAudioRef.current = audio;
+
         audio.play().catch(() => {});
-        audio.onended = () => URL.revokeObjectURL(url);
+        audio.onended = () => {
+          try {
+            if (ttsUrlRef.current === url) {
+              URL.revokeObjectURL(url);
+              ttsUrlRef.current = null;
+            }
+          } catch {}
+          if (ttsAudioRef.current === audio) {
+            ttsAudioRef.current = null;
+          }
+        };
       }
     };
 
@@ -138,7 +183,7 @@ const ws = new WebSocket(wsUrl);
     ws.onclose = () => {
       setStatus("OFF");
     };
-  }, [status, stop]);
+  }, [status, stop, stopTts]);
 
   return { status, partial, finalText, botText, start, stop };
 }

@@ -123,3 +123,8 @@ async def ws_voice(ws: WebSocket):
             pass
         recognizer.stop_continuous_recognition()
         consumer_task.cancel()
+        
+@app.get("/health")
+def health():
+    return {"ok": True}
+

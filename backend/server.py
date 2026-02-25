@@ -78,12 +78,13 @@ def synth_wav(text: str) -> bytes:
 
 @app.websocket("/ws/voice")
 async def ws_voice(ws: WebSocket):
-    # 1) 단일 세션만 허용: 이미 누가 쓰고 있으면 즉시 거절
+    # 1) 단일 세션만 허용
     if _ACTIVE_SESSION_LOCK.locked():
-        # accept는 해야 close/send가 안정적으로 됨
         await ws.accept()
-        await ws.send_text(json.dumps({"type": "error", "message": "이미 상담이 진행 중입니다. 잠시 후 다시 시도하세요."}))
-        await ws.close(code=1008)  # Policy Violation
+        await ws.send_text(
+            json.dumps({"type": "error", "message": "이미 상담이 진행 중입니다. 잠시 후 다시 시도하세요."})
+        )
+        await ws.close(code=1008)
         return
 
     await _ACTIVE_SESSION_LOCK.acquire()
@@ -98,31 +99,51 @@ async def ws_voice(ws: WebSocket):
 
     speech_config = speechsdk.SpeechConfig(subscription=SPEECH_KEY, region=SPEECH_REGION)
     speech_config.speech_recognition_language = SPEECH_LANG
-
     recognizer = speechsdk.SpeechRecognizer(speech_config=speech_config, audio_config=audio_config)
 
     loop = asyncio.get_running_loop()
     final_queue: asyncio.Queue[str] = asyncio.Queue()
 
-    # 2) 턴 처리(LLM+TTS)를 절대 겹치지 않게 직렬화
+    # 2) 턴 처리(LLM+TTS)를 직렬화
     turn_lock = asyncio.Lock()
+
+    # ----------------------------
+    # ✅ barge-in + 턴 무효화 가드
+    # ----------------------------
+    speech_active = False        # 사용자가 현재 말하고 있는지(Recognizing 구간)
+    active_turn_id = 0           # 현재 유효한 턴(바징인 발생 시 증가)
+
+    async def send_json(obj: dict):
+        try:
+            await ws.send_text(json.dumps(obj))
+        except Exception:
+            pass
 
     # 이벤트 핸들러(별도 스레드에서 콜백될 수 있으므로 thread-safe로 loop에 넘김)
     def on_recognizing(evt):
+        nonlocal speech_active, active_turn_id
+
         text = (evt.result.text or "").strip()
         if not text:
             return
 
-        async def _send_partial():
-            try:
-                await ws.send_text(json.dumps({"type": "partial", "text": text}))
-            except Exception:
-                # ws 끊긴 경우 무시
-                pass
+        # ✅ 사용자가 말 시작한 "첫 순간"에만 barge_in + 현재 턴 무효화
+        if not speech_active:
+            speech_active = True
+            active_turn_id += 1  # 진행 중이던 bot 응답/tts 전송을 무효화(턴 ID 증가)
 
-        loop.call_soon_threadsafe(lambda: asyncio.create_task(_send_partial()))
+            loop.call_soon_threadsafe(lambda: asyncio.create_task(send_json({"type": "barge_in"})))
+
+        # partial 전송
+        loop.call_soon_threadsafe(
+            lambda: asyncio.create_task(send_json({"type": "partial", "text": text}))
+        )
 
     def on_recognized(evt):
+        nonlocal speech_active
+        # ✅ final이 떨어지면 발화 구간 종료로 간주
+        speech_active = False
+
         if evt.result.reason != speechsdk.ResultReason.RecognizedSpeech:
             return
         text = (evt.result.text or "").strip()
@@ -132,31 +153,46 @@ async def ws_voice(ws: WebSocket):
 
     recognizer.recognizing.connect(on_recognizing)
     recognizer.recognized.connect(on_recognized)
-
     recognizer.start_continuous_recognition()
 
     async def final_consumer():
+        nonlocal active_turn_id
         while True:
             text = await final_queue.get()
 
             async with turn_lock:
+                # 턴 시작 시점의 id 스냅샷
+                my_turn_id = active_turn_id
+
                 # (선택) 너무 짧은 잡음/호흡은 컷
                 if len(text) <= 1:
                     continue
 
-                await ws.send_text(json.dumps({"type": "final", "text": text}))
+                await send_json({"type": "final", "text": text})
 
-                # LLM (블로킹 호출이지만 데모에서는 OK / 필요하면 to_thread로 분리 가능)
-                bot = llm_reply(text)
+                # ✅ LLM/TTS는 블로킹이라 to_thread로 분리(이벤트루프 끊김 방지)
+                bot = await asyncio.to_thread(llm_reply, text)
                 if not bot:
                     bot = "죄송합니다. 다시 한 번 말씀해 주세요."
 
-                await ws.send_text(json.dumps({"type": "bot_text", "text": bot}))
+                # ✅ 바징인이 발생해서 turn_id가 바뀌었으면(사용자가 끼어듦) 이 턴 결과는 버림
+                if my_turn_id != active_turn_id:
+                    continue
 
-                # TTS -> WAV bytes 전송
-                wav = synth_wav(bot)
+                await send_json({"type": "bot_text", "text": bot})
+
+                # TTS
+                wav = await asyncio.to_thread(synth_wav, bot)
+
+                # ✅ TTS 생성 중에도 바징인 발생 가능 → 다시 확인 후 전송
+                if my_turn_id != active_turn_id:
+                    continue
+
                 if wav:
-                    await ws.send_bytes(wav)
+                    try:
+                        await ws.send_bytes(wav)
+                    except Exception:
+                        pass
 
     consumer_task = asyncio.create_task(final_consumer())
 

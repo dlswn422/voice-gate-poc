@@ -1,195 +1,130 @@
-"use client";
+import os
+import time
+from dotenv import load_dotenv
 
-import { useCallback, useRef, useState } from "react";
+import azure.cognitiveservices.speech as speechsdk
+from openai import AzureOpenAI
 
-type WsStatus = "OFF" | "CONNECTING" | "RUNNING";
 
-type ServerMsg =
-  | { type: "partial"; text?: string }
-  | { type: "final"; text?: string }
-  | { type: "bot_text"; text?: string }
-  | { type: "error"; message?: string }
-  | { type: "barge_in" }; // (서버에서 보내면 잡음)
+def make_speech_recognizer():
+    key = os.getenv("AZURE_SPEECH_KEY")
+    region = os.getenv("AZURE_SPEECH_REGION")
+    lang = os.getenv("AZURE_SPEECH_LANGUAGE", "ko-KR")
+    if not key or not region:
+        raise RuntimeError("AZURE_SPEECH_KEY / AZURE_SPEECH_REGION 가 .env에 없습니다.")
 
-export function useVoiceWs() {
-  const [status, setStatus] = useState<WsStatus>("OFF");
-  const [partial, setPartial] = useState("");
-  const [finalText, setFinalText] = useState("");
-  const [botText, setBotText] = useState("");
+    speech_config = speechsdk.SpeechConfig(subscription=key, region=region)
+    speech_config.speech_recognition_language = lang
 
-  const wsRef = useRef<WebSocket | null>(null);
-  const audioCtxRef = useRef<AudioContext | null>(null);
-  const workletNodeRef = useRef<AudioWorkletNode | null>(null);
-  const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
+    # (선택) 주차장 도메인 힌트 - 인식 품질에 도움
+    recognizer = speechsdk.SpeechRecognizer(speech_config=speech_config)
+    phrase_list = speechsdk.PhraseListGrammar.from_recognizer(recognizer)
+    for p in ["차단기", "게이트", "문", "출구", "입구", "결제", "요금", "정기권", "영수증", "할인", "문이 안 열려요", "차단기가 안 열려요"]:
+        phrase_list.addPhrase(p)
 
-  // ✅ 오디오 1개만 유지 + URL도 추적해서 정리
-  const audioRef = useRef<HTMLAudioElement | null>(null);
-  const audioUrlRef = useRef<string | null>(null);
+    return recognizer
 
-  const stopAudio = useCallback(() => {
-    const a = audioRef.current;
-    if (a) {
-      try {
-        a.pause();
-        a.currentTime = 0;
-        a.src = "";
-        a.load();
-      } catch {}
-    }
-    if (audioUrlRef.current) {
-      try {
-        URL.revokeObjectURL(audioUrlRef.current);
-      } catch {}
-      audioUrlRef.current = null;
-    }
-  }, []);
 
-  const stop = useCallback(async () => {
-    try {
-      // ✅ 현재 재생 중인 TTS도 즉시 중단
-      stopAudio();
+def make_speech_synthesizer():
+    key = os.getenv("AZURE_SPEECH_KEY")
+    region = os.getenv("AZURE_SPEECH_REGION")
+    voice = os.getenv("AZURE_SPEECH_VOICE", "ko-KR-SunHiNeural")
+    if not key or not region:
+        raise RuntimeError("AZURE_SPEECH_KEY / AZURE_SPEECH_REGION 가 .env에 없습니다.")
 
-      // audio stop
-      workletNodeRef.current?.disconnect();
-      sourceRef.current?.disconnect();
-      await audioCtxRef.current?.close().catch(() => {});
-      streamRef.current?.getTracks().forEach((t) => t.stop());
+    speech_config = speechsdk.SpeechConfig(subscription=key, region=region)
+    speech_config.speech_synthesis_voice_name = voice
 
-      // ws stop
-      const ws = wsRef.current;
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: "stop" }));
-      }
-      ws?.close();
-    } finally {
-      wsRef.current = null;
-      audioCtxRef.current = null;
-      workletNodeRef.current = null;
-      sourceRef.current = null;
-      streamRef.current = null;
-      setStatus("OFF");
-      setPartial("");
-    }
-  }, [stopAudio]);
+    # ✅ 파일 저장 없이 스피커로 바로 출력
+    audio_config = speechsdk.audio.AudioOutputConfig(use_default_speaker=True)
+    return speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=audio_config)
 
-  const start = useCallback(async () => {
-    if (status !== "OFF") return;
-    setStatus("CONNECTING");
 
-    const wsUrl = process.env.NEXT_PUBLIC_BACKEND_WS?.trim() || "ws://localhost:8000/ws/voice";
-    console.log("WS URL:", wsUrl);
+def make_azure_openai_client():
+    endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "").strip().rstrip("/")
+    api_key = os.getenv("AZURE_OPENAI_API_KEY", "").strip()
+    api_version = os.getenv("AZURE_OPENAI_API_VERSION", "").strip()
 
-    const ws = new WebSocket(wsUrl);
-    ws.binaryType = "arraybuffer";
-    wsRef.current = ws;
+    if not endpoint or not api_key or not api_version:
+        raise RuntimeError("AZURE_OPENAI_ENDPOINT / AZURE_OPENAI_API_KEY / AZURE_OPENAI_API_VERSION 누락")
 
-    ws.onopen = async () => {
-      ws.send(JSON.stringify({ type: "start", sample_rate: 16000, format: "pcm16" }));
+    return AzureOpenAI(
+        azure_endpoint=endpoint,
+        api_key=api_key,
+        api_version=api_version,
+    )
 
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
-      });
-      streamRef.current = stream;
 
-      const audioCtx = new AudioContext();
-      audioCtxRef.current = audioCtx;
+def llm_reply(client: AzureOpenAI, deployment: str, history: list[dict], user_text: str) -> str:
+    messages = history + [{"role": "user", "content": user_text}]
+    resp = client.chat.completions.create(
+        model=deployment,  # ✅ deployment name
+        messages=messages,
+        temperature=0.3,
+        max_tokens=220,
+    )
+    return (resp.choices[0].message.content or "").strip()
 
-      await audioCtx.audioWorklet.addModule("/worklets/pcm16-processor.js");
 
-      const source = audioCtx.createMediaStreamSource(stream);
-      sourceRef.current = source;
+def main():
+    load_dotenv()
 
-      const node = new AudioWorkletNode(audioCtx, "pcm16-processor");
-      workletNodeRef.current = node;
+    deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT", "").strip()
+    if not deployment:
+        raise RuntimeError("AZURE_OPENAI_DEPLOYMENT(배포 이름)이 .env에 없습니다.")
 
-      node.port.onmessage = (e: MessageEvent) => {
-        const data = e.data;
-        if (!(data instanceof ArrayBuffer)) return;
-        if (ws.readyState === WebSocket.OPEN) ws.send(data);
-      };
+    recognizer = make_speech_recognizer()
+    synthesizer = make_speech_synthesizer()
+    client = make_azure_openai_client()
 
-      source.connect(node);
-      setStatus("RUNNING");
-    };
+    # 최소 상담 톤
+    history: list[dict] = [{
+        "role": "system",
+        "content": (
+            "너는 주차장 고객상담 AI다. 한국어로 짧고 명확하게 안내한다. "
+            "필요한 정보가 있으면 한 번에 1개만 질문한다. "
+            "답변은 1~2문장으로, 너무 길게 말하지 않는다."
+            "규칙: 입력 문장의 문장부호(?, !)는 음성 인식 자동 보정 결과일 수 있으므로 의도 해석 시 과도하게 반영하지 마세요. "
+        )
+    }]
 
-    ws.onmessage = (evt: MessageEvent) => {
-      // JSON 텍스트 메시지
-      if (typeof evt.data === "string") {
-        let msg: ServerMsg | null = null;
-        try {
-          msg = JSON.parse(evt.data) as ServerMsg;
-        } catch {
-          return;
-        }
-        if (!msg) return;
+    print("🎤 말하면 STT → LLM → TTS로 응답합니다. (종료: '종료'라고 말하기)")
+    synthesizer.speak_text_async("안녕하세요. 무엇을 도와드릴까요?").get()
 
-        if (msg.type === "partial") {
-          // ✅ 사용자가 말하기 시작하면 기존 TTS 즉시 중단 (겹침 방지 핵심)
-          stopAudio();
-          setPartial(msg.text || "");
-        }
+    while True:
+        print("\n[LISTEN] 말씀하세요...")
+        stt = recognizer.recognize_once_async().get()
 
-        if (msg.type === "final") {
-          setFinalText(msg.text || "");
-          setPartial("");
-        }
+        if stt.reason != speechsdk.ResultReason.RecognizedSpeech or not stt.text:
+            print("[STT] 인식 실패/무응답")
+            synthesizer.speak_text_async("잘 들리지 않았어요. 다시 말씀해 주세요.").get()
+            continue
 
-        if (msg.type === "bot_text") {
-          setBotText(msg.text || "");
-        }
+        user_text = stt.text.strip()
+        print("[USER]", user_text)
 
-        if (msg.type === "error") {
-          console.error(msg.message);
-        }
+        if "종료" in user_text:
+            synthesizer.speak_text_async("테스트를 종료합니다.").get()
+            break
 
-        if (msg.type === "barge_in") {
-          // 서버가 barge-in을 보내면 이것도 즉시 stop
-          stopAudio();
-        }
+        try:
+            answer = llm_reply(client, deployment, history, user_text)
+        except Exception as e:
+            print("[LLM ERROR]", repr(e))
+            synthesizer.speak_text_async("죄송합니다. 잠시 후 다시 시도해 주세요.").get()
+            continue
 
-        return;
-      }
+        if not answer:
+            answer = "죄송합니다. 다시 한 번 말씀해 주세요."
 
-      // binary 오디오 (WAV bytes)
-      if (evt.data instanceof ArrayBuffer) {
-        // ✅ 새 TTS가 오면 이전 TTS 즉시 중단 (겹침 방지 핵심)
-        stopAudio();
+        print("[AI]", answer)
 
-        if (!audioRef.current) audioRef.current = new Audio();
+        history.append({"role": "user", "content": user_text})
+        history.append({"role": "assistant", "content": answer})
 
-        const blob = new Blob([evt.data], { type: "audio/wav" });
-        const url = URL.createObjectURL(blob);
-        audioUrlRef.current = url;
+        synthesizer.speak_text_async(answer).get()
+        time.sleep(0.1)
 
-        const a = audioRef.current;
-        a.src = url;
 
-        a.onended = () => {
-          if (audioUrlRef.current === url) {
-            try {
-              URL.revokeObjectURL(url);
-            } catch {}
-            audioUrlRef.current = null;
-          }
-        };
-
-        a.play().catch(() => {});
-      }
-    };
-
-    ws.onerror = () => {
-      stop();
-    };
-
-    ws.onclose = () => {
-      setStatus("OFF");
-    };
-  }, [status, stop, stopAudio]);
-
-  return { status, partial, finalText, botText, start, stop };
-}
+if __name__ == "__main__":
+    main()

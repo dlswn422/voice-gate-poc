@@ -7,3 +7,20 @@ build/
 .DS_Store
 .env
 .env.local
+
+
+# python venv (root or backend)
+venv/
+.venv/
+backend/venv/
+
+# local models
+models/
+
+# node
+**/node_modules/
+**/.next/
+
+# env files
+.env
+.env.*

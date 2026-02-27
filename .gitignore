@@ -1,51 +1,26 @@
-############################
-# Python
-############################
-__pycache__/
-*.py[cod]
-*$py.class
-
-# Virtual Environments
+﻿node_modules/
 .venv/
-.venv311/
-venv/
-env/
-
-# Python build / packaging
-build/
+__pycache__/
+.next/
 dist/
-*.egg-info/
-
-############################
-# ML / AI
-############################
-# Local downloaded models / weights
-models/
-checkpoints/
-*.pt
-*.pth
-*.bin
-*.onnx
-*.safetensors
-
-# Torch / CTranslate / CUDA artifacts
-*.dll
-*.so
-*.dylib
-
-############################
-# Logs / Runtime
-############################
-*.log
-logs/
-tmp/
-
-############################
-# OS
-############################
+build/
 .DS_Store
-Thumbs.db
+.env
+.env.local
 
-############################
-# IDE / Editor
-###########
+
+# python venv (root or backend)
+venv/
+.venv/
+backend/venv/
+
+# local models
+models/
+
+# node
+**/node_modules/
+**/.next/
+
+# env files
+.env
+.env.*

@@ -73,7 +73,6 @@ type ExprSignals = {
   jawOpen: number
 }
 
-// ✅ [해결1] scores 타입 + infer 결과 타입 통일
 type ExprScores = {
   angryScore: number
   frustratedScore: number
@@ -103,7 +102,6 @@ function bsScore(map: Map<string, number>, name: string) {
   return map.get(name) ?? 0
 }
 
-// ✅ [해결1] 항상 존재하는 기본값
 const ZERO_SIGNALS: ExprSignals = {
   smile: 0,
   frown: 0,
@@ -125,7 +123,6 @@ const ZERO_SCORES: ExprScores = {
   polarity: 0,
 }
 
-// EMA smoother to stabilize signals
 class EmaSmoother {
   private alpha: number
   private state: ExprSignals
@@ -153,7 +150,6 @@ class EmaSmoother {
   }
 }
 
-// Hysteresis labeler to reduce flicker
 class HysteresisLabeler {
   private current: ExprLabel = "neutral"
   private candidate: ExprLabel = "neutral"
@@ -184,7 +180,6 @@ class HysteresisLabeler {
   }
 }
 
-// ✅ NEW: Baseline calibrator (1~2초 기본 표정 평균)
 class BaselineCalibrator {
   private n = 0
   private maxN: number
@@ -192,7 +187,7 @@ class BaselineCalibrator {
   private baseline: ExprSignals | null = null
 
   constructor(maxSamples = 8) {
-    this.maxN = maxSamples // 250ms 간격이면 8개=약 2초
+    this.maxN = maxSamples
     this.sum = { ...ZERO_SIGNALS }
   }
 
@@ -235,7 +230,6 @@ class BaselineCalibrator {
   }
 }
 
-// ✅ Face bbox area from landmarks (normalized 0..1 coords)
 const bboxAreaFromLandmarks = (lm: any[]) => {
   let minX = 1, minY = 1, maxX = 0, maxY = 0
   for (const p of lm) {
@@ -249,14 +243,12 @@ const bboxAreaFromLandmarks = (lm: any[]) => {
   return w * h
 }
 
-// ✅ Face quality score from bbox area (tunable)
 const faceQualityFromArea = (area: number) => {
   if (area <= 0.03) return 0
   if (area >= 0.10) return 1
   return clamp01((area - 0.03) / (0.10 - 0.03))
 }
 
-// ✅ NEW: improved inference using baseline + quality
 function inferExpressionImproved(
   smoothed: ExprSignals,
   baseline: ExprSignals | null,
@@ -264,7 +256,6 @@ function inferExpressionImproved(
 ): ExprInferResult {
   const base = baseline ?? { ...ZERO_SIGNALS }
 
-  // baseline 대비 변화량(delta) — 개인 기본 얼굴 보정
   const d: ExprSignals = {
     smile: Math.max(0, smoothed.smile - base.smile),
     frown: Math.max(0, smoothed.frown - base.frown),
@@ -285,11 +276,9 @@ function inferExpressionImproved(
   const mouthPress = d.mouthPress
   const jawOpen = d.jawOpen
 
-  // valence: positive vs negative (baseline-corrected)
   let valence = 1.4 * smile - 1.0 * frown - 0.85 * browDown - 0.65 * mouthPress - 0.15 * eyeSquint
   valence = Math.max(-1, Math.min(1, valence))
 
-  // arousal: activation
   let arousal = 0.85 * jawOpen + 0.75 * eyeWide + 0.35 * browUp + 0.35 * browDown + 0.2 * eyeSquint
   arousal = clamp01(arousal)
 
@@ -298,10 +287,8 @@ function inferExpressionImproved(
   const intensity = clamp01(Math.max(posStrength, negStrength, arousal))
   const polarity = clamp01(Math.abs(valence))
 
-  // confidence: intensity + polarity + quality
   const confidence = clamp01((0.12 + 0.75 * intensity + 0.35 * polarity) * (0.35 + 0.65 * quality))
 
-  // label scoring
   const angryScore = 0.55 * negStrength + 0.45 * browDown + 0.25 * mouthPress + 0.20 * eyeSquint + 0.20 * arousal
   const frustratedScore = 0.60 * negStrength + 0.30 * mouthPress + 0.25 * eyeSquint + 0.10 * arousal
   const confusedScore = 0.60 * browUp + 0.45 * eyeWide + 0.15 * jawOpen + 0.15 * (1 - polarity)
@@ -341,6 +328,27 @@ function inferExpressionImproved(
   }
 }
 
+// ✅ [추가] sleep helper
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+
+// ✅ [추가] 아바타 미디어가 실제 재생 준비 완료될 때까지 대기
+async function waitForAvatarReady(videoRef: React.RefObject<HTMLVideoElement>, timeoutMs = 2500) {
+  const start = performance.now()
+  while (performance.now() - start < timeoutMs) {
+    const v = videoRef.current
+    if (v && v.srcObject && v.readyState >= 2) {
+      try {
+        await v.play()
+      } catch {
+        // play는 이미 되고 있거나 정책상 블록될 수 있음(하지만 srcObject+readyState만으로도 대부분 OK)
+      }
+      return true
+    }
+    await sleep(50)
+  }
+  return false
+}
+
 export default function Home() {
   const [isRunning, setIsRunning] = useState(false)
   const [status, setStatus] = useState<Status>("OFF")
@@ -357,6 +365,10 @@ export default function Home() {
   // Avatar
   const avatarVideoRef = useRef<HTMLVideoElement>(null!)
   const avatar = useAvatar()
+
+  // ✅ [추가] 아바타 준비/첫 speak 플래그
+  const avatarReadyRef = useRef(false)
+  const firstAvatarSpeakRef = useRef(true)
 
   // Camera
   const [camOn, setCamOn] = useState(false)
@@ -482,7 +494,6 @@ export default function Home() {
             const calibrator = baselineRef.current!
             const baseline = hasFace && quality >= 0.25 ? calibrator.update(smoothed) : calibrator.get()
 
-            // ✅ [해결1] inferred는 항상 ExprInferResult
             const inferred: ExprInferResult = hasFace
               ? inferExpressionImproved(smoothed, baseline, quality)
               : {
@@ -617,6 +628,10 @@ export default function Home() {
       await avatar.stop()
     } catch {}
 
+    // ✅ [추가] 아바타 상태 리셋
+    avatarReadyRef.current = false
+    firstAvatarSpeakRef.current = true
+
     try {
       setCamOn(false)
     } catch {}
@@ -627,9 +642,18 @@ export default function Home() {
       console.error("❌ NEXT_PUBLIC_BACKEND_WS is missing on HTTPS (production).")
     }
 
+    // ✅ [추가] 시작할 때 아바타 플래그 리셋
+    avatarReadyRef.current = false
+    firstAvatarSpeakRef.current = true
+
     if (USE_AVATAR) {
       try {
         await avatar.start(avatarVideoRef)
+
+        // ✅ 핵심: 아바타 트랙/플레이 준비 완료 대기 (첫 응답 잘림 방지)
+        const ok = await waitForAvatarReady(avatarVideoRef, 2500)
+        avatarReadyRef.current = ok
+        if (!ok) console.warn("[AVATAR] media not ready in time (will wait on first speak)")
       } catch (e) {
         console.error("[AVATAR] start failed:", e)
       }
@@ -693,6 +717,16 @@ export default function Home() {
             if (USE_AVATAR) {
               try {
                 setStatus("SPEAKING")
+
+                // ✅ 핵심: 첫 speak 때는 "아바타 미디어 준비 + 아주 짧은 지연" 후에 말하기
+                if (!avatarReadyRef.current) {
+                  avatarReadyRef.current = await waitForAvatarReady(avatarVideoRef, 2500)
+                }
+                if (firstAvatarSpeakRef.current) {
+                  firstAvatarSpeakRef.current = false
+                  await sleep(150) // 첫 프레임/오디오 라우팅 안정화
+                }
+
                 await avatar.speak(text)
               } catch (e) {
                 console.error("[AVATAR] speak failed:", e)
@@ -750,80 +784,94 @@ export default function Home() {
   }, [])
 
   return (
-    <main className="min-h-screen px-6 flex justify-center">
-      <div className="w-full max-w-[1200px]">
-        <header className="pt-10 text-center select-none">
-          <h1 className="text-4xl font-semibold tracking-[0.35em]">PARKMATE</h1>
-          <p className="mt-1 text-xs tracking-[0.35em] text-neutral-400 uppercase">Parking Guidance Kiosk</p>
+    <main className="min-h-screen px-6 pb-10">
+      <div className="w-full max-w-[1400px] mx-auto">
+        <header className="pt-6 text-center select-none">
+          <h1 className="text-4xl font-semibold tracking-[0.35em]">TABLEMATE</h1>
+          <p className="mt-1 text-xs tracking-[0.35em] text-neutral-400 uppercase">
+            DINING GUIDANCE KIOSK
+          </p>
         </header>
 
-        <section className="mt-12 flex flex-col items-center">
-          <div className="w-full mb-6">
-            <div className="rounded-3xl border border-white/70 bg-white/50 shadow-xl backdrop-blur overflow-hidden">
-              <div className="px-6 py-4 flex items-center justify-between">
-                <div className="text-sm font-semibold text-neutral-900">Avatar</div>
-                <div className="text-xs text-neutral-400">{USE_AVATAR ? "ON" : "OFF"}</div>
+        <section className="mt-6">
+          <div className="grid grid-cols-12 gap-6 items-start">
+            <div className="col-span-12 md:col-span-3">
+              <GuideCards />
+            </div>
+
+            <div className="col-span-12 md:col-span-6 flex flex-col gap-4">
+              <div className="h-[540px] rounded-3xl border border-white/70 bg-white/50 shadow-xl backdrop-blur overflow-hidden">
+                <div className="px-6 py-4 flex items-center justify-between">
+                  <div className="text-sm font-semibold text-neutral-900">Avatar</div>
+                  <div className="text-xs text-neutral-400">{USE_AVATAR ? "ON" : "OFF"}</div>
+                </div>
+
+                <div className="px-6 pb-6 h-[calc(100%-56px)]">
+                  <video
+                    ref={avatarVideoRef}
+                    id="avatarVideo"
+                    autoPlay
+                    playsInline
+                    className="w-full h-full rounded-2xl bg-black/10 object-cover"
+                  />
+                </div>
               </div>
 
-              <div className="px-6 pb-6">
-                <video
-                  ref={avatarVideoRef}
-                  id="avatarVideo"
-                  autoPlay
-                  playsInline
-                  className="w-full aspect-video rounded-2xl bg-black/10"
-                />
+              <div className="h-[210px] overflow-hidden">
+                <MicCards isRunning={isRunning} status={status} onToggle={onToggle} />
+              </div>
+            </div>
 
-                {/* Expression Camera (표정 신호 전송) */}
-                <div className="mt-6">
-                  <div className="flex items-center justify-between">
-                    <div className="text-sm font-semibold text-neutral-900">Expression Camera</div>
-                    <div className="flex gap-2">
-                      <button
-                        className="rounded-lg px-3 py-2 text-xs font-semibold shadow-sm border border-neutral-200 bg-white hover:bg-neutral-50 disabled:opacity-50"
-                        onClick={() => setCamOn(true)}
-                        disabled={camOn}
-                      >
-                        카메라 시작
-                      </button>
-                      <button
-                        className="rounded-lg px-3 py-2 text-xs font-semibold shadow-sm border border-neutral-200 bg-white hover:bg-neutral-50 disabled:opacity-50"
-                        onClick={() => setCamOn(false)}
-                        disabled={!camOn}
-                      >
-                        카메라 종료
-                      </button>
-                    </div>
+            <div className="col-span-12 md:col-span-3 flex flex-col gap-4">
+              <div className="rounded-3xl border border-white/70 bg-white/50 shadow-lg backdrop-blur overflow-hidden">
+                <div className="px-5 py-4 flex items-center justify-between">
+                  <div className="text-sm font-semibold text-neutral-900">Expression Camera</div>
+                  <div className="flex gap-2">
+                    <button
+                      className="rounded-lg px-3 py-2 text-[11px] font-semibold shadow-sm border border-neutral-200 bg-white hover:bg-neutral-50 disabled:opacity-50"
+                      onClick={() => setCamOn(true)}
+                      disabled={camOn}
+                    >
+                      시작
+                    </button>
+                    <button
+                      className="rounded-lg px-3 py-2 text-[11px] font-semibold shadow-sm border border-neutral-200 bg-white hover:bg-neutral-50 disabled:opacity-50"
+                      onClick={() => setCamOn(false)}
+                      disabled={!camOn}
+                    >
+                      종료
+                    </button>
                   </div>
+                </div>
 
+                <div className="px-5 pb-5">
                   <video
                     ref={faceVideoRef}
                     autoPlay
                     playsInline
                     muted
-                    className="mt-3 w-full aspect-video rounded-2xl bg-black/10"
+                    className="w-full aspect-video rounded-2xl bg-black/10 object-cover"
                   />
-
-                  <p className="mt-2 text-xs text-neutral-400">
-                    표정(vision_expression)만 서버로 전송합니다. (보강: 얼굴품질게이트 + baseline 보정 + conf 재설계 + score 디버그)
+                  <p className="mt-2 text-[11px] text-neutral-400 leading-snug">
+                    표정(vision_expression)만 서버로 전송합니다.
                   </p>
                 </div>
+              </div>
 
-                <p className="mt-2 text-xs text-neutral-400">
-                  {USE_AVATAR ? "bot_text → Speech SDK → Azure Avatar → (WebRTC) → <video>" : "USE_AVATAR=false (기존 WAV 재생 방식)"}
-                </p>
+              <div className="h-[250px]">
+                <RealtimeLogCard
+                  partialText={partialText}
+                  finalText={finalText}
+                  botText={botText}
+                  wsUrl={WS_URL}
+                  wsRef={wsRef}
+                  isWsOpen={isWsOpen}
+                  className="h-full"
+                  scroll
+                />
               </div>
             </div>
           </div>
-
-          <div className="w-full">
-            <MicCards isRunning={isRunning} status={status} onToggle={onToggle} />
-          </div>
-
-          <RealtimeLogCard partialText={partialText} finalText={finalText} botText={botText} wsUrl={WS_URL} wsRef={wsRef} isWsOpen={isWsOpen} />
-
-          <GuideCards />
-          <p className="mt-8 text-center text-xs text-neutral-400"></p>
         </section>
       </div>
     </main>

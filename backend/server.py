@@ -44,11 +44,6 @@ if not SPEECH_KEY or not SPEECH_REGION:
 
 # =========================================================
 # ✅ 개선된 시스템 프롬프트
-# - 문맥 유지
-# - 짧은 답/차량번호를 직전 질문의 답으로 해석
-# - 인사/감사/종료 발화 자연 처리
-# - 불완전 차량번호는 재질문
-# - 카메라/표정 언급 금지
 # =========================================================
 SYSTEM_PROMPT_BASE = """
 너는 주차장 고객상담 AI다. 사용자는 주차장 입구/출구/사전정산기/무인정산기/관리실 호출 상황에서 짧게 말할 수 있으며,
@@ -57,7 +52,7 @@ SYSTEM_PROMPT_BASE = """
 [목표]
 - 사용자가 주차장 관련 문제를 빠르게 해결하도록 돕는다.
 - 답변은 짧고 명확하게 한다.
-- 필요할 때만 질문 1개를 한다.
+- 필요한 경우에만 질문 1개를 한다.
 - 기본 문맥은 “지금 주차장 관련 상담 중”이다.
 
 [상담 범위]
@@ -102,6 +97,8 @@ SYSTEM_PROMPT_BASE = """
 
 [차량번호 처리 규칙]
 - 차량번호가 들어오면 현재 문맥상 차량번호를 요구하던 상황인지 우선 확인하고, 그렇다면 답변으로 처리한다.
+- 차량번호는 앞 2~3자리 + 한글 1자 + 숫자 4자리 형태를 기준으로 본다.
+- STT가 숫자를 한글로 바꿔도 문맥상 차량번호라면 숫자로 복원해서 해석한다.
 - 차량번호가 완전하지 않거나 불분명하면 추측해서 확정하지 않는다.
 - 말끝이 흐리거나 일부만 들린 경우에는 반드시 짧게 다시 요청한다.
 - 예:
@@ -150,6 +147,31 @@ SYSTEM_PROMPT_BASE = """
 NO_MATCH_FALLBACK = "이해를 잘 못했습니다. 다시 한 번만 말씀해주세요."
 MAX_HISTORY_MESSAGES = 12
 
+# =========================================================
+# ✅ 차량번호 규칙
+# 앞 2~3자리 + 한글 1자 + 뒤 4자리
+# 예: 12가1234 / 123가1234
+# =========================================================
+PLATE_LEAD_MIN = 2
+PLATE_LEAD_MAX = 3
+PLATE_MID_PATTERN = r"[가-힣]"
+
+KOR_DIGIT_MAP = {
+    "영": "0",
+    "공": "0",
+    "빵": "0",
+    "일": "1",
+    "이": "2",
+    "삼": "3",
+    "사": "4",
+    "오": "5",
+    "육": "6",
+    "륙": "6",
+    "칠": "7",
+    "팔": "8",
+    "구": "9",
+}
+
 
 def _safe_float(x, default=0.0) -> float:
     try:
@@ -162,6 +184,24 @@ def _normalize_match_text(text: str) -> str:
     s = (text or "").strip().lower()
     s = re.sub(r"[\s\.\,\!\?\~…]+", "", s)
     return s
+
+
+def normalize_spoken_plate_text(text: str) -> str:
+    """
+    STT가 차량번호를 한글 숫자로 넘겨도 차량번호 패턴 인식이 되도록 정규화.
+    예:
+      - "일이가 일이삼사" -> "12가1234"
+      - "공칠가 공공일이" -> "07가0012"
+      - "123가1234" -> "123가1234"
+    """
+    s = (text or "").strip()
+    s = re.sub(r"\s+", "", s)
+    s = re.sub(r"[^0-9가-힣]", "", s)
+
+    out = []
+    for ch in s:
+        out.append(KOR_DIGIT_MAP.get(ch, ch))
+    return "".join(out)
 
 
 def try_get_social_reply(text: str) -> str:
@@ -187,23 +227,37 @@ def try_get_social_reply(text: str) -> str:
 
 
 def extract_full_plate(text: str) -> str:
-    compact = re.sub(r"\s+", "", text or "")
-    m = re.search(r"(?<!\d)(\d{2,3}[가-힣]\d{4})(?!\d)", compact)
+    """
+    정규화 후 완전한 차량번호를 추출.
+    2~3자리 + 한글1자 + 4자리
+    """
+    normalized = normalize_spoken_plate_text(text)
+    pattern = rf"(?<!\d)(\d{{{PLATE_LEAD_MIN},{PLATE_LEAD_MAX}}}{PLATE_MID_PATTERN}\d{{4}})(?!\d)"
+    m = re.search(pattern, normalized)
     return m.group(1) if m else ""
 
 
 def is_incomplete_plate_like(text: str) -> bool:
-    compact = re.sub(r"\s+", "", text or "")
+    """
+    차량번호를 말하는 중인데 덜 들어온 경우 감지.
+    예:
+      - "12가"
+      - "12가123"
+      - "123가"
+      - "일이가"
+      - "일이가 일이삼"
+    """
+    normalized = normalize_spoken_plate_text(text)
 
-    if extract_full_plate(compact):
+    if extract_full_plate(normalized):
         return False
 
-    # 예: 12가 / 12가1 / 12가12 / 12가123 / 123가 / 123가1 ...
-    if re.search(r"(?<!\d)\d{1,3}[가-힣]\d{0,3}(?!\d)", compact):
+    partial_pattern = rf"(?<!\d)\d{{1,3}}{PLATE_MID_PATTERN}\d{{0,3}}(?!\d)"
+    if re.search(partial_pattern, normalized):
         return True
 
-    # 예: "12가 어버버" 같은 경우 일부라도 차량번호 형태면 재질문 유도
-    if re.search(r"\d{1,3}[가-힣]", compact):
+    prefix_pattern = rf"\d{{1,3}}{PLATE_MID_PATTERN}"
+    if re.search(prefix_pattern, normalized):
         return True
 
     return False
@@ -289,13 +343,11 @@ def build_expression_policy(vision: dict | None) -> str:
     valence = _safe_float(expr.get("valence", 0))
     arousal = _safe_float(expr.get("arousal", 0))
 
-    # low => ignore
     if conf < 0.25:
         return (
             "\n[표정 신호(추정)] confidence가 낮다. 표정 정보는 무시하고 기본 톤으로 답하라.\n"
         )
 
-    # mid => tone only
     if conf < 0.45:
         return (
             "\n[표정 신호(추정, 약한 참고)] "
@@ -305,7 +357,6 @@ def build_expression_policy(vision: dict | None) -> str:
             "- 확인 질문은 최대 1개.\n"
         )
 
-    # high => strong strategy
     if label in ("angry", "frustrated"):
         return (
             "\n[표정 신호(추정, 강한 참고)] "
@@ -395,23 +446,19 @@ def update_dialog_state(dialog_state: dict, user_text: str, bot_text: str) -> No
     else:
         dialog_state["conversation_phase"] = "guiding"
 
-    # assistant가 차량번호를 요청하는 경우
     if "차량번호" in bot_text and any(k in bot_text for k in ["알려주세요", "말씀해주세요", "말씀해 주세요", "다시", "부탁드립니다"]):
         dialog_state["pending_slot"] = "car_number"
         dialog_state["last_question"] = bot_text
         return
 
-    # assistant가 차량번호를 확인 완료한 경우
-    if "차량번호" in bot_text and ("확인했습니다" in bot_text or "확인됐" in bot_text or "확인했습니다." in bot_text):
+    if "차량번호" in bot_text and ("확인했습니다" in bot_text or "확인됐" in bot_text):
         dialog_state["pending_slot"] = None
 
-    # 기타 질문 슬롯
     if "결제 수단" in bot_text or "어떤 결제 수단" in bot_text:
         dialog_state["pending_slot"] = "payment_method"
     elif "문구" in bot_text or "오류 내용" in bot_text:
         dialog_state["pending_slot"] = "error_message"
     elif not looks_like_question(bot_text):
-        # 명시적 질문이 아니면 슬롯 해제
         if dialog_state.get("pending_slot") != "car_number":
             dialog_state["pending_slot"] = None
 
@@ -476,15 +523,15 @@ async def ws_voice(ws: WebSocket):
     await _ACTIVE_SESSION_LOCK.acquire()
     await ws.accept()
 
-    # ✅ Latest expression-only camera signal (per websocket session)
+    # Latest expression-only camera signal (per websocket session)
     last_vision_state: dict | None = None
     _last_expr_log_ts = 0.0
 
-    # ✅ STT 애매 인식 fallback용 타임스탬프
+    # STT 애매 인식 fallback용 타임스탬프
     last_partial_ts = 0.0
     last_no_match_queue_ts = 0.0
 
-    # ✅ 최근 대화 히스토리 / 상태
+    # 최근 대화 히스토리 / 상태
     chat_history = deque(maxlen=MAX_HISTORY_MESSAGES)
     dialog_state = {
         "current_task": None,
@@ -494,7 +541,11 @@ async def ws_voice(ws: WebSocket):
     }
 
     # Azure STT: 브라우저 PCM16(16k mono) 스트림 수신
-    stream_format = speechsdk.audio.AudioStreamFormat(samples_per_second=16000, bits_per_sample=16, channels=1)
+    stream_format = speechsdk.audio.AudioStreamFormat(
+        samples_per_second=16000,
+        bits_per_sample=16,
+        channels=1,
+    )
     push_stream = speechsdk.audio.PushAudioInputStream(stream_format)
     audio_config = speechsdk.audio.AudioConfig(stream=push_stream)
 
@@ -548,7 +599,7 @@ async def ws_voice(ws: WebSocket):
             )
             return
 
-        # ✅ 애매하게 끊긴 발화도 무응답으로 끝내지 않기
+        # 애매하게 끊긴 발화도 무응답으로 끝내지 않기
         if reason == speechsdk.ResultReason.NoMatch:
             now = time.time()
             if (now - last_partial_ts) < 2.5 and (now - last_no_match_queue_ts) > 1.5:
@@ -570,9 +621,7 @@ async def ws_voice(ws: WebSocket):
             kind = item.get("kind")
             my_turn = item.get("turn_id", turn_id)
 
-            # --------------------------------
             # 1) STT no-match fallback
-            # --------------------------------
             if kind == "no_match":
                 async with turn_lock:
                     if my_turn != turn_id:
@@ -593,9 +642,7 @@ async def ws_voice(ws: WebSocket):
                             pass
                 continue
 
-            # --------------------------------
             # 2) normal recognized speech
-            # --------------------------------
             user_text = (item.get("text") or "").strip()
             if not user_text:
                 continue
@@ -608,10 +655,10 @@ async def ws_voice(ws: WebSocket):
 
                 state_for_turn = prepare_state_for_current_turn(dialog_state, user_text)
 
-                # ✅ deterministic fast-path
+                # deterministic fast-path
                 bot = maybe_handle_fastpath(user_text, state_for_turn)
 
-                # ✅ fallback to LLM with recent history + state
+                # fallback to LLM with recent history + state
                 if not bot:
                     try:
                         bot = await asyncio.to_thread(
@@ -631,7 +678,7 @@ async def ws_voice(ws: WebSocket):
                 if my_turn != turn_id:
                     continue
 
-                # ✅ 다음 턴이 직전 문맥을 이어받도록 먼저 반영
+                # 다음 턴이 직전 문맥을 이어받도록 먼저 반영
                 chat_history.append({"role": "user", "content": user_text})
                 chat_history.append({"role": "assistant", "content": bot})
                 update_dialog_state(dialog_state, user_text, bot)
@@ -668,7 +715,6 @@ async def ws_voice(ws: WebSocket):
                         bump_turn_and_barge_in()
                         continue
 
-                    # ✅ 카메라 표정 신호 수신
                     if ctype == "vision_expression":
                         last_vision_state = ctrl
 
@@ -693,7 +739,6 @@ async def ws_voice(ws: WebSocket):
     except WebSocketDisconnect:
         pass
     finally:
-        # cleanup
         try:
             push_stream.close()
         except Exception:
